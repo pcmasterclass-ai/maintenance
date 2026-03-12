@@ -512,12 +512,12 @@ function Set-MaintenanceSchedule {
             -Execute "powershell.exe" `
             -Argument $scriptArgs
 
-        # Create the trigger - daily trigger with repetition interval
-        # We use a daily trigger and set the interval to our frequency
+        # Create a one-time trigger that repeats indefinitely at our frequency
         $trigger = New-ScheduledTaskTrigger `
             -Once `
             -At $runTime `
-            -RepetitionInterval (New-TimeSpan -Days $frequencyDays)
+            -RepetitionInterval (New-TimeSpan -Days $frequencyDays) `
+            -RepetitionDuration (New-TimeSpan -Days 36500)
 
         # Task settings - run whether user is logged in or not
         $settings = New-ScheduledTaskSettingsSet `
