@@ -329,6 +329,73 @@ function Get-MachineInfo {
 }
 
 # ============================================================================
+# EMAIL CREDENTIAL SETUP
+# ============================================================================
+function Set-EmailCredentials {
+    Write-Section "EMAIL CREDENTIAL SETUP"
+    Write-Host ""
+    Write-Host "  The maintenance script can email reports to you after each run." -ForegroundColor White
+    Write-Host "  Credentials are encrypted and stored locally on this machine only." -ForegroundColor White
+    Write-Host ""
+
+    $setupEmail = Read-Host "  Set up email credentials now? (Y/N)"
+
+    if ($setupEmail -notmatch '^[Yy]') {
+        Write-Warn "Skipped - you can set this up later by running:"
+        Write-Host "    powershell -ExecutionPolicy Bypass -File `"$ScriptPath`" ``" -ForegroundColor White
+        Write-Host "        -SaveCredential -SmtpUser `"your@email.com`" ``" -ForegroundColor White
+        Write-Host "        -SmtpPassword `"your-app-password`"" -ForegroundColor White
+        return
+    }
+
+    Write-Host ""
+    Write-Host "  Enter the SMTP credentials for sending reports." -ForegroundColor White
+    Write-Host "  (For Gmail, use an App Password - not your regular password)" -ForegroundColor White
+    Write-Host ""
+
+    $smtpUser = Read-Host "  SMTP email address (e.g. reports@pcmasterclass.com.au)"
+    if (-not $smtpUser) {
+        Write-Warn "No email entered - skipping credential setup"
+        return
+    }
+
+    $smtpPassword = Read-Host "  SMTP password / App Password" -AsSecureString
+    $plainPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+        [Runtime.InteropServices.Marshal]::SecureStringToBSTR($smtpPassword)
+    )
+    if (-not $plainPassword) {
+        Write-Warn "No password entered - skipping credential setup"
+        return
+    }
+
+    Write-Step "Saving encrypted credentials..."
+
+    try {
+        # Run the maintenance script with -SaveCredential to store them
+        $saveArgs = @(
+            "-ExecutionPolicy", "Bypass",
+            "-File", "`"$ScriptPath`"",
+            "-SaveCredential",
+            "-SmtpUser", "`"$smtpUser`"",
+            "-SmtpPassword", "`"$plainPassword`"",
+            "-SkipUpdate"
+        )
+        $process = Start-Process powershell.exe -ArgumentList $saveArgs -Wait -NoNewWindow -PassThru
+
+        if ($process.ExitCode -eq 0) {
+            Write-OK "Email credentials saved successfully"
+            Write-OK "Reports will be sent from: $smtpUser"
+        } else {
+            Write-Fail "Credential save may have failed (exit code: $($process.ExitCode))"
+            Write-Warn "You can retry later with the -SaveCredential flag"
+        }
+    } catch {
+        Write-Fail "Failed to save credentials: $($_.Exception.Message)"
+        Write-Warn "You can retry later with the -SaveCredential flag"
+    }
+}
+
+# ============================================================================
 # DISPLAY SUMMARY
 # ============================================================================
 function Show-Summary {
@@ -347,11 +414,6 @@ function Show-Summary {
 
        TO RUN MAINTENANCE:
        powershell -ExecutionPolicy Bypass -File "$ScriptPath"
-
-       FIRST-TIME EMAIL SETUP (optional):
-       powershell -ExecutionPolicy Bypass -File "$ScriptPath" ``
-           -SaveCredential -SmtpUser "your@email.com" ``
-           -SmtpPassword "your-app-password"
 
        The script will auto-update from GitHub each time
        it runs, so this machine will always get the latest
@@ -411,6 +473,11 @@ if ($success) {
 # Step 5: Display machine info for Rollout Tracker
 if ($success) {
     Get-MachineInfo
+}
+
+# Step 6: Email credential setup (optional, interactive)
+if ($success) {
+    Set-EmailCredentials
 }
 
 # Show final summary
