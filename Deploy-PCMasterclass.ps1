@@ -17,10 +17,7 @@
     Date:    2026-03-12
 
     USAGE (paste into an elevated PowerShell prompt):
-      irm https://raw.githubusercontent.com/pcmasterclass-ai/maintenance/main/Deploy-PCMasterclass.ps1 | iex
-
-    OR if running from a local copy:
-      powershell -ExecutionPolicy Bypass -File "Deploy-PCMasterclass.ps1"
+      powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\Downloads\Onboarding-PCMasterclass.ps1"
 
     WHAT THIS SCRIPT DOES:
       1. Creates C:\Teamviewer folder structure (Reports, Config, Tools)
