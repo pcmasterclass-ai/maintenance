@@ -1,0 +1,426 @@
+#Requires -RunAsAdministrator
+<#
+.SYNOPSIS
+    PC Masterclass - Client Onboarding / Deployment Script
+.DESCRIPTION
+    One-step deployment script for new clients. Run this once on a client machine
+    (via TeamViewer or in person) to set up the full PC Masterclass maintenance
+    environment. It creates the folder structure, downloads the latest maintenance
+    script from GitHub, and confirms everything is ready.
+
+    After deployment, the maintenance script can be run at any time with:
+      powershell -ExecutionPolicy Bypass -File "C:\Teamviewer\PCMasterclass-Maintenance.ps1"
+
+.NOTES
+    Author:  Paul - PC Masterclass
+    Version: 1.0.0
+    Date:    2026-03-12
+
+    USAGE (paste into an elevated PowerShell prompt):
+      irm https://raw.githubusercontent.com/pcmasterclass-ai/maintenance/main/Deploy-PCMasterclass.ps1 | iex
+
+    OR if running from a local copy:
+      powershell -ExecutionPolicy Bypass -File "Deploy-PCMasterclass.ps1"
+
+    WHAT THIS SCRIPT DOES:
+      1. Creates C:\Teamviewer folder structure (Reports, Config, Tools)
+      2. Downloads the latest PCMasterclass-Maintenance.ps1 from GitHub
+      3. Verifies the download and displays the installed version
+      4. Runs a quick environment check (PowerShell version, admin rights, disk space)
+      5. Displays a summary with next steps
+
+    WHAT THIS SCRIPT DOES NOT DO:
+      - It does not run the maintenance script (you decide when to run it)
+      - It does not create scheduled tasks
+      - It does not store any credentials (that's done on first maintenance run)
+      - It does not modify system settings
+#>
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+$DeployVersion = "1.0.0"
+$BaseDir = "C:\Teamviewer"
+$ScriptName = "PCMasterclass-Maintenance.ps1"
+$GitHubRepo = "pcmasterclass-ai/maintenance"
+$GitHubBranch = "main"
+$GitHubToken = "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"
+
+# Derived paths
+$ScriptPath = Join-Path $BaseDir $ScriptName
+$ReportsDir = Join-Path $BaseDir "Reports"
+$ConfigDir  = Join-Path $BaseDir "Config"
+$ToolsDir   = Join-Path $BaseDir "Tools"
+$DownloadUrl = "https://raw.githubusercontent.com/$GitHubRepo/$GitHubBranch/$ScriptName"
+
+# ============================================================================
+# DISPLAY BANNER
+# ============================================================================
+function Show-Banner {
+    $banner = @"
+
+    ====================================================
+       PC Masterclass - Client Deployment Script v$DeployVersion
+    ====================================================
+       Setting up automated maintenance environment...
+    ====================================================
+
+"@
+    Write-Host $banner -ForegroundColor Cyan
+}
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+function Write-Step {
+    param([string]$Message)
+    Write-Host "  [*] $Message" -ForegroundColor White
+}
+
+function Write-OK {
+    param([string]$Message)
+    Write-Host "  [OK] $Message" -ForegroundColor Green
+}
+
+function Write-Warn {
+    param([string]$Message)
+    Write-Host "  [!!] $Message" -ForegroundColor Yellow
+}
+
+function Write-Fail {
+    param([string]$Message)
+    Write-Host "  [FAIL] $Message" -ForegroundColor Red
+}
+
+function Write-Section {
+    param([string]$Title)
+    Write-Host ""
+    Write-Host "  --- $Title ---" -ForegroundColor Cyan
+}
+
+# ============================================================================
+# PRE-FLIGHT CHECKS
+# ============================================================================
+function Test-Prerequisites {
+    Write-Section "PRE-FLIGHT CHECKS"
+    $allGood = $true
+
+    # Check admin rights
+    $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator
+    )
+    if ($isAdmin) {
+        Write-OK "Running as Administrator"
+    } else {
+        Write-Fail "Not running as Administrator - this script requires elevation"
+        $allGood = $false
+    }
+
+    # Check PowerShell version
+    $psVer = $PSVersionTable.PSVersion
+    if ($psVer.Major -ge 5) {
+        Write-OK "PowerShell version: $psVer"
+    } else {
+        Write-Warn "PowerShell version $psVer detected (5.1+ recommended)"
+    }
+
+    # Check Windows version
+    $osInfo = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+    if ($osInfo) {
+        Write-OK "OS: $($osInfo.Caption) (Build $($osInfo.BuildNumber))"
+    }
+
+    # Check internet connectivity
+    Write-Step "Testing internet connectivity..."
+    try {
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+        $testUrl = "https://raw.githubusercontent.com"
+        $request = [System.Net.WebRequest]::Create($testUrl)
+        $request.Timeout = 10000
+        $response = $request.GetResponse()
+        $response.Close()
+        Write-OK "Internet connectivity confirmed"
+    } catch {
+        Write-Fail "Cannot reach GitHub - check internet connection"
+        $allGood = $false
+    }
+
+    # Check disk space on C:
+    $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'" -ErrorAction SilentlyContinue
+    if ($disk) {
+        $freeGB = [math]::Round($disk.FreeSpace / 1GB, 1)
+        if ($freeGB -gt 5) {
+            Write-OK "Disk space: ${freeGB}GB free on C:"
+        } else {
+            Write-Warn "Low disk space: ${freeGB}GB free on C: (recommend 5GB+)"
+        }
+    }
+
+    return $allGood
+}
+
+# ============================================================================
+# CREATE FOLDER STRUCTURE
+# ============================================================================
+function New-FolderStructure {
+    Write-Section "CREATING FOLDER STRUCTURE"
+
+    $folders = @($BaseDir, $ReportsDir, $ConfigDir, $ToolsDir)
+
+    foreach ($folder in $folders) {
+        if (Test-Path $folder) {
+            Write-OK "Already exists: $folder"
+        } else {
+            try {
+                New-Item -ItemType Directory -Path $folder -Force | Out-Null
+                Write-OK "Created: $folder"
+            } catch {
+                Write-Fail "Failed to create: $folder - $($_.Exception.Message)"
+                return $false
+            }
+        }
+    }
+
+    return $true
+}
+
+# ============================================================================
+# DOWNLOAD MAINTENANCE SCRIPT
+# ============================================================================
+function Get-MaintenanceScript {
+    Write-Section "DOWNLOADING MAINTENANCE SCRIPT"
+
+    # Check if script already exists
+    $existingVersion = $null
+    if (Test-Path $ScriptPath) {
+        $existingContent = Get-Content $ScriptPath -Raw -ErrorAction SilentlyContinue
+        if ($existingContent -match '\$ScriptVersion\s*=\s*"([^"]+)"') {
+            $existingVersion = $Matches[1]
+        }
+        Write-Step "Existing installation found (v$existingVersion) - will update if newer available"
+    } else {
+        Write-Step "Fresh install - downloading latest version..."
+    }
+
+    try {
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+
+        $webClient = New-Object System.Net.WebClient
+        if ($GitHubToken) {
+            $webClient.Headers.Add("Authorization", "token $GitHubToken")
+        }
+
+        # Download to temp first, then move (safer)
+        $tempFile = Join-Path $env:TEMP "PCMasterclass-Maintenance-deploy.ps1"
+        $webClient.DownloadFile($DownloadUrl, $tempFile)
+
+        # Verify download
+        if (-not (Test-Path $tempFile)) {
+            Write-Fail "Download failed - temp file not created"
+            return $false
+        }
+
+        $fileSize = (Get-Item $tempFile).Length
+        if ($fileSize -lt 1000) {
+            Write-Fail "Downloaded file is too small ($fileSize bytes) - may be an error page"
+            Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+            return $false
+        }
+
+        # Extract version from downloaded script
+        $downloadedContent = Get-Content $tempFile -Raw
+        $downloadedVersion = "unknown"
+        if ($downloadedContent -match '\$ScriptVersion\s*=\s*"([^"]+)"') {
+            $downloadedVersion = $Matches[1]
+        }
+
+        # Copy to final location
+        Copy-Item -Path $tempFile -Destination $ScriptPath -Force
+        Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+
+        if ($existingVersion -and $existingVersion -eq $downloadedVersion) {
+            Write-OK "Script is already up to date (v$downloadedVersion)"
+        } elseif ($existingVersion) {
+            Write-OK "Updated: v$existingVersion -> v$downloadedVersion"
+        } else {
+            Write-OK "Installed: PCMasterclass-Maintenance.ps1 v$downloadedVersion"
+        }
+
+        Write-OK "Location: $ScriptPath"
+        Write-OK "File size: $([math]::Round($fileSize / 1KB, 1))KB"
+
+        return $true
+
+    } catch {
+        Write-Fail "Download failed: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+# ============================================================================
+# POST-INSTALL VERIFICATION
+# ============================================================================
+function Test-Installation {
+    Write-Section "VERIFYING INSTALLATION"
+    $allGood = $true
+
+    # Check script exists
+    if (Test-Path $ScriptPath) {
+        Write-OK "Maintenance script present"
+    } else {
+        Write-Fail "Maintenance script missing from $ScriptPath"
+        $allGood = $false
+    }
+
+    # Check all folders exist
+    foreach ($dir in @($BaseDir, $ReportsDir, $ConfigDir, $ToolsDir)) {
+        if (Test-Path $dir) {
+            Write-OK "Directory OK: $dir"
+        } else {
+            Write-Fail "Directory missing: $dir"
+            $allGood = $false
+        }
+    }
+
+    # Check script is parseable (not corrupted)
+    if (Test-Path $ScriptPath) {
+        try {
+            $null = [System.Management.Automation.PSParser]::Tokenize(
+                (Get-Content $ScriptPath -Raw), [ref]$null
+            )
+            Write-OK "Script syntax validation passed"
+        } catch {
+            Write-Fail "Script may be corrupted - syntax check failed"
+            $allGood = $false
+        }
+    }
+
+    return $allGood
+}
+
+# ============================================================================
+# GATHER MACHINE INFO (for Rollout Tracker)
+# ============================================================================
+function Get-MachineInfo {
+    Write-Section "MACHINE INFORMATION"
+
+    $computerName = $env:COMPUTERNAME
+    $osInfo = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+    $csInfo = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+
+    $osVersion = if ($osInfo) { "$($osInfo.Caption) ($($osInfo.Version))" } else { "Unknown" }
+    $deviceType = if ($csInfo) {
+        switch ($csInfo.PCSystemType) {
+            1 { "Desktop" }
+            2 { "Laptop" }
+            3 { "Workstation" }
+            default { "Unknown ($($csInfo.PCSystemType))" }
+        }
+    } else { "Unknown" }
+    $manufacturer = if ($csInfo) { "$($csInfo.Manufacturer) $($csInfo.Model)" } else { "Unknown" }
+
+    Write-OK "Computer Name: $computerName"
+    Write-OK "Device Type:   $deviceType"
+    Write-OK "Hardware:      $manufacturer"
+    Write-OK "OS Version:    $osVersion"
+
+    Write-Host ""
+    Write-Host "  Copy these details to your Rollout Tracker:" -ForegroundColor Yellow
+    Write-Host "    Computer Name:  $computerName" -ForegroundColor White
+    Write-Host "    Device:         $deviceType" -ForegroundColor White
+    Write-Host "    OS Version:     $osVersion" -ForegroundColor White
+}
+
+# ============================================================================
+# DISPLAY SUMMARY
+# ============================================================================
+function Show-Summary {
+    param([bool]$Success)
+
+    Write-Host ""
+    if ($Success) {
+        $summary = @"
+
+    ====================================================
+       DEPLOYMENT COMPLETE
+    ====================================================
+
+       Maintenance script is ready at:
+       $ScriptPath
+
+       TO RUN MAINTENANCE:
+       powershell -ExecutionPolicy Bypass -File "$ScriptPath"
+
+       FIRST-TIME EMAIL SETUP (optional):
+       powershell -ExecutionPolicy Bypass -File "$ScriptPath" ``
+           -SaveCredential -SmtpUser "your@email.com" ``
+           -SmtpPassword "your-app-password"
+
+       The script will auto-update from GitHub each time
+       it runs, so this machine will always get the latest
+       version.
+
+    ====================================================
+"@
+        Write-Host $summary -ForegroundColor Green
+    } else {
+        $summary = @"
+
+    ====================================================
+       DEPLOYMENT INCOMPLETE - SEE ERRORS ABOVE
+    ====================================================
+       Some steps did not complete successfully.
+       Please resolve the issues and run this script again.
+    ====================================================
+"@
+        Write-Host $summary -ForegroundColor Red
+    }
+}
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+Show-Banner
+
+$success = $true
+
+# Step 1: Pre-flight checks
+if (-not (Test-Prerequisites)) {
+    Write-Fail "Pre-flight checks failed - resolve issues before continuing"
+    Show-Summary -Success $false
+    exit 1
+}
+
+# Step 2: Create folder structure
+if (-not (New-FolderStructure)) {
+    $success = $false
+}
+
+# Step 3: Download maintenance script
+if ($success) {
+    if (-not (Get-MaintenanceScript)) {
+        $success = $false
+    }
+}
+
+# Step 4: Verify installation
+if ($success) {
+    if (-not (Test-Installation)) {
+        $success = $false
+    }
+}
+
+# Step 5: Display machine info for Rollout Tracker
+if ($success) {
+    Get-MachineInfo
+}
+
+# Show final summary
+Show-Summary -Success $success
+
+if ($success) {
+    exit 0
+} else {
+    exit 1
+}
