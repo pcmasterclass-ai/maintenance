@@ -36,7 +36,7 @@
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-$DeployVersion = "1.1.0"
+$DeployVersion = "1.2.0"
 $BaseDir = "C:\Teamviewer"
 $ScriptName = "PCMasterclass-Maintenance.ps1"
 $GitHubRepo = "pcmasterclass-ai/maintenance"
@@ -349,7 +349,7 @@ function Set-EmailCredentials {
     if ($setupEmail -notmatch '^[Yy]') {
         Write-Warn "Skipped - you can set this up later by running:"
         Write-Host "    powershell -ExecutionPolicy Bypass -File `"$ScriptPath`" ``" -ForegroundColor White
-        Write-Host "        -SaveCredential -SmtpUser `"reports@pcmasterclass.com.au`" ``" -ForegroundColor White
+        Write-Host "        -SaveCredential -SmtpUser `"paul@pcmasterclass.com.au`" ``" -ForegroundColor White
         Write-Host "        -SmtpPassword `"your-app-password`"" -ForegroundColor White
         return
     }
@@ -358,9 +358,12 @@ function Set-EmailCredentials {
     Write-Host "  Enter the SMTP credentials for sending reports." -ForegroundColor White
     Write-Host "  (For Gmail, use an App Password - not your regular password)" -ForegroundColor White
     Write-Host ""
+    Write-Host "  NOTE: Use the actual Google account (paul@), NOT the alias (reports@)." -ForegroundColor Yellow
+    Write-Host "  Gmail requires the real account for authentication." -ForegroundColor Yellow
+    Write-Host ""
 
-    $defaultEmail = "reports@pcmasterclass.com.au"
-    $smtpInput = Read-Host "  SMTP email address (press Enter for $defaultEmail)"
+    $defaultEmail = "paul@pcmasterclass.com.au"
+    $smtpInput = Read-Host "  SMTP login account (press Enter for $defaultEmail)"
     $smtpUser = if ($smtpInput) { $smtpInput } else { $defaultEmail }
     Write-OK "Using: $smtpUser"
 
@@ -413,11 +416,13 @@ function Set-EmailCredentials {
             Set-Content -Path $aesKeyPath -Value $aesKey -Encoding Byte -Force
 
             # Save the config with encrypted password
+            # SmtpUser = actual Google account for authentication (paul@)
+            # EmailFrom = address shown on sent emails (reports@ alias is fine)
             $aesConfig = @{
                 SmtpUser      = $smtpUser
                 SmtpServer    = "smtp.gmail.com"
                 SmtpPort      = 587
-                EmailFrom     = $smtpUser
+                EmailFrom     = "reports@pcmasterclass.com.au"
                 EncryptedPass = $encPass
             }
             $aesConfig | Export-Clixml -Path $aesConfigPath -Force
@@ -520,10 +525,11 @@ function Set-MaintenanceSchedule {
             -At $runTime
 
         # Task settings - run whether user is logged in or not
+        # StartWhenAvailable ensures the scan catches up if the PC was off at 1am (common for home users)
         $settings = New-ScheduledTaskSettingsSet `
             -AllowStartIfOnBatteries `
             -DontStopIfGoingOnBatteries `
-            -StartWhenAvailable:$false `
+            -StartWhenAvailable `
             -ExecutionTimeLimit (New-TimeSpan -Hours 4) `
             -MultipleInstances IgnoreNew
 
@@ -542,6 +548,16 @@ function Set-MaintenanceSchedule {
         Write-OK "Schedule: $freqLabel at $runTime"
         Write-OK "Reports will be emailed to: $emailTo"
         Write-OK "Task runs as SYSTEM with elevated privileges"
+
+        # Trigger an immediate first run so we don't wait 90 days for the first report
+        Write-Step "Starting first maintenance run in background..."
+        try {
+            Start-ScheduledTask -TaskName $TaskName
+            Write-OK "First run triggered - report will be emailed to $emailTo when complete (10-15 mins)"
+        } catch {
+            Write-Warn "Could not trigger first run automatically: $($_.Exception.Message)"
+            Write-Warn "The task will run at its next scheduled time, or start it manually from Task Scheduler"
+        }
 
     } catch {
         Write-Fail "Failed to create scheduled task: $($_.Exception.Message)"

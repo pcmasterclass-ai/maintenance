@@ -67,7 +67,7 @@ param(
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-$ScriptVersion = "2.1.0"
+$ScriptVersion = "2.2.0"
 
 # GitHub raw URL for the latest version of this script
 # To use: create a private GitHub repo, push the script, and set this URL
@@ -161,6 +161,21 @@ $Timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
 $ComputerName = $env:COMPUTERNAME
 $ReportFile = Join-Path $ReportPath "${ComputerName}_Maintenance_${Timestamp}.html"
 $LogFile = Join-Path $ReportPath "${ComputerName}_Maintenance_${Timestamp}.log"
+
+# ============================================================================
+# CLIENT NAME LOOKUP (from Rollout Tracker via webhook)
+# ============================================================================
+$ClientName = ""
+try {
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+    $lookupUrl = "https://script.google.com/macros/s/AKfycbyKkPyodUa3M2Ka9vXzgjMK0hzq6EfA58unifA7Ih6h4OxjLYfXuqea8rrcO2i4yMmF/exec?computerName=$ComputerName&secret=pcm-tracker-2026"
+    $lookupResponse = Invoke-RestMethod -Uri $lookupUrl -Method Get -TimeoutSec 15 -ErrorAction Stop
+    if ($lookupResponse.status -eq "ok" -and $lookupResponse.clientName) {
+        $ClientName = $lookupResponse.clientName
+    }
+} catch {
+    # Non-critical - continue without client name
+}
 
 # ============================================================================
 # CREDENTIAL MANAGEMENT
@@ -1648,7 +1663,7 @@ try {
     )
 
     foreach ($folder in $startupFolders) {
-        if (Test-Path $folder) {
+        if ($folder -and (Test-Path $folder)) {
             Get-ChildItem -Path $folder -File -ErrorAction SilentlyContinue | ForEach-Object {
                 $startupItems += @{
                     Name    = $_.BaseName
@@ -2642,7 +2657,7 @@ $html = @"
 
 <div class="header">
     <h1>PC Masterclass  - Maintenance Report</h1>
-    <div class="subtitle">$ComputerName &bull; $($Results.OSVersion) &bull; $(Get-Date -Format 'dddd, d MMMM yyyy h:mm tt')</div>
+    <div class="subtitle">$(if ($ClientName) { "$ClientName &bull; " })$ComputerName &bull; $($Results.OSVersion) &bull; $(Get-Date -Format 'dddd, d MMMM yyyy h:mm tt')</div>
     <div class="overall">Overall Status: $overallBadge &nbsp; ($warningCount warning(s), $errorCount error(s))</div>
 </div>
 
@@ -2650,6 +2665,7 @@ $html = @"
 <div class="section">
     <h2><span class="icon">&#x1F4BB;</span> System Information</h2>
     <table>
+        $(if ($ClientName) { "<tr><td><strong>Client</strong></td><td><strong style='font-size:1.1em;'>$ClientName</strong></td></tr>" })
         <tr><td><strong>Computer</strong></td><td>$ComputerName</td></tr>
         <tr><td><strong>Make / Model</strong></td><td>$($Results.SystemInfo.Manufacturer) $($Results.SystemInfo.Model)</td></tr>
         <tr><td><strong>Serial Number</strong></td><td>$($Results.SystemInfo.SerialNumber)</td></tr>
@@ -3190,6 +3206,7 @@ $html | Out-File -FilePath $ReportFile -Encoding UTF8 -Force
 
 # Also export results as JSON for programmatic processing
 $jsonFile = $ReportFile -replace '\.html$', '.json'
+if ($ClientName) { $Results | Add-Member -NotePropertyName "ClientName" -NotePropertyValue $ClientName -Force }
 $Results | ConvertTo-Json -Depth 5 | Out-File -FilePath $jsonFile -Encoding UTF8 -Force
 
 # ============================================================================
@@ -3214,7 +3231,7 @@ if ($EmailTo) {
             default   { "[UNKNOWN]" }
         }
 
-        $emailSubject = "$statusIcon Maintenance Report  - $ComputerName  - $(Get-Date -Format 'dd MMM yyyy')"
+        $emailSubject = "$statusIcon Maintenance Report  - $(if ($ClientName) { "$ClientName - " })$ComputerName  - $(Get-Date -Format 'dd MMM yyyy')"
 
         $emailBody = "[T]PC MASTERCLASS - SCHEDULED MAINTENANCE REPORT[/T]`n"
         $emailBody += "Computer".PadRight(30) + "$ComputerName ($($Results.SystemInfo.Manufacturer) $($Results.SystemInfo.Model))`n"
