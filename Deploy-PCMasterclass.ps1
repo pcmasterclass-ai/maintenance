@@ -13,7 +13,7 @@
 
 .NOTES
     Author:  Paul - PC Masterclass
-    Version: 1.0.0
+    Version: 1.1.0
     Date:    2026-03-12
 
     USAGE (paste into an elevated PowerShell prompt):
@@ -24,24 +24,30 @@
       2. Downloads the latest PCMasterclass-Maintenance.ps1 from GitHub
       3. Verifies the download and displays the installed version
       4. Runs a quick environment check (PowerShell version, admin rights, disk space)
-      5. Displays a summary with next steps
+      5. Displays machine info for the Rollout Tracker
+      6. Sets up email credentials (DPAPI + AES fallback for SYSTEM)
+      7. Creates a Windows Scheduled Task for unattended maintenance runs
 
     WHAT THIS SCRIPT DOES NOT DO:
       - It does not run the maintenance script (you decide when to run it)
-      - It does not create scheduled tasks
-      - It does not store any credentials (that's done on first maintenance run)
-      - It does not modify system settings
+      - It does not modify system settings beyond the scheduled task
 #>
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-$DeployVersion = "1.0.0"
+$DeployVersion = "1.1.0"
 $BaseDir = "C:\Teamviewer"
 $ScriptName = "PCMasterclass-Maintenance.ps1"
 $GitHubRepo = "pcmasterclass-ai/maintenance"
 $GitHubBranch = "main"
 $GitHubToken = "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"
+
+# Email & scheduling defaults
+$DefaultEmailTo = "paul@pcmasterclass.com.au"
+$DefaultRunTime = "1:00AM"
+$DefaultFrequencyDays = 90  # Quarterly (every 90 days)
+$TaskName = "PCMasterclass-Maintenance"
 
 # Derived paths
 $ScriptPath = Join-Path $BaseDir $ScriptName
@@ -370,7 +376,7 @@ function Set-EmailCredentials {
     Write-Step "Saving encrypted credentials..."
 
     try {
-        # Run the maintenance script with -SaveCredential to store them
+        # Run the maintenance script with -SaveCredential to store DPAPI credentials
         $saveArgs = @(
             "-ExecutionPolicy", "Bypass",
             "-File", "`"$ScriptPath`"",
@@ -382,15 +388,164 @@ function Set-EmailCredentials {
         $process = Start-Process powershell.exe -ArgumentList $saveArgs -Wait -NoNewWindow -PassThru
 
         if ($process.ExitCode -eq 0) {
-            Write-OK "Email credentials saved successfully"
-            Write-OK "Reports will be sent from: $smtpUser"
+            Write-OK "Email credentials saved (DPAPI - user context)"
         } else {
             Write-Fail "Credential save may have failed (exit code: $($process.ExitCode))"
             Write-Warn "You can retry later with the -SaveCredential flag"
         }
+
+        # Also save AES-encrypted fallback for SYSTEM scheduled task
+        # DPAPI credentials are tied to the user account - SYSTEM can't read them
+        Write-Step "Saving AES fallback credentials for scheduled task..."
+        try {
+            $aesKeyPath    = Join-Path $ConfigDir "smtp.key"
+            $aesConfigPath = Join-Path $ConfigDir "smtp-config.xml"
+
+            # Generate a random 256-bit AES key
+            $aesKey = New-Object byte[] 32
+            [System.Security.Cryptography.RNGCryptoServiceProvider]::Create().GetBytes($aesKey)
+
+            # Encrypt the password with the AES key (not tied to any user account)
+            $secPass = ConvertTo-SecureString $plainPassword -AsPlainText -Force
+            $encPass = ConvertFrom-SecureString $secPass -Key $aesKey
+
+            # Save the AES key file (restricted permissions set by maintenance script)
+            Set-Content -Path $aesKeyPath -Value $aesKey -Encoding Byte -Force
+
+            # Save the config with encrypted password
+            $aesConfig = @{
+                SmtpUser      = $smtpUser
+                SmtpServer    = "smtp.gmail.com"
+                SmtpPort      = 587
+                EmailFrom     = $smtpUser
+                EncryptedPass = $encPass
+            }
+            $aesConfig | Export-Clixml -Path $aesConfigPath -Force
+
+            # Restrict permissions on the key file to SYSTEM and current user only
+            try {
+                foreach ($file in @($aesKeyPath, $aesConfigPath)) {
+                    $acl = Get-Acl $file
+                    $acl.SetAccessRuleProtection($true, $false)
+                    $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+                    $userRule   = New-Object System.Security.AccessControl.FileSystemAccessRule($currentUser, "FullControl", "None", "None", "Allow")
+                    $systemRule = New-Object System.Security.AccessControl.FileSystemAccessRule("SYSTEM", "FullControl", "None", "None", "Allow")
+                    $acl.AddAccessRule($userRule)
+                    $acl.AddAccessRule($systemRule)
+                    Set-Acl $file $acl
+                }
+            } catch {
+                Write-Warn "Could not restrict key file permissions: $_"
+            }
+
+            Write-OK "AES fallback credentials saved (for SYSTEM scheduled task)"
+            Write-OK "Reports will be sent from: $smtpUser"
+        } catch {
+            Write-Fail "AES fallback save failed: $($_.Exception.Message)"
+            Write-Warn "Scheduled task may not be able to send emails - credentials only work for interactive runs"
+        }
+
     } catch {
         Write-Fail "Failed to save credentials: $($_.Exception.Message)"
         Write-Warn "You can retry later with the -SaveCredential flag"
+    }
+}
+
+# ============================================================================
+# SCHEDULED TASK SETUP
+# ============================================================================
+function Set-MaintenanceSchedule {
+    Write-Section "SCHEDULED MAINTENANCE SETUP"
+    Write-Host ""
+    Write-Host "  The maintenance script can run automatically on a schedule." -ForegroundColor White
+    Write-Host "  It will run unattended, generate a report, and email it to you." -ForegroundColor White
+    Write-Host ""
+    Write-Host "  Default: Every 90 days at $DefaultRunTime" -ForegroundColor White
+    Write-Host "  Reports emailed to: $DefaultEmailTo" -ForegroundColor White
+    Write-Host ""
+
+    $setupSchedule = Read-Host "  Set up scheduled maintenance? (Y/N)"
+
+    if ($setupSchedule -notmatch '^[Yy]') {
+        Write-Warn "Skipped - maintenance will only run when triggered manually"
+        return
+    }
+
+    # Ask for run time
+    Write-Host ""
+    $timeInput = Read-Host "  Run time (press Enter for $DefaultRunTime)"
+    $runTime = if ($timeInput) { $timeInput } else { $DefaultRunTime }
+
+    # Ask for frequency
+    Write-Host ""
+    Write-Host "  Frequency options:" -ForegroundColor White
+    Write-Host "    1. Every 90 days (quarterly - recommended)" -ForegroundColor White
+    Write-Host "    2. Every 60 days (bi-monthly)" -ForegroundColor White
+    Write-Host "    3. Every 30 days (monthly)" -ForegroundColor White
+    Write-Host ""
+    $freqChoice = Read-Host "  Choose frequency (press Enter for quarterly)"
+
+    $frequencyDays = switch ($freqChoice) {
+        "2" { 60 }
+        "3" { 30 }
+        default { $DefaultFrequencyDays }
+    }
+    $freqLabel = switch ($frequencyDays) {
+        30 { "monthly (every 30 days)" }
+        60 { "bi-monthly (every 60 days)" }
+        90 { "quarterly (every 90 days)" }
+    }
+
+    # Ask for email recipient
+    Write-Host ""
+    $emailInput = Read-Host "  Email reports to (press Enter for $DefaultEmailTo)"
+    $emailTo = if ($emailInput) { $emailInput } else { $DefaultEmailTo }
+
+    Write-Step "Creating scheduled task..."
+
+    try {
+        # Build the command that the scheduled task will run
+        $scriptArgs = "-ExecutionPolicy Bypass -File `"$ScriptPath`" -EmailTo `"$emailTo`""
+
+        # Create the scheduled task action
+        $action = New-ScheduledTaskAction `
+            -Execute "powershell.exe" `
+            -Argument $scriptArgs
+
+        # Create the trigger - daily trigger with repetition interval
+        # We use a daily trigger and set the interval to our frequency
+        $trigger = New-ScheduledTaskTrigger `
+            -Once `
+            -At $runTime `
+            -RepetitionInterval (New-TimeSpan -Days $frequencyDays)
+
+        # Task settings - run whether user is logged in or not
+        $settings = New-ScheduledTaskSettingsSet `
+            -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries `
+            -StartWhenAvailable:$false `
+            -ExecutionTimeLimit (New-TimeSpan -Hours 4) `
+            -MultipleInstances IgnoreNew
+
+        # Register the task to run as SYSTEM (no password needed, runs elevated)
+        Register-ScheduledTask `
+            -TaskName $TaskName `
+            -Action $action `
+            -Trigger $trigger `
+            -Settings $settings `
+            -User "SYSTEM" `
+            -RunLevel Highest `
+            -Description "PC Masterclass automated maintenance - runs $freqLabel and emails report to $emailTo" `
+            -Force | Out-Null
+
+        Write-OK "Scheduled task created: $TaskName"
+        Write-OK "Schedule: $freqLabel at $runTime"
+        Write-OK "Reports will be emailed to: $emailTo"
+        Write-OK "Task runs as SYSTEM with elevated privileges"
+
+    } catch {
+        Write-Fail "Failed to create scheduled task: $($_.Exception.Message)"
+        Write-Warn "You can create it manually later via Task Scheduler"
     }
 }
 
@@ -477,6 +632,11 @@ if ($success) {
 # Step 6: Email credential setup (optional, interactive)
 if ($success) {
     Set-EmailCredentials
+}
+
+# Step 7: Scheduled task setup (optional, interactive)
+if ($success) {
+    Set-MaintenanceSchedule
 }
 
 # Show final summary
