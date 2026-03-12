@@ -343,7 +343,7 @@ function Set-EmailCredentials {
     if ($setupEmail -notmatch '^[Yy]') {
         Write-Warn "Skipped - you can set this up later by running:"
         Write-Host "    powershell -ExecutionPolicy Bypass -File `"$ScriptPath`" ``" -ForegroundColor White
-        Write-Host "        -SaveCredential -SmtpUser `"your@email.com`" ``" -ForegroundColor White
+        Write-Host "        -SaveCredential -SmtpUser `"reports@pcmasterclass.com.au`" ``" -ForegroundColor White
         Write-Host "        -SmtpPassword `"your-app-password`"" -ForegroundColor White
         return
     }
@@ -353,11 +353,10 @@ function Set-EmailCredentials {
     Write-Host "  (For Gmail, use an App Password - not your regular password)" -ForegroundColor White
     Write-Host ""
 
-    $smtpUser = Read-Host "  SMTP email address (e.g. reports@pcmasterclass.com.au)"
-    if (-not $smtpUser) {
-        Write-Warn "No email entered - skipping credential setup"
-        return
-    }
+    $defaultEmail = "reports@pcmasterclass.com.au"
+    $smtpInput = Read-Host "  SMTP email address (press Enter for $defaultEmail)"
+    $smtpUser = if ($smtpInput) { $smtpInput } else { $defaultEmail }
+    Write-OK "Using: $smtpUser"
 
     $smtpPassword = Read-Host "  SMTP password / App Password" -AsSecureString
     $plainPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
