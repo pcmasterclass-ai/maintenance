@@ -3642,6 +3642,35 @@ $safeBody
 }
 
 
+# ============================================================================
+# UPDATE ROLLOUT TRACKER (webhook to Google Sheets)
+# ============================================================================
+$WebhookUrl = "https://script.google.com/macros/s/AKfycbyKkPyodUa3M2Ka9vXzgjMK0hzq6EfA58unifA7Ih6h4OxjLYfXuqea8rrcO2i4yMmF/exec"
+$WebhookSecret = "pcm-tracker-2026"
+
+try {
+    $osCaption = (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption
+    $webhookData = @{
+        secret         = $WebhookSecret
+        computerName   = $env:COMPUTERNAME
+        scriptVersion  = $ScriptVersion
+        lastRun        = (Get-Date).ToString("yyyy-MM-dd")
+        frequencyDays  = 90
+        osVersion      = if ($osCaption) { $osCaption } else { "Unknown" }
+    } | ConvertTo-Json -Compress
+
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+    $response = Invoke-RestMethod -Uri $WebhookUrl -Method Post -Body $webhookData -ContentType "application/json" -TimeoutSec 30 -ErrorAction Stop
+
+    if ($response.status -eq "ok") {
+        Write-Log "Rollout Tracker updated successfully (row $($response.row))"
+    } else {
+        Write-Log "Rollout Tracker update warning: $($response.message)" "WARN"
+    }
+} catch {
+    Write-Log "Rollout Tracker webhook failed (non-critical): $_" "WARN"
+}
+
 Write-Log "============================================"
 Write-Log "REPORT SAVED: $ReportFile"
 Write-Log "JSON DATA:    $jsonFile"
