@@ -67,7 +67,7 @@ param(
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-$ScriptVersion = "2.2.0"
+$ScriptVersion = "2.4.0"
 
 # GitHub raw URL for the latest version of this script
 # To use: create a private GitHub repo, push the script, and set this URL
@@ -348,6 +348,7 @@ $Results = [ordered]@{
     DiskHealth       = @{}
     WindowsUpdates   = @{}
     iDriveBackup     = @{}
+    Malwarebytes     = @{}
     Defender         = @{}
     EventLogErrors   = @{}
     PendingReboot    = @{}
@@ -362,7 +363,12 @@ $Results = [ordered]@{
     NetworkConfig    = @{}
     AdwCleaner       = @{}
     Errors           = @()
+    EmailResult      = @{}
+    WebhookResult    = @{}
 }
+
+# Script timer
+$scriptStartTime = Get-Date
 
 # Logging helper
 function Write-Log {
@@ -473,6 +479,8 @@ try {
         foreach ($tz in $thermalZones) {
             # WMI returns temperature in tenths of Kelvin - convert to Celsius
             $tempC = [math]::Round(($tz.CurrentTemperature / 10) - 273.15, 1)
+            # Discard obviously invalid readings (sensor errors return near-zero Kelvin or extreme values)
+            if ($tempC -lt -40 -or $tempC -gt 150) { continue }
             $zoneName = if ($tz.InstanceName) { ($tz.InstanceName -split '\\')[-1] -replace '_', ' ' } else { "Thermal Zone" }
             $thermalData += @{ Zone = $zoneName; TempC = $tempC; TempF = [math]::Round(($tempC * 9/5) + 32, 1) }
         }
@@ -486,6 +494,7 @@ try {
             $tempProbes = Get-CimInstance Win32_TemperatureProbe -ErrorAction Stop | Where-Object { $_.CurrentReading }
             foreach ($probe in $tempProbes) {
                 $tempC = [math]::Round($probe.CurrentReading / 10, 1)
+                if ($tempC -lt -40 -or $tempC -gt 150) { continue }
                 $probeName = if ($probe.Description) { $probe.Description } else { "Temperature Probe" }
                 $thermalData += @{ Zone = $probeName; TempC = $tempC; TempF = [math]::Round(($tempC * 9/5) + 32, 1) }
             }
@@ -500,6 +509,7 @@ try {
             $perfThermal = Get-CimInstance Win32_PerfFormattedData_Counters_ThermalZoneInformation -ErrorAction Stop
             foreach ($pt in $perfThermal) {
                 $tempC = [math]::Round($pt.Temperature - 273.15, 1)
+                if ($tempC -lt -40 -or $tempC -gt 150) { continue }
                 $zoneName = if ($pt.Name) { $pt.Name } else { "Thermal Zone" }
                 $thermalData += @{ Zone = $zoneName; TempC = $tempC; TempF = [math]::Round(($tempC * 9/5) + 32, 1) }
             }
@@ -526,6 +536,120 @@ try {
 } catch {
     Write-Log "Failed to gather system info: $_" "ERROR"
     $Results.Errors += "System Info: $_"
+}
+
+# ============================================================================
+# CPU BENCHMARK LOOKUP (PassMark)
+# Looks up the detected CPU in the bundled benchmark CSV to provide a
+# performance score and colour-coded tier rating in the report.
+# ============================================================================
+Write-Log "Looking up CPU benchmark..."
+
+try {
+    $benchmarkCsvPath = "C:\Teamviewer\Data\cpu-benchmarks.csv"
+    $Results.SystemInfo.CPUBenchmark = @{
+        Score          = 0
+        Tier           = "Unknown"
+        TierColor      = "#6c757d"
+        Matched        = ""
+        DefinitionsDate = ""
+        DefinitionsAge  = ""
+    }
+
+    if (Test-Path $benchmarkCsvPath) {
+        $benchmarkData = Import-Csv $benchmarkCsvPath
+
+        # Track definitions age from file last-write time
+        $csvDate = (Get-Item $benchmarkCsvPath).LastWriteTime
+        $Results.SystemInfo.CPUBenchmark.DefinitionsDate = $csvDate.ToString("d MMM yyyy")
+        $ageDays = [math]::Floor(((Get-Date) - $csvDate).TotalDays)
+        if ($ageDays -eq 0) {
+            $Results.SystemInfo.CPUBenchmark.DefinitionsAge = "today"
+        } elseif ($ageDays -eq 1) {
+            $Results.SystemInfo.CPUBenchmark.DefinitionsAge = "1 day ago"
+        } elseif ($ageDays -lt 30) {
+            $Results.SystemInfo.CPUBenchmark.DefinitionsAge = "$ageDays days ago"
+        } elseif ($ageDays -lt 365) {
+            $months = [math]::Floor($ageDays / 30)
+            $Results.SystemInfo.CPUBenchmark.DefinitionsAge = "$months month$(if ($months -gt 1) {'s'}) ago"
+        } else {
+            $years = [math]::Floor($ageDays / 365)
+            $Results.SystemInfo.CPUBenchmark.DefinitionsAge = "$years year$(if ($years -gt 1) {'s'}) ago"
+        }
+        $detectedCpu = $Results.SystemInfo.CPU
+
+        # Try exact match first (after normalising whitespace)
+        $normalised = ($detectedCpu -replace '\s+', ' ').Trim()
+        $match = $benchmarkData | Where-Object { $_.CpuName -eq $normalised } | Select-Object -First 1
+
+        # Try match without clock speed suffix (e.g. "@ 3.60GHz")
+        if (-not $match) {
+            $cpuNoSpeed = ($normalised -replace '\s*@\s*[\d\.]+\s*GHz', '').Trim()
+            $match = $benchmarkData | Where-Object { $_.CpuName -eq $cpuNoSpeed } | Select-Object -First 1
+        }
+
+        # Try match adding clock speed from WMI
+        if (-not $match -and $cpuMaxSpeed) {
+            $cpuWithSpeed = "$cpuNoSpeed @ $($cpuMaxSpeed.ToString('0.00'))GHz"
+            $match = $benchmarkData | Where-Object { $_.CpuName -eq $cpuWithSpeed } | Select-Object -First 1
+        }
+
+        # Try fuzzy match - find closest match by checking if CSV name is contained in detected name or vice versa
+        if (-not $match) {
+            $match = $benchmarkData | Where-Object {
+                $csvName = ($_.CpuName -replace '\s*@\s*[\d\.]+\s*GHz', '').Trim()
+                $cpuNoSpeed -like "*$csvName*" -or $csvName -like "*$cpuNoSpeed*"
+            } | Select-Object -First 1
+        }
+
+        # Try partial model match (e.g. "i7-14700" from "Intel Core i7-14700")
+        if (-not $match) {
+            # Extract the model number pattern like "i7-14700" or "Ryzen 7 5800X"
+            if ($cpuNoSpeed -match '(i[3579]-\d{4,5}\w*|Ryzen\s+\d\s+\d{4}\w*|N\d{2,3}|Celeron\s+\w+\d+|Pentium\s+\w+\s+\w+\d+)') {
+                $modelPattern = $Matches[1]
+                $match = $benchmarkData | Where-Object {
+                    $_.CpuName -match [regex]::Escape($modelPattern)
+                } | Select-Object -First 1
+            }
+        }
+
+        if ($match) {
+            $score = [int]$match.CpuMark
+            $Results.SystemInfo.CPUBenchmark.Score = $score
+            $Results.SystemInfo.CPUBenchmark.Matched = $match.CpuName
+
+            # Performance tiers based on average consumer desktop CPU (~15,000 in 2025/2026)
+            # Very Slow: < 5,000     (old dual-core, Celerons, 4th gen and below)
+            # Slow:      5,000-9,999 (budget / older i3/i5, entry Ryzen)
+            # Average:   10,000-19,999 (mainstream i5 10th-11th gen, Ryzen 5 3xxx)
+            # Fast:      20,000-34,999 (current-gen i5/i7, Ryzen 5/7 5xxx-7xxx)
+            # Very Fast: 35,000+      (high-end i7/i9, Ryzen 7/9 latest gen)
+            if ($score -ge 35000) {
+                $Results.SystemInfo.CPUBenchmark.Tier = "Very Fast"
+                $Results.SystemInfo.CPUBenchmark.TierColor = "#28a745"  # Green
+            } elseif ($score -ge 20000) {
+                $Results.SystemInfo.CPUBenchmark.Tier = "Fast"
+                $Results.SystemInfo.CPUBenchmark.TierColor = "#17a2b8"  # Blue
+            } elseif ($score -ge 10000) {
+                $Results.SystemInfo.CPUBenchmark.Tier = "Average"
+                $Results.SystemInfo.CPUBenchmark.TierColor = "#ffc107"  # Yellow/Amber
+            } elseif ($score -ge 5000) {
+                $Results.SystemInfo.CPUBenchmark.Tier = "Slow"
+                $Results.SystemInfo.CPUBenchmark.TierColor = "#fd7e14"  # Orange
+            } else {
+                $Results.SystemInfo.CPUBenchmark.Tier = "Very Slow"
+                $Results.SystemInfo.CPUBenchmark.TierColor = "#dc3545"  # Red
+            }
+
+            Write-Log "CPU Benchmark: $score (PassMark) - $($Results.SystemInfo.CPUBenchmark.Tier) [matched: $($match.CpuName)]"
+        } else {
+            Write-Log "CPU Benchmark: No match found for '$detectedCpu'" "WARN"
+        }
+    } else {
+        Write-Log "CPU Benchmark: csv not found at $benchmarkCsvPath" "WARN"
+    }
+} catch {
+    Write-Log "CPU Benchmark lookup failed: $_" "WARN"
 }
 
 
@@ -604,15 +728,18 @@ if (-not $SkipSFC) {
         $sfcOutput = & sfc /scannow 2>&1 | Out-String
         $sfcDuration = [math]::Round(((Get-Date) - $sfcStart).TotalMinutes, 1)
 
+        # Strip null bytes (SFC sometimes outputs UTF-16 with embedded nulls)
+        $sfcClean = $sfcOutput -replace '\x00', ''
+
         # Parse the SFC result
         $sfcStatus = "Unknown"
-        if ($sfcOutput -match "did not find any integrity violations") {
+        if ($sfcClean -match "did not find any integrity violations") {
             $sfcStatus = "PASS"
-        } elseif ($sfcOutput -match "found corrupt files and successfully repaired") {
+        } elseif ($sfcClean -match "found corrupt files and successfully repaired") {
             $sfcStatus = "REPAIRED"
-        } elseif ($sfcOutput -match "found corrupt files but was unable to fix") {
+        } elseif ($sfcClean -match "found corrupt files but was unable to fix") {
             $sfcStatus = "FAIL"
-        } elseif ($sfcOutput -match "could not perform the requested operation") {
+        } elseif ($sfcClean -match "could not perform the requested operation") {
             $sfcStatus = "ERROR"
         }
 
@@ -980,6 +1107,145 @@ try {
     Write-Log "iDrive check failed: $_" "ERROR"
     $Results.iDriveBackup = @{ Status = "ERROR"; Error = $_.ToString() }
     $Results.Errors += "iDrive: $_"
+}
+
+
+# ============================================================================
+# MODULE 5B: MALWAREBYTES ENDPOINT PROTECTION
+# ============================================================================
+Write-Log "Checking Malwarebytes status..."
+
+try {
+    $mbInstalled = $false
+    $mbVersion = "N/A"
+    $mbProductType = "N/A"
+    $mbServiceRunning = $false
+    $mbRealTimeProtection = "N/A"
+    $mbLastScan = "N/A"
+    $mbDefinitionsAge = "N/A"
+    $mbLicenseStatus = "N/A"
+
+    # Check for Malwarebytes service
+    $mbServices = Get-Service -Name "MBAMService", "MBEndpointAgent" -ErrorAction SilentlyContinue
+    $mbServiceRunning = ($mbServices | Where-Object { $_.Status -eq "Running" }).Count -gt 0
+
+    # Check install paths
+    $mbPaths = @(
+        "$env:ProgramFiles\Malwarebytes\Anti-Malware\mbam.exe",
+        "${env:ProgramFiles(x86)}\Malwarebytes\Anti-Malware\mbam.exe",
+        "$env:ProgramFiles\Malwarebytes Endpoint Agent\MBEndpointAgent.exe",
+        "$env:ProgramFiles\Malwarebytes\Malwarebytes\mbam.exe"
+    )
+    foreach ($mbPath in $mbPaths) {
+        if (Test-Path $mbPath) {
+            $mbInstalled = $true
+            $mbFileInfo = Get-Item $mbPath -ErrorAction SilentlyContinue
+            if ($mbFileInfo.VersionInfo.ProductVersion) {
+                $mbVersion = $mbFileInfo.VersionInfo.ProductVersion
+            }
+            break
+        }
+    }
+
+    # Also check via services
+    if ($mbServices) { $mbInstalled = $true }
+
+    if ($mbInstalled) {
+        # Determine product type (Premium/Free/Endpoint)
+        $mbEndpointSvc = Get-Service -Name "MBEndpointAgent" -ErrorAction SilentlyContinue
+        if ($mbEndpointSvc) {
+            $mbProductType = "Endpoint Protection"
+        } else {
+            # Check registry for license type
+            $mbRegPaths = @(
+                "HKLM:\SOFTWARE\Malwarebytes\Malwarebytes",
+                "HKLM:\SOFTWARE\Malwarebytes' Anti-Malware"
+            )
+            foreach ($regPath in $mbRegPaths) {
+                if (Test-Path $regPath) {
+                    $mbReg = Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue
+                    if ($mbReg) {
+                        if ($mbReg.premium -eq 1 -or $mbReg.IsPremium -eq 1) {
+                            $mbProductType = "Premium"
+                        } else {
+                            $mbProductType = "Free"
+                        }
+                        break
+                    }
+                }
+            }
+        }
+
+        # Check real-time protection via WMI (registered antivirus products)
+        try {
+            $avProducts = Get-CimInstance -Namespace "root\SecurityCenter2" -ClassName "AntiVirusProduct" -ErrorAction Stop
+            $mbAV = $avProducts | Where-Object { $_.displayName -match "Malwarebytes" }
+            if ($mbAV) {
+                # productState is a bitmask: bits 12-15 indicate real-time protection
+                $state = $mbAV.productState
+                $rtEnabled = (($state -shr 12) -band 0xF) -eq 1
+                $mbRealTimeProtection = if ($rtEnabled) { "Enabled" } else { "Disabled" }
+            }
+        } catch { }
+
+        # Check last scan and definitions from logs
+        $mbLogsDir = "$env:ProgramData\Malwarebytes\MBAMService\logs"
+        if (Test-Path $mbLogsDir) {
+            $mbLogFile = Get-ChildItem -LiteralPath $mbLogsDir -Filter "mbamservice.log" -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($mbLogFile) {
+                $mbLogTail = Get-Content -LiteralPath $mbLogFile.FullName -Tail 200 -ErrorAction SilentlyContinue | Out-String
+                if ($mbLogTail -match "Scan completed") {
+                    $mbLastScan = $mbLogFile.LastWriteTime.ToString("yyyy-MM-dd HH:mm")
+                }
+            }
+        }
+
+        # Check database/definitions age
+        $mbDbPaths = @(
+            "$env:ProgramData\Malwarebytes\MBAMService\data\mbam-rules.db",
+            "$env:ProgramData\Malwarebytes\MBAMService\SignatureUpdates"
+        )
+        foreach ($dbPath in $mbDbPaths) {
+            if (Test-Path $dbPath) {
+                $dbItem = Get-Item $dbPath -ErrorAction SilentlyContinue
+                if ($dbItem) {
+                    $daysOld = [math]::Round(((Get-Date) - $dbItem.LastWriteTime).TotalDays, 1)
+                    $mbDefinitionsAge = "$daysOld day(s) ago"
+                    break
+                }
+            }
+        }
+
+        $mbStatus = "INSTALLED"
+        if (-not $mbServiceRunning) {
+            $mbStatus = "WARNING - Service not running"
+        }
+
+        $Results.Malwarebytes = @{
+            Installed           = $true
+            Status              = $mbStatus
+            Version             = $mbVersion
+            ProductType         = $mbProductType
+            ServiceRunning      = $mbServiceRunning
+            RealTimeProtection  = $mbRealTimeProtection
+            LastScan            = $mbLastScan
+            DefinitionsAge      = $mbDefinitionsAge
+        }
+
+        Write-Log "Malwarebytes: $mbProductType v$mbVersion | Service: $(if($mbServiceRunning){'Running'}else{'Stopped'}) | RT: $mbRealTimeProtection"
+    } else {
+        $Results.Malwarebytes = @{
+            Installed = $false
+            Status    = "NOT INSTALLED"
+        }
+        Write-Log "Malwarebytes not found on this system"
+    }
+
+} catch {
+    Write-Log "Malwarebytes check failed: $_" "ERROR"
+    $Results.Malwarebytes = @{ Status = "ERROR"; Error = $_.ToString() }
+    $Results.Errors += "Malwarebytes: $_"
 }
 
 
@@ -1660,10 +1926,10 @@ try {
     $startupFolders = @(
         [Environment]::GetFolderPath("Startup"),
         "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup"
-    )
+    ) | Where-Object { $_ -and $_.Trim() -ne '' }
 
     foreach ($folder in $startupFolders) {
-        if ($folder -and (Test-Path $folder)) {
+        if (Test-Path $folder) {
             Get-ChildItem -Path $folder -File -ErrorAction SilentlyContinue | ForEach-Object {
                 $startupItems += @{
                     Name    = $_.BaseName
@@ -1688,6 +1954,9 @@ try {
             Type    = "ScheduledTask"
         }
     }
+
+    # Filter out entries with empty/null commands
+    $startupItems = @($startupItems | Where-Object { $_.Command -and "$($_.Command)".Trim() -ne '' })
 
     # Now flag suspicious items
     $flaggedItems = @()
@@ -1722,11 +1991,11 @@ try {
 
             # Check for unsigned or unknown executables
             $exePath = $null
-            if ($item.Command -match '"([^"]+\.exe)"' -or $item.Command -match '([^\s]+\.exe)') {
+            if ($item.Command -and ($item.Command -match '"([^"]+\.exe)"' -or $item.Command -match '([^\s]+\.exe)')) {
                 $exePath = $matches[1]
             }
 
-            if ($exePath -and (Test-Path $exePath)) {
+            if ($exePath -and $exePath.Trim() -ne '' -and (Test-Path $exePath)) {
                 $sig = Get-AuthenticodeSignature $exePath -ErrorAction SilentlyContinue
                 if ($sig -and $sig.Status -ne "Valid") {
                     $isSuspicious = $true
@@ -1881,6 +2150,35 @@ try {
 # ============================================================================
 Write-Log "Auditing browser extensions..."
 
+# Helper: resolve __MSG_ extension names from _locales
+function Resolve-ExtensionName {
+    param([string]$ManifestName, [string]$ExtVersionDir, [string]$FallbackName)
+
+    if (-not $ManifestName -or $ManifestName -match "^__MSG_") {
+        # Extract the message key (e.g. __MSG_appName__ -> appName)
+        $msgKey = $ManifestName -replace '^__MSG_', '' -replace '__$', ''
+
+        # Try common locale folders in order
+        $localeDirs = @("en", "en_US", "en_GB")
+        foreach ($locale in $localeDirs) {
+            $messagesPath = Join-Path $ExtVersionDir "_locales\$locale\messages.json"
+            if (Test-Path $messagesPath) {
+                try {
+                    $messages = Get-Content -LiteralPath $messagesPath -Raw -ErrorAction Stop | ConvertFrom-Json
+                    # Try the exact key first, then common fallbacks
+                    foreach ($key in @($msgKey, "appName", "extName", "extensionName", "app_name", "name")) {
+                        if ($messages.$key -and $messages.$key.message) {
+                            return $messages.$key.message
+                        }
+                    }
+                } catch { }
+            }
+        }
+        return $FallbackName
+    }
+    return $ManifestName
+}
+
 try {
     $browserExtensions = @()
     $flaggedExtensions = @()
@@ -1903,7 +2201,7 @@ try {
                     if (Test-Path $manifestPath) {
                         try {
                             $manifest = Get-Content -LiteralPath $manifestPath -Raw -ErrorAction Stop | ConvertFrom-Json
-                            $extName = if ($manifest.name -and $manifest.name -notmatch "^__MSG_") { $manifest.name } else { $extFolder.Name }
+                            $extName = Resolve-ExtensionName -ManifestName $manifest.name -ExtVersionDir $verDir.FullName -FallbackName $extFolder.Name
                             $extVersion = if ($manifest.version) { $manifest.version } else { "Unknown" }
                             $permissions = @()
                             if ($manifest.permissions) { $permissions += $manifest.permissions }
@@ -1964,7 +2262,7 @@ try {
                     if (Test-Path $manifestPath) {
                         try {
                             $manifest = Get-Content -LiteralPath $manifestPath -Raw -ErrorAction Stop | ConvertFrom-Json
-                            $extName = if ($manifest.name -and $manifest.name -notmatch "^__MSG_") { $manifest.name } else { $extFolder.Name }
+                            $extName = Resolve-ExtensionName -ManifestName $manifest.name -ExtVersionDir $verDir.FullName -FallbackName $extFolder.Name
                             $extVersion = if ($manifest.version) { $manifest.version } else { "Unknown" }
                             $permissions = @()
                             if ($manifest.permissions) { $permissions += $manifest.permissions }
@@ -2337,16 +2635,15 @@ try {
             $portName = $printer.PortName
             if ($portName -match "^(FILE:|PORTPROMPT:|NUL:|nul:)") { continue }
 
-            # Skip printers flagged as "Local" with no physical port (often virtual)
-            # Real local printers use USB, LPT, WSD, or TCP/IP ports
-            $isNetworkOrPhysicalPort = $portName -match "(USB|LPT|WSD|IP_|TCPMON|DOT4)" -or $printer.Network
+            # Accept printers with physical/network ports or flagged as network printers
+            # Known physical ports: USB, LPT, WSD, TCP/IP, DOT4, IP addresses, Ne ports
+            # Also accept anything the OS flags as a network printer, or HP/vendor-specific ports
+            $isPhysical = $portName -match "(USB|LPT|WSD|IP_|TCPMON|DOT4|Ne\d)" -or
+                          $printer.Network -or
+                          $portName -match '^\d+\.\d+\.\d+\.\d+' -or
+                          $portName -match '(HP|Canon|Epson|Brother|Samsung|Xerox|Ricoh|Lexmark|Kyocera)'
 
-            # Also accept printers with IP-based port names
-            if (-not $isNetworkOrPhysicalPort -and $portName -match '^\d+\.\d+\.\d+\.\d+') {
-                $isNetworkOrPhysicalPort = $true
-            }
-
-            if (-not $isNetworkOrPhysicalPort) { continue }
+            if (-not $isPhysical) { continue }
 
             $statusText = switch ($printer.PrinterStatus) {
                 1 { "Other" }
@@ -2363,7 +2660,9 @@ try {
             $connType = if ($printer.Network) { "Network" }
                         elseif ($portName -match "USB") { "USB" }
                         elseif ($portName -match "LPT") { "Parallel" }
-                        elseif ($portName -match "WSD") { "WSD" }
+                        elseif ($portName -match "WSD") { "WSD (Wi-Fi/Network)" }
+                        elseif ($portName -match '^\d+\.\d+\.\d+\.\d+|TCPMON|IP_|Ne\d') { "Network (TCP/IP)" }
+                        elseif ($portName -match 'HP|Canon|Epson|Brother') { "Network (Vendor)" }
                         else { "Local" }
 
             $isDefault = $printer.Default
@@ -2550,14 +2849,29 @@ if (-not $SkipAdwCleaner) {
                 if ($adwLog) {
                     $adwLogContent = Get-Content -LiteralPath $adwLog.FullName | Out-String
 
-                    # Count detections - parse the "Detected: N" line from the log header
-                    if ($adwLogContent -match "Detected:\s+(\d+)") {
-                        $detectionCount = [int]$matches[1]
-                    } else {
-                        # Fallback: count actual PUP/Adware/Toolbar detection lines (not section headers)
-                        $detectionLines = ($adwLogContent -split "`n") | Where-Object { $_ -match "PUP\.|Adware\.|Toolbar\." }
-                        $detectionCount = ($detectionLines | Measure-Object).Count
+                    # Separate adware/malware from preinstalled software
+                    $logLines = $adwLogContent -split "`n"
+                    $adwareLines = @()
+                    $preinstalledLines = @()
+                    $inPreinstalled = $false
+                    foreach ($line in $logLines) {
+                        if ($line -match "\*+\s*\[\s*Preinstalled Software\s*\]\s*\*+") {
+                            $inPreinstalled = $true
+                            continue
+                        }
+                        if ($inPreinstalled) {
+                            # Capture preinstalled entries (non-blank, non-header lines with actual content)
+                            if ($line.Trim() -and $line -notmatch "^\*+\s*\[" -and $line -notmatch "^#") {
+                                $preinstalledLines += $line.Trim()
+                            }
+                        } else {
+                            # Actual adware/malware detections
+                            if ($line -match "^(PUP\.|Adware\.|Toolbar\.|Hijack\.|Trojan\.|Spyware\.|Ransomware\.)") {
+                                $adwareLines += $line
+                            }
+                        }
                     }
+                    $detectionCount = $adwareLines.Count
                 }
             }
 
@@ -2568,11 +2882,14 @@ if (-not $SkipAdwCleaner) {
             }
 
             $Results.AdwCleaner = @{
-                Status         = if ($detectionCount -eq 0) { "CLEAN" } else { "WARNING  - $detectionCount detection(s)" }
-                ExitCode       = $adwProcess.ExitCode
-                DetectionCount = $detectionCount
-                LogFile        = if ($adwLog) { $adwLog.FullName } else { "N/A" }
-                LogSummary     = if ($adwLogContent.Length -gt 2000) { $adwLogContent.Substring(0, 2000) + "... [truncated]" } else { $adwLogContent }
+                Status              = if ($detectionCount -eq 0) { "CLEAN" } else { "WARNING  - $detectionCount detection(s)" }
+                ExitCode            = $adwProcess.ExitCode
+                DetectionCount      = $detectionCount
+                Detections          = $adwareLines
+                PreinstalledCount   = $preinstalledLines.Count
+                PreinstalledItems   = $preinstalledLines
+                LogFile             = if ($adwLog) { $adwLog.FullName } else { "N/A" }
+                LogSummary          = if ($adwLogContent.Length -gt 2000) { $adwLogContent.Substring(0, 2000) + "... [truncated]" } else { $adwLogContent }
             }
 
             Write-Log "AdwCleaner scan complete: $detectionCount detection(s)"
@@ -2600,7 +2917,7 @@ $overallStatus = "PASS"
 $warningCount = 0
 $errorCount = 0
 
-$checkModules = @($Results.SFC, $Results.DiskHealth, $Results.WindowsUpdates, $Results.iDriveBackup, $Results.Defender, $Results.EventLogErrors, $Results.PendingReboot, $Results.Firewall, $Results.UserAccounts, $Results.DISM, $Results.TempFiles, $Results.StartupPrograms, $Results.ScheduledTasks, $Results.BrowserExtensions, $Results.ServiceStatus, $Results.NetworkConfig, $Results.AdwCleaner)
+$checkModules = @($Results.SFC, $Results.DiskHealth, $Results.WindowsUpdates, $Results.iDriveBackup, $Results.Malwarebytes, $Results.Defender, $Results.EventLogErrors, $Results.PendingReboot, $Results.Firewall, $Results.UserAccounts, $Results.DISM, $Results.TempFiles, $Results.StartupPrograms, $Results.ScheduledTasks, $Results.BrowserExtensions, $Results.ServiceStatus, $Results.NetworkConfig, $Results.AdwCleaner)
 foreach ($module in $checkModules) {
     if ($module.Status -match "ERROR|FAIL") { $errorCount++; $overallStatus = "FAIL" }
     elseif ($module.Status -match "WARNING") { $warningCount++; if ($overallStatus -ne "FAIL") { $overallStatus = "WARNING" } }
@@ -2611,9 +2928,9 @@ function Get-StatusBadge {
     param([string]$Status)
     $colour = switch -Regex ($Status) {
         "PASS|CLEAN|UP TO DATE|REPAIRED" { "#22c55e" }  # green
-        "WARNING|UPDATES AVAILABLE|CHECK REQUIRED" { "#f59e0b" }  # amber
+        "WARNING|UPDATES AVAILABLE|CHECK REQUIRED|NOT INSTALLED" { "#f59e0b" }  # amber
         "FAIL|ERROR" { "#ef4444" }  # red
-        "SKIPPED|NOT INSTALLED" { "#94a3b8" }  # grey
+        "SKIPPED" { "#94a3b8" }  # grey
         default { "#64748b" }
     }
     return "<span style='background:$colour;color:white;padding:3px 10px;border-radius:4px;font-weight:bold;font-size:0.85em;'>$Status</span>"
@@ -2670,7 +2987,11 @@ $html = @"
         <tr><td><strong>Make / Model</strong></td><td>$($Results.SystemInfo.Manufacturer) $($Results.SystemInfo.Model)</td></tr>
         <tr><td><strong>Serial Number</strong></td><td>$($Results.SystemInfo.SerialNumber)</td></tr>
         <tr><td><strong>OS</strong></td><td>$($Results.SystemInfo.OS) - Build $($Results.SystemInfo.Build)</td></tr>
-        <tr><td><strong>CPU</strong></td><td>$($Results.SystemInfo.CPU) ($($Results.SystemInfo.CPUCores) cores / $($Results.SystemInfo.CPUThreads) threads @ $($Results.SystemInfo.CPUMaxSpeedGHz) GHz)</td></tr>
+        <tr><td><strong>CPU</strong></td><td>$($Results.SystemInfo.CPU) ($($Results.SystemInfo.CPUCores) cores / $($Results.SystemInfo.CPUThreads) threads @ $($Results.SystemInfo.CPUMaxSpeedGHz) GHz)$(
+            if ($Results.SystemInfo.CPUBenchmark.Score -gt 0) {
+                " &mdash; <span style='color:$($Results.SystemInfo.CPUBenchmark.TierColor);font-weight:bold;'>$($Results.SystemInfo.CPUBenchmark.Tier)</span> <span style='color:#6c757d;font-size:0.9em;'>(PassMark: $($Results.SystemInfo.CPUBenchmark.Score.ToString('N0')) &bull; defs: $($Results.SystemInfo.CPUBenchmark.DefinitionsAge))</span>"
+            }
+        )</td></tr>
         <tr><td><strong>RAM</strong></td><td>$($Results.SystemInfo.TotalRAM_GB) GB</td></tr>
         <tr><td><strong>BIOS</strong></td><td>$($Results.SystemInfo.BIOSVersion)</td></tr>
         <tr><td><strong>Last Boot</strong></td><td>$($Results.SystemInfo.LastBoot) (Uptime: $($Results.SystemInfo.UptimeDays) days)</td></tr>
@@ -2803,6 +3124,31 @@ if (-not $Results.iDriveBackup.Installed) {
         <tr><td><strong>Duration</strong></td><td>$($Results.iDriveBackup.Duration)</td></tr>
         <tr><td><strong>Computer Name</strong></td><td>$($Results.iDriveBackup.ComputerName)</td></tr>
         <tr><td><strong>Account</strong></td><td>$($Results.iDriveBackup.Account)</td></tr>
+    </table>
+"@
+}
+
+$html += @"
+</div>
+
+<!-- MALWAREBYTES -->
+<div class="section">
+    <h2><span class="icon">&#x1F6E1;</span> Malwarebytes Endpoint Protection $(Get-StatusBadge $Results.Malwarebytes.Status)</h2>
+"@
+
+if (-not $Results.Malwarebytes.Installed) {
+    $html += "<p class='detail'>Malwarebytes not found on this system.</p>"
+} else {
+    $mbSvcRunning = if ($Results.Malwarebytes.ServiceRunning) { "Running" } else { "<span class='warning-text'>Not Running</span>" }
+    $mbRtColor = if ($Results.Malwarebytes.RealTimeProtection -eq "Enabled") { "color:#28a745" } elseif ($Results.Malwarebytes.RealTimeProtection -eq "Disabled") { "color:#dc3545" } else { "" }
+    $html += @"
+    <table>
+        <tr><td><strong>Product</strong></td><td>$($Results.Malwarebytes.ProductType)</td></tr>
+        <tr><td><strong>Version</strong></td><td>$($Results.Malwarebytes.Version)</td></tr>
+        <tr><td><strong>Service Status</strong></td><td>$mbSvcRunning</td></tr>
+        <tr><td><strong>Real-Time Protection</strong></td><td><span style='$mbRtColor;font-weight:bold;'>$($Results.Malwarebytes.RealTimeProtection)</span></td></tr>
+        <tr><td><strong>Definitions Updated</strong></td><td>$($Results.Malwarebytes.DefinitionsAge)</td></tr>
+        <tr><td><strong>Last Scan</strong></td><td>$($Results.Malwarebytes.LastScan)</td></tr>
     </table>
 "@
 }
@@ -3125,7 +3471,6 @@ if ($Results.NetworkConfig.SpeedTest.Tested) {
     $html += "<tr><td><strong>Ping (Latency)</strong></td><td><span style='color:$pingColor;font-weight:bold;'>$($st.PingMs) ms</span></td></tr>"
     $html += "<tr><td><strong>Jitter</strong></td><td><span style='color:$jitterColor;font-weight:bold;'>$($st.JitterMs) ms</span></td></tr>"
     $html += "<tr><td><strong>ISP</strong></td><td>$($st.ISP)</td></tr>"
-    $html += "<tr><td><strong>Test Server</strong></td><td>$($st.ServerName) ($($st.ServerLocation))</td></tr>"
     $html += "</table>"
 } elseif ($Results.NetworkConfig.SpeedTest.Error) {
     $html += "<h3 style='margin-top:12px;margin-bottom:6px;font-size:0.95em;'>Internet Speed Test</h3>"
@@ -3170,7 +3515,25 @@ if ($Results.AdwCleaner.Status -eq "SKIPPED") {
 } elseif ($Results.AdwCleaner.Status -eq "ERROR") {
     $html += "<p class='error-text'>Error: $($Results.AdwCleaner.Error)</p>"
 } else {
-    $html += "<p>Detections: $($Results.AdwCleaner.DetectionCount)</p>"
+    $html += "<p>Adware/Malware Detections: $($Results.AdwCleaner.DetectionCount)</p>"
+    if ($Results.AdwCleaner.DetectionCount -gt 0 -and $Results.AdwCleaner.Detections) {
+        $html += "<h3 style='color:#dc2626;margin:10px 0 5px;font-size:0.95em;'>Adware/Malware Found ($($Results.AdwCleaner.DetectionCount))</h3>"
+        $html += "<table><tr><th>Detection</th></tr>"
+        foreach ($detection in $Results.AdwCleaner.Detections) {
+            $html += "<tr class='flagged'><td class='error-text'>$([System.Net.WebUtility]::HtmlEncode($detection.Trim()))</td></tr>"
+        }
+        $html += "</table>"
+    } elseif ($Results.AdwCleaner.DetectionCount -eq 0) {
+        $html += "<p style='color:#28a745;font-weight:bold;'>No adware or malware found.</p>"
+    }
+    if ($Results.AdwCleaner.PreinstalledCount -gt 0) {
+        $html += "<h3 style='margin:10px 0 5px;font-size:0.95em;color:#6b7280;'>Preinstalled Software ($($Results.AdwCleaner.PreinstalledCount) items)</h3>"
+        $html += "<table><tr><th>Item</th></tr>"
+        foreach ($item in $Results.AdwCleaner.PreinstalledItems) {
+            $html += "<tr><td class='detail'>$([System.Net.WebUtility]::HtmlEncode($item))</td></tr>"
+        }
+        $html += "</table>"
+    }
     if ($Results.AdwCleaner.LogFile -ne "N/A") {
         $html += "<p class='detail'>Full log: $($Results.AdwCleaner.LogFile)</p>"
     }
@@ -3204,7 +3567,7 @@ $html += @"
 # Write the report
 $html | Out-File -FilePath $ReportFile -Encoding UTF8 -Force
 
-# Also export results as JSON for programmatic processing
+# Export results as JSON (preliminary - so it can be attached to email; re-exported after email + webhook)
 $jsonFile = $ReportFile -replace '\.html$', '.json'
 if ($ClientName) { $Results | Add-Member -NotePropertyName "ClientName" -NotePropertyValue $ClientName -Force }
 $Results | ConvertTo-Json -Depth 5 | Out-File -FilePath $jsonFile -Encoding UTF8 -Force
@@ -3231,7 +3594,8 @@ if ($EmailTo) {
             default   { "[UNKNOWN]" }
         }
 
-        $emailSubject = "$statusIcon Maintenance Report  - $(if ($ClientName) { "$ClientName - " })$ComputerName  - $(Get-Date -Format 'dd MMM yyyy')"
+        $scriptDuration = [math]::Round(((Get-Date) - $scriptStartTime).TotalMinutes, 1)
+        $emailSubject = "$statusIcon Maintenance Report  - $(if ($ClientName) { "$ClientName ($ComputerName)" } else { $ComputerName })  - $(Get-Date -Format 'dd MMM yyyy') [${scriptDuration}m]"
 
         $emailBody = "[T]PC MASTERCLASS - SCHEDULED MAINTENANCE REPORT[/T]`n"
         $emailBody += "Computer".PadRight(30) + "$ComputerName ($($Results.SystemInfo.Manufacturer) $($Results.SystemInfo.Model))`n"
@@ -3239,6 +3603,17 @@ if ($EmailTo) {
         $emailBody += "Date".PadRight(30) + "$(Get-Date -Format 'dddd, d MMMM yyyy h:mm tt')`n"
         $emailBody += "OS".PadRight(30) + "$($Results.SystemInfo.OS) - Build $($Results.SystemInfo.Build)`n"
         $emailBody += "CPU".PadRight(30) + "$($Results.SystemInfo.CPU) ($($Results.SystemInfo.CPUCores)C/$($Results.SystemInfo.CPUThreads)T)`n"
+        if ($Results.SystemInfo.CPUBenchmark.Score -gt 0) {
+            $tierTag = switch ($Results.SystemInfo.CPUBenchmark.Tier) {
+                "Very Fast"  { "[G]$($Results.SystemInfo.CPUBenchmark.Tier)[/G]" }
+                "Fast"       { "[G]$($Results.SystemInfo.CPUBenchmark.Tier)[/G]" }
+                "Average"    { "[W]$($Results.SystemInfo.CPUBenchmark.Tier)[/W]" }
+                "Slow"       { "[W]$($Results.SystemInfo.CPUBenchmark.Tier)[/W]" }
+                "Very Slow"  { "[R]$($Results.SystemInfo.CPUBenchmark.Tier)[/R]" }
+                default      { $Results.SystemInfo.CPUBenchmark.Tier }
+            }
+            $emailBody += "CPU Benchmark".PadRight(30) + "PassMark: $($Results.SystemInfo.CPUBenchmark.Score.ToString('N0')) - $tierTag (defs: $($Results.SystemInfo.CPUBenchmark.DefinitionsAge))`n"
+        }
         $emailBody += "RAM".PadRight(30) + "$($Results.SystemInfo.TotalRAM_GB) GB`n"
         $emailBody += "Uptime".PadRight(30) + "$($Results.SystemInfo.UptimeDays) days`n"
         if ($Results.SystemInfo.Temperatures[0].Zone -ne "N/A") {
@@ -3272,6 +3647,7 @@ if ($EmailTo) {
 ${overallColor}OVERALL STATUS: $overallStatus ($warningCount warning(s), $errorCount error(s))${overallEnd}
 
 [H]CHECK RESULTS SUMMARY[/H]
+
 "@
         # Build aligned two-column summary
         $checkItems = @(
@@ -3279,6 +3655,7 @@ ${overallColor}OVERALL STATUS: $overallStatus ($warningCount warning(s), $errorC
             @("Disk Health", $Results.DiskHealth.Status),
             @("Windows Updates", $(if ($Results.WindowsUpdates.PendingCount) { "$($Results.WindowsUpdates.Status) - $($Results.WindowsUpdates.PendingCount) pending" } else { $Results.WindowsUpdates.Status })),
             @("iDrive Backup", $Results.iDriveBackup.Status),
+            @("Malwarebytes", $Results.Malwarebytes.Status),
             @("Windows Defender", $Results.Defender.Status),
             @("Event Log Errors (24h)", $Results.EventLogErrors.Status),
             @("Pending Reboot", $Results.PendingReboot.Status),
@@ -3299,11 +3676,11 @@ ${overallColor}OVERALL STATUS: $overallStatus ($warningCount warning(s), $errorC
             # Colour-code the status in the summary
             if ($statusText -match "ERROR|FAIL") {
                 $emailBody += "$label [R]$statusText[/R]`n"
-            } elseif ($statusText -match "WARNING|UPDATES AVAILABLE|flagged|stopped") {
+            } elseif ($statusText -match "WARNING|UPDATES AVAILABLE|NOT INSTALLED|flagged|stopped") {
                 $emailBody += "$label [W]$statusText[/W]`n"
             } elseif ($statusText -match "PASS|CLEAN|UP TO DATE") {
                 $emailBody += "$label [G]$statusText[/G]`n"
-            } elseif ($statusText -match "SKIPPED|NOT INSTALLED") {
+            } elseif ($statusText -match "SKIPPED") {
                 $emailBody += "$label $statusText`n"
             } else {
                 $emailBody += "$label $statusText`n"
@@ -3329,6 +3706,24 @@ ${overallColor}OVERALL STATUS: $overallStatus ($warningCount warning(s), $errorC
             $emailBody += "Computer Name".PadRight(30) + "$($Results.iDriveBackup.ComputerName)`n"
             $emailBody += "Account".PadRight(30) + "$($Results.iDriveBackup.Account)`n"
             $emailBody += "Service".PadRight(30) + "$svcStatus`n"
+            $emailBody += "`n"
+        }
+
+        # Add Malwarebytes details if installed
+        if ($Results.Malwarebytes.Installed) {
+            $mbSvcText = if ($Results.Malwarebytes.ServiceRunning) { "[G]Running[/G]" } else { "[R]Not Running[/R]" }
+            $mbRtText = switch ($Results.Malwarebytes.RealTimeProtection) {
+                "Enabled"  { "[G]Enabled[/G]" }
+                "Disabled" { "[R]Disabled[/R]" }
+                default    { $Results.Malwarebytes.RealTimeProtection }
+            }
+            $emailBody += "`n[H]MALWAREBYTES ENDPOINT PROTECTION[/H]`n"
+            $emailBody += "Product".PadRight(30) + "$($Results.Malwarebytes.ProductType)`n"
+            $emailBody += "Version".PadRight(30) + "$($Results.Malwarebytes.Version)`n"
+            $emailBody += "Service".PadRight(30) + "$mbSvcText`n"
+            $emailBody += "Real-Time Protection".PadRight(30) + "$mbRtText`n"
+            $emailBody += "Definitions Updated".PadRight(30) + "$($Results.Malwarebytes.DefinitionsAge)`n"
+            $emailBody += "Last Scan".PadRight(30) + "$($Results.Malwarebytes.LastScan)`n"
             $emailBody += "`n"
         }
 
@@ -3487,8 +3882,12 @@ ${overallColor}OVERALL STATUS: $overallStatus ($warningCount warning(s), $errorC
             $emailBody += "  [B]** FLAGGED TASKS **[/B]`n"
             foreach ($task in $Results.ScheduledTasks.FlaggedTasks) {
                 $emailBody += "  [R]$($task.TaskName)[/R]`n"
-                $cmdTruncated = if ($task.Command.Length -gt 70) { $task.Command.Substring(0, 70) + "..." } else { $task.Command }
-                $emailBody += "    Command: $cmdTruncated`n"
+                if ($task.Command.Length -gt 80) {
+                    $emailBody += "    Command: $($task.Command.Substring(0, 80))`n"
+                    $emailBody += "             $($task.Command.Substring(80))`n"
+                } else {
+                    $emailBody += "    Command: $($task.Command)`n"
+                }
                 $emailBody += "    -> [R]$($task.FlagReason)[/R]`n`n"
             }
         }
@@ -3505,6 +3904,27 @@ ${overallColor}OVERALL STATUS: $overallStatus ($warningCount warning(s), $errorC
                 $emailBody += "  $($ext.Name) ($($ext.Browser))".PadRight(40) + "$flagColor$($ext.FlagReason)$flagEnd`n"
             }
             $emailBody += "`n"
+        }
+
+        # Add AdwCleaner details
+        if ($Results.AdwCleaner.Status -and $Results.AdwCleaner.Status -ne "SKIPPED" -and $Results.AdwCleaner.Status -ne "ERROR") {
+            $emailBody += "`n[H]ADWCLEANER SCAN[/H]`n"
+            if ($Results.AdwCleaner.DetectionCount -gt 0 -and $Results.AdwCleaner.Detections) {
+                $emailBody += "Adware/Malware Found".PadRight(30) + "[R]$($Results.AdwCleaner.DetectionCount)[/R]`n`n"
+                foreach ($detection in $Results.AdwCleaner.Detections) {
+                    $emailBody += "  [R]$($detection.Trim())[/R]`n"
+                }
+                $emailBody += "`n"
+            } else {
+                $emailBody += "[G]No adware or malware found.[/G]`n`n"
+            }
+            if ($Results.AdwCleaner.PreinstalledCount -gt 0) {
+                $emailBody += "Preinstalled Software".PadRight(30) + "$($Results.AdwCleaner.PreinstalledCount) item(s)`n"
+                foreach ($item in $Results.AdwCleaner.PreinstalledItems) {
+                    $emailBody += "  $item`n"
+                }
+                $emailBody += "`n"
+            }
         }
 
         # Add Service Status details if issues found
@@ -3551,8 +3971,7 @@ ${overallColor}OVERALL STATUS: $overallStatus ($warningCount warning(s), $errorC
                 $emailBody += "  Upload".PadRight(30) + "$ulText`n"
                 $emailBody += "  Ping (Latency)".PadRight(30) + "$pingText`n"
                 $emailBody += "  Jitter".PadRight(30) + "$jitterText`n"
-                $emailBody += "  ISP".PadRight(30) + "$($st.ISP)`n"
-                $emailBody += "  Test Server".PadRight(30) + "$($st.ServerName) ($($st.ServerLocation))`n`n"
+                $emailBody += "  ISP".PadRight(30) + "$($st.ISP)`n`n"
             }
 
             # Physical printers
@@ -3649,13 +4068,26 @@ $safeBody
         Send-MailMessage @mailParams -ErrorAction Stop
 
         Write-Log "Email sent successfully to $EmailTo"
+        $Results.EmailResult = @{
+            Status   = "Sent"
+            To       = $EmailTo
+            From     = $EmailFrom
+            Subject  = $emailSubject
+            SmtpServer = $SmtpServer
+        }
 
     } catch {
         Write-Log "Failed to send email: $_" "ERROR"
         $Results.Errors += "Email: $_"
+        $Results.EmailResult = @{
+            Status = "FAILED"
+            Error  = $_.ToString()
+            To     = $EmailTo
+        }
     }
 } else {
     Write-Log "Email not configured (no -EmailTo specified). Skipping."
+    $Results.EmailResult = @{ Status = "Not configured" }
 }
 
 
@@ -3681,12 +4113,31 @@ try {
 
     if ($response.status -eq "ok") {
         Write-Log "Rollout Tracker updated successfully (row $($response.row))"
+        $Results.WebhookResult = @{
+            Status   = "OK"
+            Row      = $response.row
+            Response = $response.message
+            URL      = $WebhookUrl
+        }
     } else {
         Write-Log "Rollout Tracker update warning: $($response.message)" "WARN"
+        $Results.WebhookResult = @{
+            Status   = "WARNING"
+            Response = $response.message
+            URL      = $WebhookUrl
+        }
     }
 } catch {
     Write-Log "Rollout Tracker webhook failed (non-critical): $_" "WARN"
+    $Results.WebhookResult = @{
+        Status = "FAILED"
+        Error  = $_.ToString()
+        URL    = $WebhookUrl
+    }
 }
+
+# Export results as JSON (after email + webhook so all results are captured)
+$Results | ConvertTo-Json -Depth 5 | Out-File -FilePath $jsonFile -Encoding UTF8 -Force
 
 Write-Log "============================================"
 Write-Log "REPORT SAVED: $ReportFile"
