@@ -1,4 +1,3 @@
-#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
     PC Masterclass - Client Onboarding / Deployment Script
@@ -13,7 +12,7 @@
 
 .NOTES
     Author:  Paul - PC Masterclass
-    Version: 1.3.0
+    Version: 1.3.1
     Date:    2026-03-14
 
     USAGE (paste into an elevated PowerShell prompt):
@@ -37,12 +36,12 @@
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-$DeployVersion = "1.3.0"
+$DeployVersion = "1.3.1"
 $BaseDir = "C:\Teamviewer"
 $ScriptName = "PCMasterclass-Maintenance.ps1"
 $GitHubRepo = "pcmasterclass-ai/maintenance"
 $GitHubBranch = "main"
-$GitHubToken = "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"
+$GitHubToken = ""  # Not needed - repo is public
 
 # Email & scheduling defaults
 $DefaultEmailTo = "reports@pcmasterclass.com.au"
@@ -767,6 +766,17 @@ function Show-Summary {
 # MAIN EXECUTION
 # ============================================================================
 
+# Check for admin rights (replaces #Requires -RunAsAdministrator which breaks irm | iex)
+$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator
+)
+if (-not $isAdmin) {
+    Write-Host "`n  [FAIL] This script must be run as Administrator." -ForegroundColor Red
+    Write-Host "  Right-click PowerShell and select 'Run as Administrator', then try again.`n" -ForegroundColor Yellow
+    Read-Host "  Press Enter to close"
+    return
+}
+
 Show-Banner
 
 $success = $true
@@ -775,7 +785,8 @@ $success = $true
 if (-not (Test-Prerequisites)) {
     Write-Fail "Pre-flight checks failed - resolve issues before continuing"
     Show-Summary -Success $false
-    exit 1
+    Read-Host "`n  Press Enter to close"
+    return
 }
 
 # Step 2: Create folder structure
@@ -820,8 +831,4 @@ if ($success) {
 # Show final summary
 Show-Summary -Success $success
 
-if ($success) {
-    exit 0
-} else {
-    exit 1
-}
+Read-Host "`n  Press Enter to close"
