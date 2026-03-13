@@ -1,4 +1,3 @@
-#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
     PC Masterclass - Client Offboarding Script
@@ -15,7 +14,7 @@
 
 .NOTES
     Author:  Paul - PC Masterclass
-    Version: 1.0.0
+    Version: 1.0.1
     Date:    2026-03-12
 
     USAGE (paste into an elevated PowerShell prompt):
@@ -61,10 +60,21 @@ function Write-Section {
 # ============================================================================
 # BANNER
 # ============================================================================
+# Check for admin rights (replaces #Requires -RunAsAdministrator which breaks irm | iex)
+$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator
+)
+if (-not $isAdmin) {
+    Write-Host "`n  [FAIL] This script must be run as Administrator." -ForegroundColor Red
+    Write-Host "  Right-click PowerShell and select 'Run as Administrator', then try again.`n" -ForegroundColor Yellow
+    Read-Host "  Press Enter to close"
+    return
+}
+
 $banner = @"
 
     ====================================================
-       PC Masterclass - Client Offboarding Script v1.0.0
+       PC Masterclass - Client Offboarding Script v1.0.1
     ====================================================
        Removing maintenance environment from this machine
     ====================================================
@@ -88,7 +98,8 @@ $confirm = Read-Host "  Are you sure you want to proceed? (Y/N)"
 if ($confirm -notmatch '^[Yy]') {
     Write-Host ""
     Write-Host "  Offboarding cancelled." -ForegroundColor Cyan
-    exit 0
+    Read-Host "`n  Press Enter to close"
+    return
 }
 
 # ============================================================================
@@ -217,3 +228,5 @@ $summary = @"
     ====================================================
 "@
 Write-Host $summary -ForegroundColor Green
+
+Read-Host "`n  Press Enter to close"

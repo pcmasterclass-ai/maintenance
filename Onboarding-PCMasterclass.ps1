@@ -12,7 +12,7 @@
 
 .NOTES
     Author:  Paul - PC Masterclass
-    Version: 1.3.1
+    Version: 1.3.2
     Date:    2026-03-14
 
     USAGE (paste into an elevated PowerShell prompt):
@@ -36,7 +36,7 @@
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-$DeployVersion = "1.3.1"
+$DeployVersion = "1.3.2"
 $BaseDir = "C:\Teamviewer"
 $ScriptName = "PCMasterclass-Maintenance.ps1"
 $GitHubRepo = "pcmasterclass-ai/maintenance"
@@ -54,7 +54,10 @@ $ScriptPath = Join-Path $BaseDir $ScriptName
 $ReportsDir = Join-Path $BaseDir "Reports"
 $ConfigDir  = Join-Path $BaseDir "Config"
 $ToolsDir   = Join-Path $BaseDir "Tools"
+$DataDir    = Join-Path $BaseDir "Data"
 $DownloadUrl = "https://raw.githubusercontent.com/$GitHubRepo/$GitHubBranch/$ScriptName"
+$BenchmarkCsvUrl = "https://raw.githubusercontent.com/$GitHubRepo/$GitHubBranch/cpu-benchmarks.csv"
+$BenchmarkCsvPath = Join-Path $DataDir "cpu-benchmarks.csv"
 
 # ============================================================================
 # DISPLAY BANNER
@@ -168,7 +171,7 @@ function Test-Prerequisites {
 function New-FolderStructure {
     Write-Section "CREATING FOLDER STRUCTURE"
 
-    $folders = @($BaseDir, $ReportsDir, $ConfigDir, $ToolsDir)
+    $folders = @($BaseDir, $ReportsDir, $ConfigDir, $ToolsDir, $DataDir)
 
     foreach ($folder in $folders) {
         if (Test-Path $folder) {
@@ -251,6 +254,20 @@ function Get-MaintenanceScript {
 
         Write-OK "Location: $ScriptPath"
         Write-OK "File size: $([math]::Round($fileSize / 1KB, 1))KB"
+
+        # Download CPU benchmarks CSV (used for CPU performance tier rating)
+        Write-Step "Downloading CPU benchmark definitions..."
+        try {
+            $csvClient = New-Object System.Net.WebClient
+            if ($GitHubToken) { $csvClient.Headers.Add("Authorization", "token $GitHubToken") }
+            $csvClient.DownloadFile($BenchmarkCsvUrl, $BenchmarkCsvPath)
+            $csvSize = (Get-Item $BenchmarkCsvPath).Length
+            $csvLines = (Get-Content $BenchmarkCsvPath | Measure-Object).Count - 1
+            Write-OK "CPU benchmarks: $csvLines processors ($([math]::Round($csvSize / 1KB, 1))KB)"
+        } catch {
+            Write-Warn "Could not download CPU benchmarks: $($_.Exception.Message)"
+            Write-Warn "The maintenance script will attempt to download it on first run"
+        }
 
         return $true
 
@@ -641,6 +658,23 @@ function Set-MaintenanceSchedule {
         90 { "quarterly (every 90 days)" }
     }
 
+    # Ask for start date
+    Write-Host ""
+    $todayStr = (Get-Date).ToString("dd/MM/yyyy")
+    $dateInput = Read-Host "  Start date dd/MM/yyyy (press Enter for today, $todayStr)"
+    if ($dateInput) {
+        try {
+            $startDate = [datetime]::ParseExact($dateInput, "dd/MM/yyyy", $null)
+        } catch {
+            Write-Warn "Invalid date format - using today"
+            $startDate = (Get-Date).Date
+        }
+    } else {
+        $startDate = (Get-Date).Date
+    }
+    # Combine start date with chosen run time
+    $startDateTime = $startDate.Add([datetime]::Parse($runTime).TimeOfDay)
+
     # Ask for email recipient
     Write-Host ""
     $emailInput = Read-Host "  Email reports to (press Enter for $DefaultEmailTo)"
@@ -658,11 +692,11 @@ function Set-MaintenanceSchedule {
             -Execute "powershell.exe" `
             -Argument $scriptArgs
 
-        # Create a daily trigger with the chosen day interval
+        # Create a daily trigger with the chosen day interval, starting on the chosen date
         $trigger = New-ScheduledTaskTrigger `
             -Daily `
             -DaysInterval $frequencyDays `
-            -At $runTime
+            -At $startDateTime
 
         # Task settings - try full settings first, fall back for older PowerShell versions
         # (Some older systems don't support -AllowStartIfOnBatteries)
@@ -702,17 +736,22 @@ function Set-MaintenanceSchedule {
 
         Write-OK "Scheduled task created: $TaskName"
         Write-OK "Schedule: $freqLabel at $runTime"
+        Write-OK "First scheduled run: $($startDateTime.ToString('dd MMM yyyy')) at $runTime"
         Write-OK "Reports will be emailed to: $emailTo"
         Write-OK "Task runs as SYSTEM with elevated privileges"
 
-        # Trigger an immediate first run so we don't wait 90 days for the first report
-        Write-Step "Starting first maintenance run in background..."
-        try {
-            Start-ScheduledTask -TaskName $TaskName
-            Write-OK "First run triggered - report will be emailed to $emailTo when complete (10-15 mins)"
-        } catch {
-            Write-Warn "Could not trigger first run automatically: $($_.Exception.Message)"
-            Write-Warn "The task will run at its next scheduled time, or start it manually from Task Scheduler"
+        # Trigger an immediate first run if start date is today
+        if ($startDate.Date -le (Get-Date).Date) {
+            Write-Step "Starting first maintenance run in background..."
+            try {
+                Start-ScheduledTask -TaskName $TaskName
+                Write-OK "First run triggered - report will be emailed to $emailTo when complete (10-15 mins)"
+            } catch {
+                Write-Warn "Could not trigger first run automatically: $($_.Exception.Message)"
+                Write-Warn "The task will run at its next scheduled time, or start it manually from Task Scheduler"
+            }
+        } else {
+            Write-OK "First run will occur on $($startDate.ToString('dd MMM yyyy')) at $runTime"
         }
 
     } catch {
