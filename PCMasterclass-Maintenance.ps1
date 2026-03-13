@@ -74,7 +74,7 @@ $ScriptVersion = "2.5.0"
 # Format: https://raw.githubusercontent.com/OWNER/REPO/main/PCMasterclass-Maintenance.ps1
 # For private repos, append ?token=YOUR_PAT or use the $UpdateToken variable below
 $UpdateUrl = "https://raw.githubusercontent.com/pcmasterclass-ai/maintenance/main/PCMasterclass-Maintenance.ps1"
-$UpdateToken = "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"  # GitHub Personal Access Token (for private repos only)
+$UpdateToken = ""  # Not needed - repo is public
 
 # ============================================================================
 # AUTO-UPDATE FROM GITHUB
@@ -1359,7 +1359,20 @@ try {
 
     # Determine overall status
     if (-not $mpStatus.RealTimeProtectionEnabled) {
-        $defenderStatus = "FAIL - Real-time protection DISABLED"
+        # Check if a third-party AV (e.g. Malwarebytes) is providing protection instead
+        $thirdPartyAV = $null
+        try {
+            $avProducts = Get-CimInstance -Namespace "root\SecurityCenter2" -ClassName "AntiVirusProduct" -ErrorAction SilentlyContinue
+            $thirdPartyAV = $avProducts | Where-Object { $_.displayName -notmatch "Windows Defender|Microsoft Defender" }
+        } catch {}
+
+        if ($thirdPartyAV) {
+            $avNames = ($thirdPartyAV | ForEach-Object { $_.displayName }) -join ", "
+            $defenderStatus = "PASS - Defender disabled ($avNames active)"
+            $rtProtection = "Disabled - $avNames active"
+        } else {
+            $defenderStatus = "FAIL - Real-time protection DISABLED"
+        }
     } elseif ($defsAgeDays -gt 7) {
         $defenderStatus = "WARNING - Definitions $defsAgeDays days old"
     } elseif ($threatCount -gt 0) {
@@ -2098,6 +2111,14 @@ try {
     )
     $trustedPathPrefixes = @("\Microsoft\")
 
+    # Known-safe commands that should never be flagged even with unknown publisher
+    $knownSafeCommands = @(
+        "MicrosoftEdgeUpdate\.exe",
+        "PCMasterclass-Maintenance\.ps1",
+        "Apple Software Update\\SoftwareUpdate\.exe",
+        "Lenovo\.Modern\.ImController\.exe"
+    )
+
     $allTasks = Get-ScheduledTask -ErrorAction Stop
     $systemTasks = $allTasks | Where-Object {
         $isTrustedPath = $false
@@ -2146,6 +2167,12 @@ try {
         $isTrusted = $false
         foreach ($tp in $trustedPublishers) {
             if ($publisher -like "*$tp*") { $isTrusted = $true; break }
+        }
+        # Check if the command matches a known-safe pattern
+        if (-not $isTrusted) {
+            foreach ($safePattern in $knownSafeCommands) {
+                if ($command -match $safePattern) { $isTrusted = $true; break }
+            }
         }
         if (-not $isTrusted -and $publisher -eq "Unknown") {
             $reasons += "Unknown publisher"
@@ -2199,8 +2226,37 @@ try {
 Write-Log "Auditing browser extensions..."
 
 # Helper: resolve __MSG_ extension names from _locales
+# Trusted browser extensions that should never be flagged (by ID or name pattern)
+$TrustedExtensionIDs = @(
+    "cjpalhdlnbpafiamejdnhcphjbkeiagm",  # uBlock Origin
+    "ddkjiahejlhfcafbddmgiahcphecmpfh",  # uBlock Origin Lite
+    "efaidnbmnnnibpcajpcglclefindmkaj",   # Adobe Acrobat
+    "ghbmnnjooekpmoecnnnilnnbdlolhkhi",   # Google Docs Offline
+    "nmmhkkegccagdldgiimedpiccmgmieda",   # Google Wallet
+    "pkedcjkdefgpdelpbcmbmeomcjbeemfm"    # Chrome Remote Desktop
+)
+
+# Well-known extension IDs whose names often fail to resolve from locale files
+$KnownExtensionNames = @{
+    "efaidnbmnnnibpcajpcglclefindmkaj" = "Adobe Acrobat"
+    "ghbmnnjooekpmoecnnnilnnbdlolhkhi" = "Google Docs Offline"
+    "nmmhkkegccagdldgiimedpiccmgmieda" = "Google Wallet (Chrome Web Store Payments)"
+    "aapocclcgogkmnckokdopfmhonfmgoek" = "Google Slides"
+    "aohghmighlieiainnegkcijnfilokake" = "Google Docs"
+    "felcaaldnbdncclmgdcncolpebgiejap" = "Google Calendar"
+    "blpcfgokakmgnkcojhhkbfbldkacnbeo" = "YouTube"
+    "gomekmidlodglbbmalcneegieacbdmki" = "Avast Online Security & Privacy"
+    "pkedcjkdefgpdelpbcmbmeomcjbeemfm" = "Chrome Remote Desktop"
+    "cjpalhdlnbpafiamejdnhcphjbkeiagm" = "uBlock Origin"
+}
+
 function Resolve-ExtensionName {
     param([string]$ManifestName, [string]$ExtVersionDir, [string]$FallbackName)
+
+    # Check known extension IDs first
+    if ($KnownExtensionNames.ContainsKey($FallbackName)) {
+        return $KnownExtensionNames[$FallbackName]
+    }
 
     if (-not $ManifestName -or $ManifestName -match "^__MSG_") {
         # Extract the message key (e.g. __MSG_appName__ -> appName)
@@ -2266,20 +2322,18 @@ try {
                                 FlagReason  = ""
                             }
 
-                            # Flag suspicious extensions
+                            # Flag suspicious extensions (skip trusted ones)
                             $reasons = @()
-                            $hasAllUrls = ($permissions -join " ") -match "<all_urls>|\*://\*/\*"
-                            $hasHistory = ($permissions -join " ") -match "history|webNavigation"
-                            $hasTabs = ($permissions -join " ") -match "\btabs\b"
-                            if ($hasAllUrls -and $hasHistory) {
-                                $reasons += "Access to all sites + browsing history"
-                            }
-                            if ($extName -match "coupon|shop|deal|discount|cashback|honey" -and $hasAllUrls) {
-                                $reasons += "Shopping extension with broad permissions"
-                            }
-                            # Check for known PUP extension IDs (common adware)
-                            if ($extFolder.Name -match "^(efaidnbmnnnibpcajpcglclefindmkaj|gighmmpiobklfepjocnamgkkbiglidom)$") {
-                                # These are actually legit (Adobe Acrobat, AdBlock) - skip
+                            if ($extFolder.Name -notin $TrustedExtensionIDs) {
+                                $hasAllUrls = ($permissions -join " ") -match "<all_urls>|\*://\*/\*"
+                                $hasHistory = ($permissions -join " ") -match "history|webNavigation"
+                                $hasTabs = ($permissions -join " ") -match "\btabs\b"
+                                if ($hasAllUrls -and $hasHistory) {
+                                    $reasons += "Access to all sites + browsing history"
+                                }
+                                if ($extName -match "coupon|shop|deal|discount|cashback|honey" -and $hasAllUrls) {
+                                    $reasons += "Shopping extension with broad permissions"
+                                }
                             }
 
                             if ($reasons.Count -gt 0) {
@@ -2328,13 +2382,15 @@ try {
                             }
 
                             $reasons = @()
-                            $hasAllUrls = ($permissions -join " ") -match "<all_urls>|\*://\*/\*"
-                            $hasHistory = ($permissions -join " ") -match "history|webNavigation"
-                            if ($hasAllUrls -and $hasHistory) {
-                                $reasons += "Access to all sites + browsing history"
-                            }
-                            if ($extName -match "coupon|shop|deal|discount|cashback" -and $hasAllUrls) {
-                                $reasons += "Shopping extension with broad permissions"
+                            if ($extFolder.Name -notin $TrustedExtensionIDs) {
+                                $hasAllUrls = ($permissions -join " ") -match "<all_urls>|\*://\*/\*"
+                                $hasHistory = ($permissions -join " ") -match "history|webNavigation"
+                                if ($hasAllUrls -and $hasHistory) {
+                                    $reasons += "Access to all sites + browsing history"
+                                }
+                                if ($extName -match "coupon|shop|deal|discount|cashback" -and $hasAllUrls) {
+                                    $reasons += "Shopping extension with broad permissions"
+                                }
                             }
 
                             if ($reasons.Count -gt 0) {
@@ -2909,7 +2965,8 @@ if (-not $SkipAdwCleaner) {
                         }
                         if ($inPreinstalled) {
                             # Capture preinstalled entries (non-blank, non-header lines with actual content)
-                            if ($line.Trim() -and $line -notmatch "^\*+\s*\[" -and $line -notmatch "^#") {
+                            # Skip AdwCleaner log file listings (e.g. "AdwCleaner[S00].txt - [1250 octets]")
+                            if ($line.Trim() -and $line -notmatch "^\*+\s*\[" -and $line -notmatch "^#" -and $line -notmatch "AdwCleaner\[.+\]\.txt") {
                                 $preinstalledLines += $line.Trim()
                             }
                         } else {
@@ -3192,11 +3249,8 @@ if (-not $Results.Malwarebytes.Installed) {
     $html += @"
     <table>
         <tr><td><strong>Product</strong></td><td>$($Results.Malwarebytes.ProductType)</td></tr>
-        <tr><td><strong>Version</strong></td><td>$($Results.Malwarebytes.Version)</td></tr>
         <tr><td><strong>Service Status</strong></td><td>$mbSvcRunning</td></tr>
         <tr><td><strong>Real-Time Protection</strong></td><td><span style='$mbRtColor;font-weight:bold;'>$($Results.Malwarebytes.RealTimeProtection)</span></td></tr>
-        <tr><td><strong>Definitions Updated</strong></td><td>$($Results.Malwarebytes.DefinitionsAge)</td></tr>
-        <tr><td><strong>Last Scan</strong></td><td>$($Results.Malwarebytes.LastScan)</td></tr>
     </table>
 "@
 }
@@ -3643,7 +3697,8 @@ if ($EmailTo) {
         }
 
         $scriptDuration = [math]::Round(((Get-Date) - $scriptStartTime).TotalMinutes, 1)
-        $emailSubject = "$statusIcon Maintenance Report  - $(if ($ClientName) { "$ClientName ($ComputerName)" } else { $ComputerName })  - $(Get-Date -Format 'dd MMM yyyy') [${scriptDuration}m]"
+        $clientDisplay = if ($ClientName) { $ClientName } else { $ComputerName }
+        $emailSubject = "$clientDisplay - Periodic Maintenance Report - $overallStatus. $(Get-Date -Format 'dd MMM yyyy')"
 
         $emailBody = "[T]PC MASTERCLASS - SCHEDULED MAINTENANCE REPORT[/T]`n"
         $emailBody += "Computer".PadRight(30) + "$ComputerName ($($Results.SystemInfo.Manufacturer) $($Results.SystemInfo.Model))`n"
@@ -3767,11 +3822,8 @@ ${overallColor}OVERALL STATUS: $overallStatus ($warningCount warning(s), $errorC
             }
             $emailBody += "`n[H]MALWAREBYTES ENDPOINT PROTECTION[/H]`n"
             $emailBody += "Product".PadRight(30) + "$($Results.Malwarebytes.ProductType)`n"
-            $emailBody += "Version".PadRight(30) + "$($Results.Malwarebytes.Version)`n"
             $emailBody += "Service".PadRight(30) + "$mbSvcText`n"
             $emailBody += "Real-Time Protection".PadRight(30) + "$mbRtText`n"
-            $emailBody += "Definitions Updated".PadRight(30) + "$($Results.Malwarebytes.DefinitionsAge)`n"
-            $emailBody += "Last Scan".PadRight(30) + "$($Results.Malwarebytes.LastScan)`n"
             $emailBody += "`n"
         }
 
