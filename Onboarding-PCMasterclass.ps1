@@ -12,8 +12,8 @@
 
 .NOTES
     Author:  Paul - PC Masterclass
-    Version: 1.3.2
-    Date:    2026-03-14
+    Version: 1.3.3
+    Date:    2026-03-16
 
     USAGE (paste into an elevated PowerShell prompt):
       powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\Downloads\Onboarding-PCMasterclass.ps1"
@@ -36,7 +36,7 @@
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-$DeployVersion = "1.3.2"
+$DeployVersion = "1.3.3"
 $BaseDir = "C:\Teamviewer"
 $ScriptName = "PCMasterclass-Maintenance.ps1"
 $GitHubRepo = "pcmasterclass-ai/maintenance"
@@ -733,6 +733,33 @@ function Set-MaintenanceSchedule {
             $registerParams.Settings = $settings
         }
         Register-ScheduledTask @registerParams | Out-Null
+
+        # ---- VERIFY the DaysInterval actually stuck ----
+        # Some Windows builds silently ignore -DaysInterval and default to 1 (daily).
+        # If that happened, fix it by patching the task XML directly.
+        $verifyTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        $verifyTrigger = $verifyTask.Triggers | Select-Object -First 1
+        $actualInterval = 1
+        if ($verifyTrigger -and $verifyTrigger.PSObject.Properties['DaysInterval']) {
+            $actualInterval = $verifyTrigger.DaysInterval
+        }
+
+        if ($actualInterval -ne $frequencyDays) {
+            Write-Warn "Windows set interval to $actualInterval day(s) instead of $frequencyDays — fixing via XML..."
+            try {
+                $xml = Export-ScheduledTask -TaskName $TaskName
+                # The XML has <DaysInterval>1</DaysInterval> — replace with the correct value
+                $xml = $xml -replace '<DaysInterval>\d+</DaysInterval>', "<DaysInterval>$frequencyDays</DaysInterval>"
+                Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+                Register-ScheduledTask -TaskName $TaskName -Xml $xml -User "SYSTEM" -Force | Out-Null
+                Write-OK "Fixed: interval corrected to every $frequencyDays days via XML"
+            } catch {
+                Write-Fail "Could not fix interval via XML: $($_.Exception.Message)"
+                Write-Warn "You may need to manually set the repeat interval in Task Scheduler"
+            }
+        } else {
+            Write-OK "Verified: task interval correctly set to every $frequencyDays days"
+        }
 
         Write-OK "Scheduled task created: $TaskName"
         Write-OK "Schedule: $freqLabel at $runTime"

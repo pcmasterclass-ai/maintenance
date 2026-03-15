@@ -10,8 +10,8 @@
 
 .NOTES
     Author:  Paul - PC Masterclass
-    Version: 1.0.0
-    Date:    2026-03-14
+    Version: 1.0.1
+    Date:    2026-03-16
 
     USAGE (paste into an elevated PowerShell prompt):
       irm https://raw.githubusercontent.com/pcmasterclass-ai/maintenance/main/Reschedule-PCMasterclass.ps1 | iex
@@ -70,7 +70,7 @@ if (-not $isAdmin) {
 $banner = @"
 
     ====================================================
-       PC Masterclass - Reschedule Maintenance v1.0.0
+       PC Masterclass - Reschedule Maintenance v1.0.1
     ====================================================
        Change the next scheduled maintenance run
     ====================================================
@@ -177,6 +177,24 @@ switch ($choice) {
 
         Set-ScheduledTask -TaskName $TaskName -Trigger $newTrigger | Out-Null
 
+        # Verify the DaysInterval actually stuck (some Windows builds ignore it)
+        $vTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        $vTrigger = $vTask.Triggers | Select-Object -First 1
+        $vInterval = 1
+        if ($vTrigger -and $vTrigger.PSObject.Properties['DaysInterval']) { $vInterval = $vTrigger.DaysInterval }
+        if ($vInterval -ne $currentInterval) {
+            Write-Warn "Windows set interval to $vInterval day(s) instead of $currentInterval - fixing via XML..."
+            try {
+                $xml = Export-ScheduledTask -TaskName $TaskName
+                $xml = $xml -replace '<DaysInterval>\d+</DaysInterval>', "<DaysInterval>$currentInterval</DaysInterval>"
+                Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+                Register-ScheduledTask -TaskName $TaskName -Xml $xml -User "SYSTEM" -Force | Out-Null
+                Write-OK "Fixed: interval corrected to every $currentInterval days"
+            } catch {
+                Write-Fail "Could not fix interval: $($_.Exception.Message)"
+            }
+        }
+
         Write-OK "Next run rescheduled to: $($newStartDateTime.ToString('dd MMM yyyy')) at $existingTime"
         Write-OK "Frequency unchanged: $currentFreqLabel"
     }
@@ -228,6 +246,24 @@ switch ($choice) {
         $newTrigger = New-ScheduledTaskTrigger -Daily -DaysInterval $frequencyDays -At $newStartDateTime
 
         Set-ScheduledTask -TaskName $TaskName -Trigger $newTrigger | Out-Null
+
+        # Verify the DaysInterval actually stuck (some Windows builds ignore it)
+        $vTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        $vTrigger = $vTask.Triggers | Select-Object -First 1
+        $vInterval = 1
+        if ($vTrigger -and $vTrigger.PSObject.Properties['DaysInterval']) { $vInterval = $vTrigger.DaysInterval }
+        if ($vInterval -ne $frequencyDays) {
+            Write-Warn "Windows set interval to $vInterval day(s) instead of $frequencyDays - fixing via XML..."
+            try {
+                $xml = Export-ScheduledTask -TaskName $TaskName
+                $xml = $xml -replace '<DaysInterval>\d+</DaysInterval>', "<DaysInterval>$frequencyDays</DaysInterval>"
+                Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+                Register-ScheduledTask -TaskName $TaskName -Xml $xml -User "SYSTEM" -Force | Out-Null
+                Write-OK "Fixed: interval corrected to every $frequencyDays days"
+            } catch {
+                Write-Fail "Could not fix interval: $($_.Exception.Message)"
+            }
+        }
 
         Write-OK "Next run rescheduled to: $($newStartDateTime.ToString('dd MMM yyyy')) at $runTime"
         Write-OK "Frequency changed to: $freqLabel"
