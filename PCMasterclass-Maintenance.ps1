@@ -67,7 +67,7 @@ param(
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-$ScriptVersion = "2.6.0"
+$ScriptVersion = "2.7.0"
 
 # GitHub raw URL for the latest version of this script
 # To use: create a private GitHub repo, push the script, and set this URL
@@ -410,6 +410,8 @@ $Results = [ordered]@{
     ServiceStatus    = @{}
     NetworkConfig    = @{}
     AdwCleaner       = @{}
+    RestorePoints    = @{}
+    TelemetryServices = @{}
     Errors           = @()
     EmailResult      = @{}
     WebhookResult    = @{}
@@ -3014,6 +3016,190 @@ if (-not $SkipAdwCleaner) {
 
 
 # ============================================================================
+# MODULE 18: SYSTEM RESTORE POINT AUDIT
+# ============================================================================
+Write-Log "Checking system restore points..."
+
+try {
+    $restorePoints = @()
+    try {
+        $restorePoints = @(Get-ComputerRestorePoint -ErrorAction Stop)
+    } catch {
+        # Get-ComputerRestorePoint may fail if System Restore is disabled
+    }
+
+    # Check if System Restore is enabled on the OS drive
+    $osDrive = $env:SystemDrive  # typically C:
+    $srEnabled = $false
+    try {
+        $sr = Get-CimInstance -ClassName SystemRestoreConfig -Namespace "root\DEFAULT" -ErrorAction Stop |
+              Where-Object { $_.DiskNumber -eq 0 -or $_.RPSessionInterval -ge 0 }
+        # Also check via vssadmin or registry
+        $regPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore"
+        $rpDisabled = (Get-ItemProperty -Path $regPath -Name "RPSessionInterval" -ErrorAction SilentlyContinue).RPSessionInterval
+        $srDisabledReg = (Get-ItemProperty -Path $regPath -Name "DisableSR" -ErrorAction SilentlyContinue).DisableSR
+        $srEnabled = ($srDisabledReg -ne 1)
+    } catch {
+        # Fallback: check registry directly
+        try {
+            $srDisabledReg = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore" -Name "DisableSR" -ErrorAction Stop).DisableSR
+            $srEnabled = ($srDisabledReg -ne 1)
+        } catch {
+            $srEnabled = $false
+        }
+    }
+
+    # Check allocated disk space for restore points
+    $allocatedGB = "Unknown"
+    try {
+        $vssOutput = vssadmin list shadowstorage 2>&1 | Out-String
+        if ($vssOutput -match "Used Shadow Copy Storage space:\s*([\d.,]+)\s*(MB|GB|TB)") {
+            $usedVal = [double]($Matches[1] -replace ',', '')
+            $usedUnit = $Matches[2]
+            $allocatedGB = switch ($usedUnit) {
+                "MB" { "$([math]::Round($usedVal / 1024, 2)) GB" }
+                "GB" { "$([math]::Round($usedVal, 2)) GB" }
+                "TB" { "$([math]::Round($usedVal * 1024, 2)) GB" }
+                default { "$usedVal $usedUnit" }
+            }
+        }
+    } catch {}
+
+    $rpCount = $restorePoints.Count
+    $newestRP = $null
+    $oldestRP = $null
+    $daysSinceLatest = -1
+
+    if ($rpCount -gt 0) {
+        $newestRP = ($restorePoints | Sort-Object CreationTime -Descending | Select-Object -First 1)
+        $oldestRP = ($restorePoints | Sort-Object CreationTime | Select-Object -First 1)
+        $daysSinceLatest = [math]::Floor(((Get-Date) - $newestRP.CreationTime).TotalDays)
+    }
+
+    # Determine status
+    $rpStatus = "PASS"
+    $rpNote = ""
+    if (-not $srEnabled) {
+        $rpStatus = "WARNING"
+        $rpNote = "System Restore is DISABLED on this machine"
+    } elseif ($rpCount -eq 0) {
+        $rpStatus = "WARNING"
+        $rpNote = "No restore points found — recommend creating one"
+    } elseif ($daysSinceLatest -gt 30) {
+        $rpStatus = "WARNING"
+        $rpNote = "Latest restore point is $daysSinceLatest days old"
+    } else {
+        $rpNote = "Latest restore point is $daysSinceLatest day(s) old"
+    }
+
+    $Results.RestorePoints = @{
+        Status           = $rpStatus
+        Enabled          = $srEnabled
+        Count            = $rpCount
+        DiskUsage        = $allocatedGB
+        DaysSinceLatest  = $daysSinceLatest
+        Note             = $rpNote
+        Points           = @()
+    }
+
+    # Store up to 5 most recent restore points for the report
+    if ($rpCount -gt 0) {
+        $Results.RestorePoints.NewestDate = $newestRP.CreationTime.ToString("d MMM yyyy HH:mm")
+        $Results.RestorePoints.OldestDate = $oldestRP.CreationTime.ToString("d MMM yyyy HH:mm")
+
+        $recentPoints = $restorePoints | Sort-Object CreationTime -Descending | Select-Object -First 5
+        foreach ($rp in $recentPoints) {
+            $Results.RestorePoints.Points += @{
+                Description = $rp.Description
+                Created     = $rp.CreationTime.ToString("d MMM yyyy HH:mm")
+                Type        = switch ($rp.RestorePointType) {
+                    0  { "Application Install" }
+                    1  { "Application Uninstall" }
+                    6  { "Restore" }
+                    7  { "Checkpoint" }
+                    10 { "Device Driver Install" }
+                    12 { "Modify Settings" }
+                    13 { "Cancel-Restore" }
+                    default { "Type $($rp.RestorePointType)" }
+                }
+            }
+        }
+    }
+
+    Write-Log "Restore Points: $rpCount found, System Restore $(if ($srEnabled) {'enabled'} else {'DISABLED'}), status: $rpStatus"
+
+} catch {
+    Write-Log "Restore point audit failed: $_" "ERROR"
+    $Results.RestorePoints = @{ Status = "ERROR"; Error = $_.ToString() }
+    $Results.Errors += "Restore Points: $_"
+}
+
+
+# ============================================================================
+# MODULE 19: TELEMETRY SERVICES AUDIT
+# Reports on Windows telemetry/data-collection services — read-only, no changes
+# ============================================================================
+Write-Log "Auditing telemetry services..."
+
+try {
+    $telemetryServices = @(
+        @{ Name = "DiagTrack";             Friendly = "Connected User Experiences and Telemetry" }
+        @{ Name = "dmwappushservice";       Friendly = "Device Management WAP Push" }
+        @{ Name = "WerSvc";                Friendly = "Windows Error Reporting" }
+        @{ Name = "WMPNetworkSvc";         Friendly = "Windows Media Player Network Sharing" }
+        @{ Name = "diagnosticshub.standardcollector.service"; Friendly = "Diagnostics Hub Collector" }
+        @{ Name = "lfsvc";                 Friendly = "Geolocation Service" }
+        @{ Name = "MapsBroker";            Friendly = "Downloaded Maps Manager" }
+    )
+
+    $telResults = @()
+    $runningCount = 0
+    $disabledCount = 0
+
+    foreach ($ts in $telemetryServices) {
+        $svc = Get-Service -Name $ts.Name -ErrorAction SilentlyContinue
+        if ($svc) {
+            $startType = "Unknown"
+            try {
+                $startType = (Get-CimInstance Win32_Service -Filter "Name='$($ts.Name)'" -ErrorAction Stop).StartMode
+            } catch {}
+
+            $telResults += @{
+                ServiceName = $ts.Name
+                FriendlyName = $ts.Friendly
+                Status       = $svc.Status.ToString()
+                StartType    = $startType
+            }
+
+            if ($svc.Status -eq "Running") { $runningCount++ }
+            if ($startType -eq "Disabled") { $disabledCount++ }
+        }
+        # If service not found, skip it (not all are present on every Windows edition)
+    }
+
+    $totalFound = $telResults.Count
+    $telStatus = if ($runningCount -eq 0 -and $totalFound -gt 0) { "PASS" }
+                 elseif ($runningCount -le 2) { "PASS" }
+                 else { "INFO" }
+
+    $Results.TelemetryServices = @{
+        Status        = $telStatus
+        TotalFound    = $totalFound
+        RunningCount  = $runningCount
+        DisabledCount = $disabledCount
+        Services      = $telResults
+    }
+
+    Write-Log "Telemetry audit: $totalFound services found, $runningCount running, $disabledCount disabled"
+
+} catch {
+    Write-Log "Telemetry services audit failed: $_" "ERROR"
+    $Results.TelemetryServices = @{ Status = "ERROR"; Error = $_.ToString() }
+    $Results.Errors += "Telemetry Services: $_"
+}
+
+
+# ============================================================================
 # REPORT GENERATION
 # ============================================================================
 Write-Log "Generating HTML report..."
@@ -3022,7 +3208,7 @@ $overallStatus = "PASS"
 $warningCount = 0
 $errorCount = 0
 
-$checkModules = @($Results.SFC, $Results.DiskHealth, $Results.WindowsUpdates, $Results.iDriveBackup, $Results.Malwarebytes, $Results.Defender, $Results.EventLogErrors, $Results.PendingReboot, $Results.Firewall, $Results.UserAccounts, $Results.DISM, $Results.TempFiles, $Results.StartupPrograms, $Results.ScheduledTasks, $Results.BrowserExtensions, $Results.ServiceStatus, $Results.NetworkConfig, $Results.AdwCleaner)
+$checkModules = @($Results.SFC, $Results.DiskHealth, $Results.WindowsUpdates, $Results.iDriveBackup, $Results.Malwarebytes, $Results.Defender, $Results.EventLogErrors, $Results.PendingReboot, $Results.Firewall, $Results.UserAccounts, $Results.DISM, $Results.TempFiles, $Results.StartupPrograms, $Results.ScheduledTasks, $Results.BrowserExtensions, $Results.ServiceStatus, $Results.NetworkConfig, $Results.AdwCleaner, $Results.RestorePoints, $Results.TelemetryServices)
 foreach ($module in $checkModules) {
     if ($module.Status -match "ERROR|FAIL") { $errorCount++; $overallStatus = "FAIL" }
     elseif ($module.Status -match "WARNING") { $warningCount++; if ($overallStatus -ne "FAIL") { $overallStatus = "WARNING" } }
@@ -3100,6 +3286,7 @@ $html = @"
         <tr><td><strong>RAM</strong></td><td>$($Results.SystemInfo.TotalRAM_GB) GB</td></tr>
         <tr><td><strong>BIOS</strong></td><td>$($Results.SystemInfo.BIOSVersion)</td></tr>
         <tr><td><strong>Last Boot</strong></td><td>$($Results.SystemInfo.LastBoot) (Uptime: $($Results.SystemInfo.UptimeDays) days)</td></tr>
+        <tr><td><strong>Script Version</strong></td><td>v$ScriptVersion</td></tr>
     </table>
 "@
 
@@ -3644,6 +3831,64 @@ if ($Results.AdwCleaner.Status -eq "SKIPPED") {
 $html += @"
 </div>
 
+<!-- RESTORE POINTS -->
+<div class="section">
+    <h2><span class="icon">&#x1F4BE;</span> System Restore Points $(Get-StatusBadge $Results.RestorePoints.Status)</h2>
+"@
+
+if ($Results.RestorePoints.Status -eq "ERROR") {
+    $html += "<p class='error-text'>Error: $($Results.RestorePoints.Error)</p>"
+} else {
+    $enabledText = if ($Results.RestorePoints.Enabled) { "<span style='color:#28a745;font-weight:bold;'>Enabled</span>" } else { "<span style='color:#dc3545;font-weight:bold;'>DISABLED</span>" }
+    $html += "<p>System Restore: $enabledText &bull; Restore Points: $($Results.RestorePoints.Count) &bull; Disk Usage: $($Results.RestorePoints.DiskUsage)</p>"
+
+    if ($Results.RestorePoints.Note) {
+        $noteColor = if ($Results.RestorePoints.Status -eq "WARNING") { "#dc3545" } else { "#28a745" }
+        $html += "<p style='color:$noteColor;font-weight:bold;'>$($Results.RestorePoints.Note)</p>"
+    }
+
+    if ($Results.RestorePoints.Points.Count -gt 0) {
+        $html += "<details><summary style='cursor:pointer;color:#0d6efd;font-weight:bold;margin:8px 0;'>Recent Restore Points ($($Results.RestorePoints.Points.Count) shown)</summary>"
+        $html += "<table><tr><th>Date</th><th>Type</th><th>Description</th></tr>"
+        foreach ($rp in $Results.RestorePoints.Points) {
+            $html += "<tr><td>$($rp.Created)</td><td>$($rp.Type)</td><td>$([System.Net.WebUtility]::HtmlEncode($rp.Description))</td></tr>"
+        }
+        $html += "</table></details>"
+    }
+}
+
+$html += @"
+</div>
+
+<!-- TELEMETRY SERVICES -->
+<div class="section">
+    <h2><span class="icon">&#x1F4E1;</span> Telemetry Services $(Get-StatusBadge $Results.TelemetryServices.Status)</h2>
+"@
+
+if ($Results.TelemetryServices.Status -eq "ERROR") {
+    $html += "<p class='error-text'>Error: $($Results.TelemetryServices.Error)</p>"
+} else {
+    $html += "<p>Found: $($Results.TelemetryServices.TotalFound) &bull; Running: $($Results.TelemetryServices.RunningCount) &bull; Disabled: $($Results.TelemetryServices.DisabledCount)</p>"
+    $html += "<p class='detail'>This is a read-only audit of Windows data-collection services. No changes have been made.</p>"
+
+    if ($Results.TelemetryServices.Services.Count -gt 0) {
+        $html += "<table><tr><th>Service</th><th>Status</th><th>Startup</th></tr>"
+        foreach ($ts in $Results.TelemetryServices.Services) {
+            $statusStyle = switch ($ts.Status) {
+                "Running" { "color:#dc3545;font-weight:bold;" }
+                "Stopped" { "color:#28a745;" }
+                default   { "" }
+            }
+            $startStyle = if ($ts.StartType -eq "Disabled") { "color:#28a745;font-weight:bold;" } else { "" }
+            $html += "<tr><td>$($ts.FriendlyName)<br/><span class='detail'>($($ts.ServiceName))</span></td><td style='$statusStyle'>$($ts.Status)</td><td style='$startStyle'>$($ts.StartType)</td></tr>"
+        }
+        $html += "</table>"
+    }
+}
+
+$html += @"
+</div>
+
 <!-- ERRORS SUMMARY -->
 "@
 
@@ -3698,12 +3943,13 @@ if ($EmailTo) {
 
         $scriptDuration = [math]::Round(((Get-Date) - $scriptStartTime).TotalMinutes, 1)
         $clientDisplay = if ($ClientName) { $ClientName } else { $ComputerName }
-        $emailSubject = "$clientDisplay - Periodic Maintenance Report - $overallStatus. $(Get-Date -Format 'dd MMM yyyy')"
+        $emailSubject = "$clientDisplay - $overallStatus - Maintenance Report - $ComputerName - $(Get-Date -Format 'dd MMM yyyy') - ${scriptDuration}m - v$ScriptVersion"
 
         $emailBody = "[T]PC MASTERCLASS - SCHEDULED MAINTENANCE REPORT[/T]`n"
         $emailBody += "Computer".PadRight(30) + "$ComputerName ($($Results.SystemInfo.Manufacturer) $($Results.SystemInfo.Model))`n"
         $emailBody += "Serial Number".PadRight(30) + "$($Results.SystemInfo.SerialNumber)`n"
         $emailBody += "Date".PadRight(30) + "$(Get-Date -Format 'dddd, d MMMM yyyy h:mm tt')`n"
+        $emailBody += "Script Version".PadRight(30) + "v$ScriptVersion`n"
         $emailBody += "OS".PadRight(30) + "$($Results.SystemInfo.OS) - Build $($Results.SystemInfo.Build)`n"
         $emailBody += "CPU".PadRight(30) + "$($Results.SystemInfo.CPU) ($($Results.SystemInfo.CPUCores)C/$($Results.SystemInfo.CPUThreads)T)`n"
         if ($Results.SystemInfo.CPUBenchmark.Score -gt 0) {
@@ -3771,7 +4017,9 @@ ${overallColor}OVERALL STATUS: $overallStatus ($warningCount warning(s), $errorC
             @("Browser Extensions", $(if ($Results.BrowserExtensions.FlaggedCount -gt 0) { "$($Results.BrowserExtensions.Status) - $($Results.BrowserExtensions.FlaggedCount) flagged" } else { $Results.BrowserExtensions.Status })),
             @("Service Status", $(if ($Results.ServiceStatus.StoppedUnexpectedCount -gt 0) { "$($Results.ServiceStatus.Status) - $($Results.ServiceStatus.StoppedUnexpectedCount) stopped" } else { $Results.ServiceStatus.Status })),
             @("Network Config", $(if ($Results.NetworkConfig.IssueCount -gt 0) { "$($Results.NetworkConfig.Status) - $($Results.NetworkConfig.IssueCount) issue(s)" } else { $Results.NetworkConfig.Status })),
-            @("AdwCleaner", $Results.AdwCleaner.Status)
+            @("AdwCleaner", $Results.AdwCleaner.Status),
+            @("Restore Points", $(if ($Results.RestorePoints.Note) { "$($Results.RestorePoints.Status) - $($Results.RestorePoints.Note)" } else { $Results.RestorePoints.Status })),
+            @("Telemetry Services", "$($Results.TelemetryServices.Status) - $($Results.TelemetryServices.RunningCount) running / $($Results.TelemetryServices.DisabledCount) disabled")
         )
         foreach ($item in $checkItems) {
             $label = $item[0].PadRight(30)
@@ -4099,6 +4347,44 @@ ${overallColor}OVERALL STATUS: $overallStatus ($warningCount warning(s), $errorC
                 }
                 $emailBody += "`n"
             }
+        }
+
+        # Add Restore Point details
+        if ($Results.RestorePoints.Status -and $Results.RestorePoints.Status -ne "ERROR") {
+            $emailBody += "`n[H]SYSTEM RESTORE POINTS[/H]`n"
+            $srText = if ($Results.RestorePoints.Enabled) { "[G]Enabled[/G]" } else { "[R]DISABLED[/R]" }
+            $emailBody += "System Restore".PadRight(30) + "$srText`n"
+            $emailBody += "Restore Points".PadRight(30) + "$($Results.RestorePoints.Count)`n"
+            $emailBody += "Disk Usage".PadRight(30) + "$($Results.RestorePoints.DiskUsage)`n"
+            if ($Results.RestorePoints.Note) {
+                $noteTag = if ($Results.RestorePoints.Status -eq "WARNING") { "[W]$($Results.RestorePoints.Note)[/W]" } else { "[G]$($Results.RestorePoints.Note)[/G]" }
+                $emailBody += "Note".PadRight(30) + "$noteTag`n"
+            }
+            if ($Results.RestorePoints.Points.Count -gt 0) {
+                $emailBody += "`n  Recent restore points:`n"
+                foreach ($rp in $Results.RestorePoints.Points) {
+                    $emailBody += "  $($rp.Created)".PadRight(28) + "$($rp.Type) - $($rp.Description)`n"
+                }
+            }
+            $emailBody += "`n"
+        }
+
+        # Add Telemetry Services details
+        if ($Results.TelemetryServices.Status -and $Results.TelemetryServices.Status -ne "ERROR") {
+            $emailBody += "`n[H]TELEMETRY SERVICES (read-only audit)[/H]`n"
+            $emailBody += "Services Found".PadRight(30) + "$($Results.TelemetryServices.TotalFound)`n"
+            $emailBody += "Running".PadRight(30) + "$($Results.TelemetryServices.RunningCount)`n"
+            $emailBody += "Disabled".PadRight(30) + "$($Results.TelemetryServices.DisabledCount)`n`n"
+            foreach ($ts in $Results.TelemetryServices.Services) {
+                $svcStatus = switch ($ts.Status) {
+                    "Running" { "[W]Running[/W]" }
+                    "Stopped" { "[G]Stopped[/G]" }
+                    default   { $ts.Status }
+                }
+                $emailBody += "  $($ts.FriendlyName)`n"
+                $emailBody += "    ($($ts.ServiceName))".PadRight(30) + "$svcStatus | Startup: $($ts.StartType)`n"
+            }
+            $emailBody += "`n"
         }
 
         # Add errors if any
