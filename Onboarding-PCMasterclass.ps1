@@ -12,7 +12,7 @@
 
 .NOTES
     Author:  Paul - PC Masterclass
-    Version: 1.3.3
+    Version: 1.3.4
     Date:    2026-03-16
 
     USAGE (paste into an elevated PowerShell prompt):
@@ -36,7 +36,7 @@
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-$DeployVersion = "1.3.3"
+$DeployVersion = "1.3.4"
 $BaseDir = "C:\Teamviewer"
 $ScriptName = "PCMasterclass-Maintenance.ps1"
 $GitHubRepo = "pcmasterclass-ai/maintenance"
@@ -658,19 +658,19 @@ function Set-MaintenanceSchedule {
         90 { "quarterly (every 90 days)" }
     }
 
-    # Ask for start date
+    # Ask for start date (default to tomorrow so the first run fires at the scheduled time)
     Write-Host ""
-    $todayStr = (Get-Date).ToString("dd/MM/yyyy")
-    $dateInput = Read-Host "  Start date dd/MM/yyyy (press Enter for today, $todayStr)"
+    $tomorrowStr = (Get-Date).AddDays(1).ToString("dd/MM/yyyy")
+    $dateInput = Read-Host "  Start date dd/MM/yyyy (press Enter for tomorrow, $tomorrowStr)"
     if ($dateInput) {
         try {
             $startDate = [datetime]::ParseExact($dateInput, "dd/MM/yyyy", $null)
         } catch {
-            Write-Warn "Invalid date format - using today"
-            $startDate = (Get-Date).Date
+            Write-Warn "Invalid date format - using tomorrow"
+            $startDate = (Get-Date).AddDays(1).Date
         }
     } else {
-        $startDate = (Get-Date).Date
+        $startDate = (Get-Date).AddDays(1).Date
     }
     # Combine start date with chosen run time
     $startDateTime = $startDate.Add([datetime]::Parse($runTime).TimeOfDay)
