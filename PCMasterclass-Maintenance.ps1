@@ -3084,7 +3084,7 @@ try {
         $rpNote = "System Restore is DISABLED on this machine"
     } elseif ($rpCount -eq 0) {
         $rpStatus = "WARNING"
-        $rpNote = "No restore points found — recommend creating one"
+        $rpNote = "No restore points found - recommend creating one"
     } elseif ($daysSinceLatest -gt 30) {
         $rpStatus = "WARNING"
         $rpNote = "Latest restore point is $daysSinceLatest days old"
@@ -3137,7 +3137,7 @@ try {
 
 # ============================================================================
 # MODULE 19: TELEMETRY SERVICES AUDIT
-# Reports on Windows telemetry/data-collection services — read-only, no changes
+# Reports on Windows telemetry/data-collection services - read-only, no changes
 # ============================================================================
 Write-Log "Auditing telemetry services..."
 
