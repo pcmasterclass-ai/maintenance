@@ -12,8 +12,8 @@
 
 .NOTES
     Author:  Paul - PC Masterclass
-    Version: 1.3.5
-    Date:    2026-03-16
+    Version: 1.4.0
+    Date:    2026-03-18
 
     USAGE (paste into an elevated PowerShell prompt):
       powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\Downloads\Onboarding-PCMasterclass.ps1"
@@ -36,7 +36,7 @@
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-$DeployVersion = "1.3.5"
+$DeployVersion = "1.4.0"
 $BaseDir = "C:\Teamviewer"
 $ScriptName = "PCMasterclass-Maintenance.ps1"
 $GitHubRepo = "pcmasterclass-ai/maintenance"
@@ -792,6 +792,81 @@ function Set-MaintenanceSchedule {
 }
 
 # ============================================================================
+# ENABLE SYSTEM RESTORE POINTS (with disk space safety check)
+# ============================================================================
+function Enable-RestorePoints {
+    Write-Section "SYSTEM RESTORE POINTS"
+
+    # Check if already enabled
+    $regPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore"
+    $disabledSR = (Get-ItemProperty -Path $regPath -Name "DisableSR" -ErrorAction SilentlyContinue).DisableSR
+
+    $alreadyEnabled = $false
+    try {
+        $vssOutput = vssadmin list shadowstorage 2>&1 | Out-String
+        if ($vssOutput -match "For volume: \(C:\)" -and $disabledSR -ne 1) {
+            $alreadyEnabled = $true
+        }
+    } catch {}
+
+    if ($alreadyEnabled) {
+        Write-OK "System Protection is already enabled on C: drive"
+        return
+    }
+
+    # Assess disk space
+    Write-Step "Checking disk space before enabling restore points..."
+    $disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='C:'"
+    $totalGB   = [math]::Round($disk.Size / 1GB, 1)
+    $freeGB    = [math]::Round($disk.FreeSpace / 1GB, 1)
+    $freePercent = [math]::Round(($disk.FreeSpace / $disk.Size) * 100, 1)
+    $minFreeGB = 30
+
+    Write-Host "    Drive C: Total: ${totalGB} GB | Free: ${freeGB} GB (${freePercent}%)" -ForegroundColor White
+
+    if ($freeGB -lt $minFreeGB) {
+        Write-Host ""
+        Write-Host "    WARNING: Free space (${freeGB} GB) is below the ${minFreeGB} GB threshold." -ForegroundColor Yellow
+        Write-Host "    Restore points will NOT be enabled on this machine." -ForegroundColor Yellow
+        Write-Host "    This PC may benefit from a storage upgrade or disk cleanup." -ForegroundColor Yellow
+        Write-Host ""
+        return
+    }
+
+    # Calculate allocation (5%, cap at 10%)
+    $allocPercent = 5
+    $allocGB = [math]::Round(($disk.Size * $allocPercent / 100) / 1GB, 1)
+    $remainingGB = $freeGB - $allocGB
+
+    if ($remainingGB -lt ($minFreeGB * 0.75)) {
+        $allocPercent = 3
+        $allocGB = [math]::Round(($disk.Size * $allocPercent / 100) / 1GB, 1)
+        Write-Host "    Using smaller 3% allocation to preserve free space." -ForegroundColor Yellow
+    }
+
+    # Enable
+    Write-Step "Enabling System Protection (${allocPercent}% = ${allocGB} GB)..."
+    try {
+        Enable-ComputerRestore -Drive "C:\" -ErrorAction Stop
+        vssadmin resize shadowstorage /for=C: /on=C: /maxsize=${allocPercent}% 2>&1 | Out-Null
+        Set-ItemProperty -Path $regPath -Name "DisableSR" -Value 0 -ErrorAction SilentlyContinue
+
+        Write-OK "System Protection enabled on C: drive"
+
+        # Create initial restore point
+        Write-Step "Creating initial restore point..."
+        try {
+            Checkpoint-Computer -Description "PCMasterclass - Initial Setup" -RestorePointType MODIFY_SETTINGS -ErrorAction Stop
+            Write-OK "Initial restore point created"
+        } catch {
+            Write-Host "    Note: Could not create restore point (Windows limits one per 24hrs)" -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Fail "Failed to enable System Protection: $($_.Exception.Message)"
+    }
+}
+
+# ============================================================================
 # DISPLAY SUMMARY
 # ============================================================================
 function Show-Summary {
@@ -896,6 +971,11 @@ if ($success) {
 # Step 8: Scheduled task setup (optional, interactive)
 if ($success) {
     Set-MaintenanceSchedule
+}
+
+# Step 9: Enable System Restore Points (with disk space safety check)
+if ($success) {
+    Enable-RestorePoints
 }
 
 # Show final summary
