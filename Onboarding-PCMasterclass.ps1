@@ -12,7 +12,7 @@
 
 .NOTES
     Author:  Paul - PC Masterclass
-    Version: 1.3.4
+    Version: 1.3.5
     Date:    2026-03-16
 
     USAGE (paste into an elevated PowerShell prompt):
@@ -36,7 +36,7 @@
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-$DeployVersion = "1.3.4"
+$DeployVersion = "1.3.5"
 $BaseDir = "C:\Teamviewer"
 $ScriptName = "PCMasterclass-Maintenance.ps1"
 $GitHubRepo = "pcmasterclass-ai/maintenance"
@@ -244,6 +244,9 @@ function Get-MaintenanceScript {
         Copy-Item -Path $tempFile -Destination $ScriptPath -Force
         Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
 
+        # Remove Zone.Identifier so RemoteSigned execution policy won't block the script
+        Unblock-File -Path $ScriptPath -ErrorAction SilentlyContinue
+
         if ($existingVersion -and $existingVersion -eq $downloadedVersion) {
             Write-OK "Script is already up to date (v$downloadedVersion)"
         } elseif ($existingVersion) {
@@ -261,6 +264,7 @@ function Get-MaintenanceScript {
             $csvClient = New-Object System.Net.WebClient
             if ($GitHubToken) { $csvClient.Headers.Add("Authorization", "token $GitHubToken") }
             $csvClient.DownloadFile($BenchmarkCsvUrl, $BenchmarkCsvPath)
+            Unblock-File -Path $BenchmarkCsvPath -ErrorAction SilentlyContinue
             $csvSize = (Get-Item $BenchmarkCsvPath).Length
             $csvLines = (Get-Content $BenchmarkCsvPath | Measure-Object).Count - 1
             Write-OK "CPU benchmarks: $csvLines processors ($([math]::Round($csvSize / 1KB, 1))KB)"
