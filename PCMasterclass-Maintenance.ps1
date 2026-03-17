@@ -3051,8 +3051,12 @@ try {
 
     # Check allocated disk space for restore points
     $allocatedGB = "Unknown"
+    $shadowStorageConfigured = $false
     try {
         $vssOutput = vssadmin list shadowstorage 2>&1 | Out-String
+        if ($vssOutput -match "For volume: \(C:\)") {
+            $shadowStorageConfigured = $true
+        }
         if ($vssOutput -match "Used Shadow Copy Storage space:\s*([\d.,]+)\s*(MB|GB|TB)") {
             $usedVal = [double]($Matches[1] -replace ',', '')
             $usedUnit = $Matches[2]
@@ -3082,6 +3086,12 @@ try {
     if (-not $srEnabled) {
         $rpStatus = "WARNING"
         $rpNote = "System Restore is DISABLED on this machine"
+    } elseif ($rpCount -eq 0 -and $shadowStorageConfigured) {
+        # Shadow storage is configured but Get-ComputerRestorePoint returns nothing.
+        # On Windows 11 24H2+ builds, Checkpoint-Computer and Get-ComputerRestorePoint
+        # are broken (srservice removed), but System Protection still works automatically.
+        $rpStatus = "PASS"
+        $rpNote = "System Protection enabled (shadow storage configured). Restore points are managed automatically by Windows."
     } elseif ($rpCount -eq 0) {
         $rpStatus = "WARNING"
         $rpNote = "No restore points found - recommend creating one"

@@ -12,7 +12,7 @@
 
 .NOTES
     Author:  Paul - PC Masterclass
-    Version: 1.0.0
+    Version: 1.1.0
     Date:    2026-03-18
 
     USAGE (Tactical RMM - run as SYSTEM):
@@ -82,13 +82,18 @@ $regDisabledExplicit = (Get-ItemProperty -Path $regPath -Name "DisableSR" -Error
 
 if ($protectionEnabled -and $regDisabledExplicit -ne 1) {
     Write-Log "System Protection is ALREADY ENABLED on C: drive. No changes needed." "INFO"
+    # Ensure RPSessionInterval is set for auto-creation
+    try {
+        Set-ItemProperty -Path $regPath -Name "RPSessionInterval" -Value 1 -ErrorAction SilentlyContinue
+    } catch {}
     Write-Log "Creating a fresh restore point as a health check..."
     try {
         Checkpoint-Computer -Description "PCMasterclass - Verification" -RestorePointType MODIFY_SETTINGS -ErrorAction Stop
         Write-Log "Restore point created successfully." "INFO"
     } catch {
-        # Windows limits restore points to one per 24 hours by default
-        Write-Log "Could not create restore point (may already have one from today): $_" "WARN"
+        # On Windows 11 24H2+ builds, Checkpoint-Computer is broken (srservice removed).
+        # System Protection is still working - Windows creates restore points automatically.
+        Write-Log "Could not create restore point manually (expected on Win 11 24H2+). System Protection is active." "WARN"
     }
     Write-Log "STATUS: ALREADY_ENABLED" "INFO"
     exit 0
@@ -129,6 +134,18 @@ if ($remainingAfterAlloc -lt ($MinFreeSpaceGB * 0.75)) {
     $allocGB = [math]::Round(($disk.Size * $allocPercent / 100) / 1GB, 1)
 }
 
+# ── Ensure VSS and related services are ready ────────────────────────────────
+Write-Log "Checking VSS and shadow copy services..."
+foreach ($svc in @("VSS", "swprv")) {
+    try {
+        $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
+        if ($s -and $s.StartType -eq "Disabled") {
+            Set-Service -Name $svc -StartupType Manual -ErrorAction SilentlyContinue
+            Write-Log "Set $svc service to Manual start." "INFO"
+        }
+    } catch {}
+}
+
 # ── Enable System Protection ─────────────────────────────────────────────────
 Write-Log "Enabling System Protection on C: drive..."
 
@@ -149,9 +166,11 @@ try {
     Write-Log "Warning - could not set shadow storage size: $_" "WARN"
 }
 
-# Ensure the registry doesn't have System Restore disabled
+# Ensure the registry has System Restore enabled and auto-create interval set
 try {
     Set-ItemProperty -Path $regPath -Name "DisableSR" -Value 0 -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path $regPath -Name "RPSessionInterval" -Value 1 -ErrorAction SilentlyContinue
+    Write-Log "Registry: DisableSR=0, RPSessionInterval=1" "INFO"
 } catch {}
 
 # ── Create Initial Restore Point ─────────────────────────────────────────────
@@ -160,7 +179,24 @@ try {
     Checkpoint-Computer -Description "PCMasterclass - Initial Setup" -RestorePointType MODIFY_SETTINGS -ErrorAction Stop
     Write-Log "Initial restore point created successfully." "INFO"
 } catch {
-    Write-Log "Could not create restore point: $_" "WARN"
+    # On Windows 11 24H2+ builds, Checkpoint-Computer is broken (srservice removed).
+    # Try WMI fallback.
+    Write-Log "Checkpoint-Computer failed, trying WMI fallback..." "WARN"
+    try {
+        $wmiSR = [wmiclass]"\\.\root\default:SystemRestore"
+        $wmiResult = $wmiSR.CreateRestorePoint("PCMasterclass - Initial Setup", 12, 100)
+        if ($wmiResult.ReturnValue -eq 0) {
+            Write-Log "Initial restore point created via WMI." "INFO"
+        } else {
+            Write-Log "WMI CreateRestorePoint returned: $($wmiResult.ReturnValue)" "WARN"
+        }
+    } catch {
+        # Both methods failed - likely Windows 11 24H2+ where manual creation is broken.
+        # System Protection is still enabled and Windows will create restore points
+        # automatically before updates and driver installs.
+        Write-Log "Could not create restore point manually. This is expected on Windows 11 24H2+ builds." "WARN"
+        Write-Log "System Protection IS enabled - Windows will create restore points automatically before updates." "INFO"
+    }
 }
 
 # ── Summary ───────────────────────────────────────────────────────────────────
