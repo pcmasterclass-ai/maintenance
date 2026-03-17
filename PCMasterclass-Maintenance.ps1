@@ -9,8 +9,8 @@
     Can also be used for ad-hoc health checks.
 .NOTES
     Author:  Paul - PC Masterclass
-    Version: 2.7.0
-    Date:    2026-03-17
+    Version: 2.7.1
+    Date:    2026-03-18
 
     USAGE:
       Run as Administrator (required for SFC, SMART, Windows Update):
