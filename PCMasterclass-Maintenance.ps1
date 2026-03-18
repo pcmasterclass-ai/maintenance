@@ -9,7 +9,7 @@
     Can also be used for ad-hoc health checks.
 .NOTES
     Author:  Paul - PC Masterclass
-    Version: 2.7.1
+    Version: 2.7.2
     Date:    2026-03-18
 
     USAGE:
@@ -67,7 +67,7 @@ param(
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-$ScriptVersion = "2.7.1"
+$ScriptVersion = "2.7.2"
 
 # GitHub raw URL for the latest version of this script
 # To use: create a private GitHub repo, push the script, and set this URL
@@ -3016,9 +3016,76 @@ if (-not $SkipAdwCleaner) {
 
 
 # ============================================================================
-# MODULE 18: SYSTEM RESTORE POINT AUDIT
+# MODULE 18: SYSTEM RESTORE POINT AUDIT (with auto-enable)
 # ============================================================================
 Write-Log "Checking system restore points..."
+
+# ── Auto-enable System Protection if not already on ──────────────────────────
+try {
+    $srRegPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore"
+    $srDisabled = (Get-ItemProperty -Path $srRegPath -Name "DisableSR" -ErrorAction SilentlyContinue).DisableSR
+    $srVssOutput = vssadmin list shadowstorage 2>&1 | Out-String
+    $srAlreadyEnabled = ($srVssOutput -match "For volume: \(C:\)" -and $srDisabled -ne 1)
+
+    if (-not $srAlreadyEnabled) {
+        Write-Log "System Protection is not enabled. Attempting to enable automatically..."
+
+        # Check disk space first (minimum 30 GB free)
+        $srDisk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='C:'"
+        $srFreeGB = [math]::Round($srDisk.FreeSpace / 1GB, 1)
+        $srTotalGB = [math]::Round($srDisk.Size / 1GB, 1)
+
+        if ($srFreeGB -lt 30) {
+            Write-Log "Skipping auto-enable: free space (${srFreeGB} GB) below 30 GB threshold. Consider storage upgrade." "WARN"
+        } else {
+            # Ensure VSS services are not disabled
+            foreach ($svc in @("VSS", "swprv")) {
+                try {
+                    $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
+                    if ($s -and $s.StartType -eq "Disabled") {
+                        Set-Service -Name $svc -StartupType Manual -ErrorAction SilentlyContinue
+                    }
+                } catch {}
+            }
+
+            # Calculate allocation (5%, drop to 3% if tight)
+            $srAllocPercent = 5
+            $srAllocGB = [math]::Round(($srDisk.Size * $srAllocPercent / 100) / 1GB, 1)
+            if (($srFreeGB - $srAllocGB) -lt 22.5) {
+                $srAllocPercent = 3
+                $srAllocGB = [math]::Round(($srDisk.Size * $srAllocPercent / 100) / 1GB, 1)
+            }
+
+            # Enable System Protection
+            Enable-ComputerRestore -Drive "C:\" -ErrorAction Stop
+            vssadmin resize shadowstorage /for=C: /on=C: /maxsize=${srAllocPercent}% 2>&1 | Out-Null
+
+            # Set registry values
+            Set-ItemProperty -Path $srRegPath -Name "DisableSR" -Value 0 -ErrorAction SilentlyContinue
+            Set-ItemProperty -Path $srRegPath -Name "RPSessionInterval" -Value 1 -ErrorAction SilentlyContinue
+
+            Write-Log "System Protection enabled: ${srAllocPercent}% allocation (${srAllocGB} GB). Free space: ${srFreeGB} GB." "INFO"
+
+            # Try to create an initial restore point
+            try {
+                Checkpoint-Computer -Description "PCMasterclass - Auto Setup" -RestorePointType MODIFY_SETTINGS -ErrorAction Stop
+                Write-Log "Initial restore point created." "INFO"
+            } catch {
+                try {
+                    $wmiSR = [wmiclass]"\\.\root\default:SystemRestore"
+                    $null = $wmiSR.CreateRestorePoint("PCMasterclass - Auto Setup", 12, 100)
+                } catch {
+                    Write-Log "Could not create restore point manually (expected on Win 11 24H2+). Windows will create one automatically." "WARN"
+                }
+            }
+        }
+    } else {
+        # Ensure RPSessionInterval is set even if already enabled
+        Set-ItemProperty -Path $srRegPath -Name "RPSessionInterval" -Value 1 -ErrorAction SilentlyContinue
+    }
+} catch {
+    Write-Log "Auto-enable System Protection failed: $_" "WARN"
+}
 
 try {
     $restorePoints = @()
