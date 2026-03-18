@@ -9,8 +9,8 @@
     Can also be used for ad-hoc health checks.
 .NOTES
     Author:  Paul - PC Masterclass
-    Version: 2.7.2
-    Date:    2026-03-18
+    Version: 2.7.3
+    Date:    2026-03-19
 
     USAGE:
       Run as Administrator (required for SFC, SMART, Windows Update):
@@ -53,6 +53,7 @@ param(
     [switch]$SkipAdwCleaner,
     [switch]$SkipUpdate,
     [switch]$Updated,
+    [string]$ClientName = "",
     [string]$ReportPath = "C:\Teamviewer\Reports",
     [string]$EmailTo = "",
     [string]$SmtpServer = "smtp.gmail.com",
@@ -67,7 +68,7 @@ param(
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-$ScriptVersion = "2.7.2"
+$ScriptVersion = "2.7.3"
 
 # GitHub raw URL for the latest version of this script
 # To use: create a private GitHub repo, push the script, and set this URL
@@ -176,18 +177,21 @@ $ReportFile = Join-Path $ReportPath "${ComputerName}_Maintenance_${Timestamp}.ht
 $LogFile = Join-Path $ReportPath "${ComputerName}_Maintenance_${Timestamp}.log"
 
 # ============================================================================
-# CLIENT NAME LOOKUP (from Rollout Tracker via webhook)
+# CLIENT NAME LOOKUP
 # ============================================================================
-$ClientName = ""
-try {
-    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
-    $lookupUrl = "https://script.google.com/macros/s/AKfycbyKkPyodUa3M2Ka9vXzgjMK0hzq6EfA58unifA7Ih6h4OxjLYfXuqea8rrcO2i4yMmF/exec?computerName=$ComputerName&secret=pcm-tracker-2026"
-    $lookupResponse = Invoke-RestMethod -Uri $lookupUrl -Method Get -TimeoutSec 15 -ErrorAction Stop
-    if ($lookupResponse.status -eq "ok" -and $lookupResponse.clientName) {
-        $ClientName = $lookupResponse.clientName
+# If -ClientName was passed as a parameter, use it directly.
+# Otherwise, fall back to the Rollout Tracker webhook lookup.
+if (-not $ClientName) {
+    try {
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+        $lookupUrl = "https://script.google.com/macros/s/AKfycbyKkPyodUa3M2Ka9vXzgjMK0hzq6EfA58unifA7Ih6h4OxjLYfXuqea8rrcO2i4yMmF/exec?computerName=$ComputerName&secret=pcm-tracker-2026"
+        $lookupResponse = Invoke-RestMethod -Uri $lookupUrl -Method Get -TimeoutSec 15 -ErrorAction Stop
+        if ($lookupResponse.status -eq "ok" -and $lookupResponse.clientName) {
+            $ClientName = $lookupResponse.clientName
+        }
+    } catch {
+        # Non-critical - continue without client name
     }
-} catch {
-    # Non-critical - continue without client name
 }
 
 # ============================================================================
