@@ -3148,7 +3148,11 @@ try {
     if ($rpCount -gt 0) {
         $newestRP = ($restorePoints | Sort-Object CreationTime -Descending | Select-Object -First 1)
         $oldestRP = ($restorePoints | Sort-Object CreationTime | Select-Object -First 1)
-        $daysSinceLatest = [math]::Floor(((Get-Date) - $newestRP.CreationTime).TotalDays)
+        # Cast CreationTime to [DateTime] explicitly — Get-ComputerRestorePoint can return
+        # a WMI datetime string on some systems, which causes "ambiguous overloads for
+        # op_Subtraction" when subtracting from (Get-Date).
+        $newestTime = [DateTime]$newestRP.CreationTime
+        $daysSinceLatest = [math]::Floor(((Get-Date) - $newestTime).TotalDays)
     }
 
     # Determine status
@@ -3185,14 +3189,14 @@ try {
 
     # Store up to 5 most recent restore points for the report
     if ($rpCount -gt 0) {
-        $Results.RestorePoints.NewestDate = $newestRP.CreationTime.ToString("d MMM yyyy HH:mm")
-        $Results.RestorePoints.OldestDate = $oldestRP.CreationTime.ToString("d MMM yyyy HH:mm")
+        $Results.RestorePoints.NewestDate = ([DateTime]$newestRP.CreationTime).ToString("d MMM yyyy HH:mm")
+        $Results.RestorePoints.OldestDate = ([DateTime]$oldestRP.CreationTime).ToString("d MMM yyyy HH:mm")
 
         $recentPoints = $restorePoints | Sort-Object CreationTime -Descending | Select-Object -First 5
         foreach ($rp in $recentPoints) {
             $Results.RestorePoints.Points += @{
                 Description = $rp.Description
-                Created     = $rp.CreationTime.ToString("d MMM yyyy HH:mm")
+                Created     = ([DateTime]$rp.CreationTime).ToString("d MMM yyyy HH:mm")
                 Type        = switch ($rp.RestorePointType) {
                     0  { "Application Install" }
                     1  { "Application Uninstall" }
