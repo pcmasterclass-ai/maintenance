@@ -9,8 +9,8 @@
     Can also be used for ad-hoc health checks.
 .NOTES
     Author:  Paul - PC Masterclass
-    Version: 2.7.3
-    Date:    2026-03-19
+    Version: 2.8.0
+    Date:    2026-03-21
 
     USAGE:
       Run as Administrator (required for SFC, SMART, Windows Update):
@@ -68,7 +68,7 @@ param(
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-$ScriptVersion = "2.7.3"
+$ScriptVersion = "2.8.0"
 
 # GitHub raw URL for the latest version of this script
 # To use: create a private GitHub repo, push the script, and set this URL
@@ -116,6 +116,17 @@ if (-not $SkipUpdate -and -not $Updated -and -not $SaveCredential) {
             $needsUpdate = $remoteVersion -ne $ScriptVersion
         }
 
+        # Even if version matches, check if file content differs (handles same-version hotfixes)
+        if (-not $needsUpdate) {
+            $myPath = $MyInvocation.MyCommand.Path
+            $localHash = (Get-FileHash -Path $myPath -Algorithm SHA256).Hash
+            $remoteHash = (Get-FileHash -Path $tempScript -Algorithm SHA256).Hash
+            if ($localHash -ne $remoteHash) {
+                Write-Host "[UPDATE] Same version (v$ScriptVersion) but content differs — applying hotfix..."
+                $needsUpdate = $true
+            }
+        }
+
         if ($needsUpdate) {
             Write-Host "[UPDATE] New version available: v$remoteVersion (current: v$ScriptVersion)"
             Write-Host "[UPDATE] Updating script and relaunching..."
@@ -150,6 +161,7 @@ if (-not $SkipUpdate -and -not $Updated -and -not $SaveCredential) {
             if ($SmtpUser) { $relaunchArgs += "-SmtpUser"; $relaunchArgs += "`"$SmtpUser`"" }
             if ($EmailFrom) { $relaunchArgs += "-EmailFrom"; $relaunchArgs += "`"$EmailFrom`"" }
             if ($CredentialPath -ne "C:\Teamviewer\Config\smtp-cred.xml") { $relaunchArgs += "-CredentialPath"; $relaunchArgs += "`"$CredentialPath`"" }
+            if ($ClientName) { $relaunchArgs += "-ClientName"; $relaunchArgs += "`"$ClientName`"" }
 
             # Clean up temp file and relaunch
             Remove-Item $tempScript -Force -ErrorAction SilentlyContinue
