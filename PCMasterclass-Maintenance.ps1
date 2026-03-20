@@ -2234,15 +2234,6 @@ try {
 Write-Log "Auditing browser extensions..."
 
 # Helper: resolve __MSG_ extension names from _locales
-# Trusted browser extensions that should never be flagged (by ID or name pattern)
-$TrustedExtensionIDs = @(
-    "cjpalhdlnbpafiamejdnhcphjbkeiagm",  # uBlock Origin
-    "ddkjiahejlhfcafbddmgiahcphecmpfh",  # uBlock Origin Lite
-    "efaidnbmnnnibpcajpcglclefindmkaj",   # Adobe Acrobat
-    "ghbmnnjooekpmoecnnnilnnbdlolhkhi",   # Google Docs Offline
-    "nmmhkkegccagdldgiimedpiccmgmieda",   # Google Wallet
-    "pkedcjkdefgpdelpbcmbmeomcjbeemfm"    # Chrome Remote Desktop
-)
 
 # Well-known extension IDs whose names often fail to resolve from locale files
 $KnownExtensionNames = @{
@@ -2300,6 +2291,10 @@ try {
         "ddkjiahejlhfcafbddmgiahcphecmpfh"   # uBlock Origin Lite (Chrome/Edge)
         "uBlock0@raymondhill.net"              # uBlock Origin (Firefox)
         "uBOLite@raymondhill.net"              # uBlock Origin Lite (Firefox)
+        "efaidnbmnnnibpcajpcglclefindmkaj"    # Adobe Acrobat (Chrome/Edge)
+        "ghbmnnjooekpmoecnnnilnnbdlolhkhi"    # Google Docs Offline (Chrome/Edge)
+        "nmmhkkegccagdldgiimedpiccmgmieda"    # Google Wallet (Chrome/Edge)
+        "pkedcjkdefgpdelpbcmbmeomcjbeemfm"    # Chrome Remote Desktop
     )
 
     $browserExtensions = @()
