@@ -9,7 +9,7 @@
     Can also be used for ad-hoc health checks.
 .NOTES
     Author:  Paul - PC Masterclass
-    Version: 2.8.0
+    Version: 2.8.1
     Date:    2026-03-21
 
     USAGE:
@@ -68,7 +68,7 @@ param(
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-$ScriptVersion = "2.8.0"
+$ScriptVersion = "2.8.1"
 
 # GitHub raw URL for the latest version of this script
 # To use: create a private GitHub repo, push the script, and set this URL
@@ -122,7 +122,7 @@ if (-not $SkipUpdate -and -not $Updated -and -not $SaveCredential) {
             $localHash = (Get-FileHash -Path $myPath -Algorithm SHA256).Hash
             $remoteHash = (Get-FileHash -Path $tempScript -Algorithm SHA256).Hash
             if ($localHash -ne $remoteHash) {
-                Write-Host "[UPDATE] Same version (v$ScriptVersion) but content differs — applying hotfix..."
+                Write-Host "[UPDATE] Same version (v$ScriptVersion) but content differs - applying hotfix..."
                 $needsUpdate = $true
             }
         }
@@ -2295,7 +2295,7 @@ function Resolve-ExtensionName {
 }
 
 try {
-    # Trusted extension IDs — these are whitelisted and will never be flagged.
+    # Trusted extension IDs - these are whitelisted and will never be flagged.
     # Chrome and Edge share the same Web Store IDs. Firefox uses its own addon IDs.
     # All formats are stored in one list since IDs never collide across browsers.
     $TrustedExtensionIDs = @(
@@ -3071,7 +3071,7 @@ if (-not $SkipAdwCleaner) {
 # ============================================================================
 Write-Log "Checking system restore points..."
 
-# ── Auto-enable System Protection if not already on ──────────────────────────
+# -- Auto-enable System Protection if not already on ---------------------------
 try {
     $srRegPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore"
     $srDisabled = (Get-ItemProperty -Path $srRegPath -Name "DisableSR" -ErrorAction SilentlyContinue).DisableSR
@@ -3195,7 +3195,7 @@ try {
     if ($rpCount -gt 0) {
         $newestRP = ($restorePoints | Sort-Object CreationTime -Descending | Select-Object -First 1)
         $oldestRP = ($restorePoints | Sort-Object CreationTime | Select-Object -First 1)
-        # Cast CreationTime to [DateTime] explicitly — Get-ComputerRestorePoint can return
+        # Cast CreationTime to [DateTime] explicitly - Get-ComputerRestorePoint can return
         # a WMI datetime string on some systems, which causes "ambiguous overloads for
         # op_Subtraction" when subtracting from (Get-Date).
         $newestTime = [DateTime]$newestRP.CreationTime
@@ -3335,7 +3335,7 @@ try {
 # CROSS-REFERENCE: Disk Health vs Event Log
 # If SMART says "Healthy" but event logs show disk errors (bad blocks, I/O
 # errors, NTFS corruption), upgrade Disk Health to WARNING. SMART status lags
-# behind real-world failures — the event log catches I/O errors in real time.
+# behind real-world failures - the event log catches I/O errors in real time.
 # ============================================================================
 if ($Results.DiskHealth.Status -eq "PASS" -and $Results.EventLogErrors.ActionableEvents) {
     $diskEventSources = @("disk", "Ntfs", "stornvme", "storahci")
@@ -3513,7 +3513,7 @@ if ($Results.DiskHealth.EventLogWarning) {
     if ($Results.DiskHealth.DiskErrorEvents) {
         $html += "<ul style='margin:8px 0 0;color:#7f1d1d;'>"
         foreach ($de in $Results.DiskHealth.DiskErrorEvents | Select-Object -First 5) {
-            $html += "<li>[$($de.Source) ID:$($de.EventID)] $($de.Time) — $($de.Note)</li>"
+            $html += "<li>[$($de.Source) ID:$($de.EventID)] $($de.Time) - $($de.Note)</li>"
         }
         if ($Results.DiskHealth.DiskErrorEvents.Count -gt 5) {
             $html += "<li>... and $($Results.DiskHealth.DiskErrorEvents.Count - 5) more (see Event Log section)</li>"
