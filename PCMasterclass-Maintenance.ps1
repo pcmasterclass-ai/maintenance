@@ -9,7 +9,7 @@
     Can also be used for ad-hoc health checks.
 .NOTES
     Author:  Paul - PC Masterclass
-    Version: 2.8.1
+    Version: 2.8.2
     Date:    2026-03-21
 
     USAGE:
@@ -68,7 +68,7 @@ param(
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-$ScriptVersion = "2.8.1"
+$ScriptVersion = "2.8.2"
 
 # GitHub raw URL for the latest version of this script
 # To use: create a private GitHub repo, push the script, and set this URL
@@ -3192,13 +3192,23 @@ try {
     $oldestRP = $null
     $daysSinceLatest = -1
 
+    # Helper: Convert CreationTime to a .NET DateTime regardless of source format.
+    # Get-ComputerRestorePoint returns either a .NET DateTime or a WMI CIM_DATETIME
+    # string (e.g. "20260320000944.549838-000") depending on the OS build and
+    # PowerShell version. This function handles both.
+    function ConvertTo-RPDateTime([object]$val) {
+        if ($val -is [DateTime]) { return $val }
+        $s = "$val"
+        if ($s -match '^\d{14}\.\d+-\d+$') {
+            return [System.Management.ManagementDateTimeConverter]::ToDateTime($s)
+        }
+        return [DateTime]::Parse($s)
+    }
+
     if ($rpCount -gt 0) {
         $newestRP = ($restorePoints | Sort-Object CreationTime -Descending | Select-Object -First 1)
         $oldestRP = ($restorePoints | Sort-Object CreationTime | Select-Object -First 1)
-        # Cast CreationTime to [DateTime] explicitly - Get-ComputerRestorePoint can return
-        # a WMI datetime string on some systems, which causes "ambiguous overloads for
-        # op_Subtraction" when subtracting from (Get-Date).
-        $newestTime = [DateTime]$newestRP.CreationTime
+        $newestTime = ConvertTo-RPDateTime $newestRP.CreationTime
         $daysSinceLatest = [math]::Floor(((Get-Date) - $newestTime).TotalDays)
     }
 
@@ -3236,14 +3246,14 @@ try {
 
     # Store up to 5 most recent restore points for the report
     if ($rpCount -gt 0) {
-        $Results.RestorePoints.NewestDate = ([DateTime]$newestRP.CreationTime).ToString("d MMM yyyy HH:mm")
-        $Results.RestorePoints.OldestDate = ([DateTime]$oldestRP.CreationTime).ToString("d MMM yyyy HH:mm")
+        $Results.RestorePoints.NewestDate = (ConvertTo-RPDateTime $newestRP.CreationTime).ToString("d MMM yyyy HH:mm")
+        $Results.RestorePoints.OldestDate = (ConvertTo-RPDateTime $oldestRP.CreationTime).ToString("d MMM yyyy HH:mm")
 
         $recentPoints = $restorePoints | Sort-Object CreationTime -Descending | Select-Object -First 5
         foreach ($rp in $recentPoints) {
             $Results.RestorePoints.Points += @{
                 Description = $rp.Description
-                Created     = ([DateTime]$rp.CreationTime).ToString("d MMM yyyy HH:mm")
+                Created     = (ConvertTo-RPDateTime $rp.CreationTime).ToString("d MMM yyyy HH:mm")
                 Type        = switch ($rp.RestorePointType) {
                     0  { "Application Install" }
                     1  { "Application Uninstall" }
@@ -4556,9 +4566,10 @@ ${overallColor}OVERALL STATUS: $overallStatus ($warningCount warning(s), $errorC
             $emailBody += "`n"
         }
 
-        # Add Telemetry Services details
+        # Add Miscellaneous section (Telemetry Services)
         if ($Results.TelemetryServices.Status -and $Results.TelemetryServices.Status -ne "ERROR") {
-            $emailBody += "`n[H]TELEMETRY SERVICES (read-only audit)[/H]`n"
+            $emailBody += "`n[H]MISCELLANEOUS[/H]`n"
+            $emailBody += "[B]Telemetry Services (read-only audit)[/B]`n"
             $emailBody += "Services Found".PadRight(30) + "$($Results.TelemetryServices.TotalFound)`n"
             $emailBody += "Running".PadRight(30) + "$($Results.TelemetryServices.RunningCount)`n"
             $emailBody += "Disabled".PadRight(30) + "$($Results.TelemetryServices.DisabledCount)`n`n"
