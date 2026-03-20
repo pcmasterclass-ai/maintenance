@@ -636,9 +636,11 @@ try {
         $normalised = ($detectedCpu -replace '\s+', ' ').Trim()
         $match = $benchmarkData | Where-Object { $_.CpuName -eq $normalised } | Select-Object -First 1
 
-        # Try match without clock speed suffix (e.g. "@ 3.60GHz")
+        # Try match without clock speed suffix (e.g. "@ 3.60GHz") and GPU branding
+        # (e.g. "with Radeon Graphics", "with Radeon Vega Mobile Gfx", "with Intel UHD Graphics")
         if (-not $match) {
             $cpuNoSpeed = ($normalised -replace '\s*@\s*[\d\.]+\s*GHz', '').Trim()
+            $cpuNoSpeed = ($cpuNoSpeed -replace '\s+with\s+(Radeon|Intel).*$', '').Trim()
             $match = $benchmarkData | Where-Object { $_.CpuName -eq $cpuNoSpeed } | Select-Object -First 1
         }
 
@@ -2290,6 +2292,16 @@ function Resolve-ExtensionName {
 }
 
 try {
+    # Trusted extension IDs — these are whitelisted and will never be flagged.
+    # Chrome and Edge share the same Web Store IDs. Firefox uses its own addon IDs.
+    # All formats are stored in one list since IDs never collide across browsers.
+    $TrustedExtensionIDs = @(
+        "cjpalhdlnbpafiamejdnhcphjbkeiagm"   # uBlock Origin (Chrome/Edge)
+        "ddkjiahejlhfcafbddmgiahcphecmpfh"   # uBlock Origin Lite (Chrome/Edge)
+        "uBlock0@raymondhill.net"              # uBlock Origin (Firefox)
+        "uBOLite@raymondhill.net"              # uBlock Origin Lite (Firefox)
+    )
+
     $browserExtensions = @()
     $flaggedExtensions = @()
     $browsersFound = @()
@@ -2425,19 +2437,47 @@ try {
                         $ffData = Get-Content -LiteralPath $extensionsJson -Raw -ErrorAction Stop | ConvertFrom-Json
                         foreach ($addon in $ffData.addons) {
                             if ($addon.type -eq "extension" -and $addon.location -ne "app-system-defaults") {
+                                # Gather Firefox permissions from the addon manifest
+                                $ffPermissions = @()
+                                if ($addon.userPermissions) {
+                                    if ($addon.userPermissions.permissions) { $ffPermissions += $addon.userPermissions.permissions }
+                                    if ($addon.userPermissions.origins) { $ffPermissions += $addon.userPermissions.origins }
+                                }
+
                                 $ext = @{
                                     Browser     = "Firefox"
                                     User        = $profile.Name
                                     Name        = if ($addon.defaultLocale.name) { $addon.defaultLocale.name } else { $addon.id }
                                     Version     = if ($addon.version) { $addon.version } else { "Unknown" }
                                     ID          = $addon.id
-                                    Permissions = ""
+                                    Permissions = ($ffPermissions -join ", ")
                                     Flagged     = $false
                                     FlagReason  = ""
                                 }
-                                if (-not $addon.active) {
-                                    $ext.FlagReason = "Disabled extension"
+
+                                # Flag suspicious extensions (skip trusted ones)
+                                $reasons = @()
+                                if ($addon.id -notin $TrustedExtensionIDs) {
+                                    $hasAllUrls = ($ffPermissions -join " ") -match "<all_urls>|\*://\*/\*"
+                                    $hasHistory = ($ffPermissions -join " ") -match "history|webNavigation"
+                                    if ($hasAllUrls -and $hasHistory) {
+                                        $reasons += "Access to all sites + browsing history"
+                                    }
+                                    $extName = $ext.Name
+                                    if ($extName -match "coupon|shop|deal|discount|cashback|honey" -and $hasAllUrls) {
+                                        $reasons += "Shopping extension with broad permissions"
+                                    }
+                                    if (-not $addon.active) {
+                                        $reasons += "Disabled extension"
+                                    }
                                 }
+
+                                if ($reasons.Count -gt 0) {
+                                    $ext.Flagged = $true
+                                    $ext.FlagReason = $reasons -join "; "
+                                    $flaggedExtensions += $ext
+                                }
+
                                 $browserExtensions += $ext
                             }
                         }
@@ -3285,6 +3325,26 @@ try {
 
 
 # ============================================================================
+# CROSS-REFERENCE: Disk Health vs Event Log
+# If SMART says "Healthy" but event logs show disk errors (bad blocks, I/O
+# errors, NTFS corruption), upgrade Disk Health to WARNING. SMART status lags
+# behind real-world failures — the event log catches I/O errors in real time.
+# ============================================================================
+if ($Results.DiskHealth.Status -eq "PASS" -and $Results.EventLogErrors.ActionableEvents) {
+    $diskEventSources = @("disk", "Ntfs", "stornvme", "storahci")
+    $diskEventIDs = @(7, 11, 15, 51, 52, 55, 137, 153)
+    $diskErrors = @($Results.EventLogErrors.ActionableEvents | Where-Object {
+        $_.Source -in $diskEventSources -or ($_.Source -eq "disk" -and $_.EventID -in $diskEventIDs)
+    })
+    if ($diskErrors.Count -gt 0) {
+        $Results.DiskHealth.Status = "WARNING"
+        $Results.DiskHealth.EventLogWarning = "SMART reports Healthy, but $($diskErrors.Count) disk error event(s) found in the last 24h (bad blocks, I/O errors, or filesystem corruption). Run disk diagnostics."
+        $Results.DiskHealth.DiskErrorEvents = $diskErrors
+        Write-Log "Disk Health upgraded to WARNING: $($diskErrors.Count) disk error event(s) found in event log despite SMART Healthy" "WARN"
+    }
+}
+
+# ============================================================================
 # REPORT GENERATION
 # ============================================================================
 Write-Log "Generating HTML report..."
@@ -3438,6 +3498,23 @@ $html += @"
 <div class="section">
     <h2><span class="icon">&#x1F4BE;</span> Disk Health $(Get-StatusBadge $Results.DiskHealth.Status)</h2>
 "@
+
+if ($Results.DiskHealth.EventLogWarning) {
+    $html += "<div style='background:#fef2f2;border:1px solid #fca5a5;border-radius:6px;padding:12px;margin-bottom:12px;'>"
+    $html += "<p style='color:#dc2626;font-weight:bold;margin:0 0 6px;'>Event Log Cross-Reference Warning</p>"
+    $html += "<p style='color:#7f1d1d;margin:0;'>$($Results.DiskHealth.EventLogWarning)</p>"
+    if ($Results.DiskHealth.DiskErrorEvents) {
+        $html += "<ul style='margin:8px 0 0;color:#7f1d1d;'>"
+        foreach ($de in $Results.DiskHealth.DiskErrorEvents | Select-Object -First 5) {
+            $html += "<li>[$($de.Source) ID:$($de.EventID)] $($de.Time) — $($de.Note)</li>"
+        }
+        if ($Results.DiskHealth.DiskErrorEvents.Count -gt 5) {
+            $html += "<li>... and $($Results.DiskHealth.DiskErrorEvents.Count - 5) more (see Event Log section)</li>"
+        }
+        $html += "</ul>"
+    }
+    $html += "</div>"
+}
 
 if ($Results.DiskHealth.Disks) {
     $html += "<table><tr><th>Disk</th><th>Type</th><th>Size</th><th>Health</th><th>Temp</th></tr>"
@@ -3945,9 +4022,10 @@ if ($Results.RestorePoints.Status -eq "ERROR") {
 $html += @"
 </div>
 
-<!-- TELEMETRY SERVICES -->
+<!-- MISCELLANEOUS (collapsed by default) -->
 <div class="section">
-    <h2><span class="icon">&#x1F4E1;</span> Telemetry Services $(Get-StatusBadge $Results.TelemetryServices.Status)</h2>
+    <h2><span class="icon">&#x1F4CB;</span> Miscellaneous</h2>
+    <details><summary style='cursor:pointer;color:#0d6efd;font-weight:bold;margin:8px 0;'>Telemetry Services $(Get-StatusBadge $Results.TelemetryServices.Status)</summary>
 "@
 
 if ($Results.TelemetryServices.Status -eq "ERROR") {
@@ -3972,6 +4050,7 @@ if ($Results.TelemetryServices.Status -eq "ERROR") {
 }
 
 $html += @"
+    </details>
 </div>
 
 <!-- ERRORS SUMMARY -->
@@ -4088,7 +4167,23 @@ ${overallColor}OVERALL STATUS: $overallStatus ($warningCount warning(s), $errorC
             @("System File Integrity (SFC)", $Results.SFC.Status),
             @("Disk Health", $Results.DiskHealth.Status),
             @("Windows Updates", $(if ($Results.WindowsUpdates.PendingCount) { "$($Results.WindowsUpdates.Status) - $($Results.WindowsUpdates.PendingCount) pending" } else { $Results.WindowsUpdates.Status })),
-            @("iDrive Backup", $Results.iDriveBackup.Status),
+            @("iDrive Backup", $(
+                $iDriveSummary = $Results.iDriveBackup.Status
+                if ($Results.iDriveBackup.LastBackupDate) {
+                    try {
+                        $bkDate = [DateTime]::Parse($Results.iDriveBackup.LastBackupDate)
+                        $day = $bkDate.Day
+                        $suffix = switch ($day) {
+                            {$_ -in 1,21,31} { "st" }
+                            {$_ -in 2,22}    { "nd" }
+                            {$_ -in 3,23}    { "rd" }
+                            default           { "th" }
+                        }
+                        $iDriveSummary += " (Last backup: ${day}${suffix} $($bkDate.ToString('MMMM, yyyy')))"
+                    } catch {}
+                }
+                $iDriveSummary
+            )),
             @("Malwarebytes", $Results.Malwarebytes.Status),
             @("Windows Defender", $Results.Defender.Status),
             @("Event Log Errors (24h)", $Results.EventLogErrors.Status),
