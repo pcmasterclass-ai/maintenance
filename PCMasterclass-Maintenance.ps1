@@ -68,7 +68,7 @@ param(
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-$ScriptVersion = "2.9.2"
+$ScriptVersion = "2.9.3"
 
 # GitHub raw URL for the latest version of this script
 # To use: create a private GitHub repo, push the script, and set this URL
@@ -1690,11 +1690,14 @@ try {
         $rebootReasons += "Component servicing requires reboot"
     }
 
-    # Check pending file rename operations
+    # Check pending file rename operations (informational only - this flag is
+    # extremely noisy and gets set by routine activity like AV updates, software
+    # installers, and even the maintenance script itself. It does not indicate a
+    # genuine need to reboot the way Windows Update or CBS flags do.)
+    $pfroPresent = $false
     $pfro = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name "PendingFileRenameOperations" -ErrorAction SilentlyContinue
     if ($pfro.PendingFileRenameOperations) {
-        $rebootRequired = $true
-        $rebootReasons += "Pending file rename operations"
+        $pfroPresent = $true
     }
 
     # Check if computer name change is pending
@@ -1717,16 +1720,6 @@ try {
     # Include uptime context
     $uptimeDays = $Results.SystemInfo.UptimeDays
 
-    # Context-aware status: if the machine was recently rebooted (under 1 day)
-    # and the ONLY pending reason is file rename operations, this almost certainly
-    # means the current maintenance run (AdwCleaner, SFC, temp cleanup, etc.)
-    # queued the renames AFTER the boot. Treat as informational, not a warning.
-    $pfroOnly = ($rebootReasons.Count -eq 1 -and $rebootReasons[0] -eq "Pending file rename operations")
-    if ($rebootRequired -and $pfroOnly -and $uptimeDays -lt 1) {
-        $rebootRequired = $false
-        $rebootReasons = @("Pending file rename operations (queued during this session - reboot recommended to finalise)")
-    }
-
     $rebootStatus = if ($rebootRequired) { "WARNING - Reboot pending" } else { "PASS" }
     $reasonText = if ($rebootReasons.Count -gt 0) { $rebootReasons -join "; " } else { "None" }
 
@@ -1744,9 +1737,10 @@ try {
         Reasons        = $reasonText
         UptimeDays     = $uptimeDays
         UptimeWarning  = $uptimeWarning
+        PFROPresent    = $pfroPresent
     }
 
-    Write-Log "Reboot: $rebootStatus | Reasons: $reasonText | Uptime: $uptimeDays days"
+    Write-Log "Reboot: $rebootStatus | Reasons: $reasonText | PFRO: $pfroPresent | Uptime: $uptimeDays days"
 
 } catch {
     Write-Log "Pending reboot check failed: $_" "ERROR"
@@ -3476,7 +3470,7 @@ $errorCount = 0
 $checkModules = @($Results.SFC, $Results.DiskHealth, $Results.WindowsUpdates, $Results.iDriveBackup, $Results.Malwarebytes, $Results.Defender, $Results.EventLogErrors, $Results.PendingReboot, $Results.Firewall, $Results.UserAccounts, $Results.DISM, $Results.TempFiles, $Results.StartupPrograms, $Results.ScheduledTasks, $Results.BrowserExtensions, $Results.ServiceStatus, $Results.NetworkConfig, $Results.AdwCleaner, $Results.RestorePoints, $Results.TelemetryServices)
 foreach ($module in $checkModules) {
     if ($module.Status -match "ERROR|FAIL") { $errorCount++; $overallStatus = "FAIL" }
-    elseif ($module.Status -match "WARNING") { $warningCount++; if ($overallStatus -ne "FAIL") { $overallStatus = "WARNING" } }
+    elseif ($module.Status -match "WARNING") { $warningCount++ }
 }
 
 # Status colour helper
@@ -3932,10 +3926,9 @@ if ($Results.PendingReboot.RebootRequired) {
     $html += "<tr><td><strong>Uptime</strong></td><td>$($Results.PendingReboot.UptimeDays) days</td></tr></table>"
 } elseif ($Results.PendingReboot.UptimeWarning) {
     $html += "<p class='warning-text'>No reboot in $($Results.PendingReboot.UptimeDays) days. Consider scheduling a restart.</p>"
-} elseif ($Results.PendingReboot.Reasons -match "queued during this session") {
-    $html += "<p>No reboot pending. A file rename operation was queued during this maintenance run and will complete on next restart. Uptime: $($Results.PendingReboot.UptimeDays) days.</p>"
 } else {
-    $html += "<p>No reboot pending. Uptime: $($Results.PendingReboot.UptimeDays) days.</p>"
+    $pfroNote = if ($Results.PendingReboot.PFROPresent) { " Pending file rename operations detected (routine - will clear on next restart)." } else { "" }
+    $html += "<p>No reboot pending. Uptime: $($Results.PendingReboot.UptimeDays) days.$pfroNote</p>"
 }
 
 $html += @"
@@ -4421,7 +4414,13 @@ if ($EmailTo) {
         }
 
         $scriptDuration = [math]::Round(((Get-Date) - $scriptStartTime).TotalMinutes, 1)
-        $clientDisplay = if ($ClientName) { $ClientName } else { $ComputerName }
+        # Format client name as "Surname, Firstname" for the email subject line
+        if ($ClientName) {
+            $nameParts = $ClientName -split '\s+', 2
+            $clientDisplay = if ($nameParts.Count -ge 2) { "$($nameParts[0].ToUpper()), $($nameParts[1])" } else { $ClientName }
+        } else {
+            $clientDisplay = $ComputerName
+        }
         $emailSubject = "$clientDisplay - $overallStatus - Maintenance Report - $ComputerName - $(Get-Date -Format 'dd MMM yyyy') - ${scriptDuration}m - v$ScriptVersion"
 
         $emailBody = "[T]PC MASTERCLASS - SCHEDULED MAINTENANCE REPORT[/T]`n"

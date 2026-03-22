@@ -21,6 +21,10 @@
       powershell -ExecutionPolicy Bypass -File "C:\Teamviewer\Setup-EmailCreds-PCMasterclass.ps1"
 #>
 
+param(
+    [string]$ClientName = ""
+)
+
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
@@ -203,10 +207,16 @@ try {
     )
 
     $computerName = $env:COMPUTERNAME
+    if ($ClientName) {
+        $nameParts = $ClientName -split '\s+', 2
+        $clientDisplay = if ($nameParts.Count -ge 2) { "$($nameParts[0].ToUpper()), $($nameParts[1])" } else { $ClientName }
+    } else {
+        $clientDisplay = $computerName
+    }
     Send-MailMessage `
         -From $smtpUser `
         -To $DefaultEmailTo `
-        -Subject "PC Masterclass - Credential Setup Test - $computerName" `
+        -Subject "$clientDisplay - Email credential test of $computerName" `
         -Body "Email credential setup successful for $computerName at $(Get-Date). This machine is ready to send maintenance reports." `
         -SmtpServer "smtp.gmail.com" `
         -Port 587 `
@@ -276,7 +286,7 @@ try {
                 Send-MailMessage `
                     -From $smtpUser `
                     -To $DefaultEmailTo `
-                    -Subject "PC Masterclass - Credential Setup Test - $computerName" `
+                    -Subject "$clientDisplay - Email credential test of $computerName" `
                     -Body "Email credential setup successful for $computerName at $(Get-Date). This machine is ready to send maintenance reports." `
                     -SmtpServer "smtp.gmail.com" `
                     -Port 587 `
