@@ -68,7 +68,7 @@ param(
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-$ScriptVersion = "2.9.0"
+$ScriptVersion = "2.9.1"
 
 # GitHub raw URL for the latest version of this script
 # To use: create a private GitHub repo, push the script, and set this URL
@@ -1713,11 +1713,22 @@ try {
         }
     } catch { }
 
+    # Include uptime context
+    $uptimeDays = $Results.SystemInfo.UptimeDays
+
+    # Context-aware status: if the machine was recently rebooted (under 1 day)
+    # and the ONLY pending reason is file rename operations, this almost certainly
+    # means the current maintenance run (AdwCleaner, SFC, temp cleanup, etc.)
+    # queued the renames AFTER the boot. Treat as informational, not a warning.
+    $pfroOnly = ($rebootReasons.Count -eq 1 -and $rebootReasons[0] -eq "Pending file rename operations")
+    if ($rebootRequired -and $pfroOnly -and $uptimeDays -lt 1) {
+        $rebootRequired = $false
+        $rebootReasons = @("Pending file rename operations (queued during this session - reboot recommended to finalise)")
+    }
+
     $rebootStatus = if ($rebootRequired) { "WARNING - Reboot pending" } else { "PASS" }
     $reasonText = if ($rebootReasons.Count -gt 0) { $rebootReasons -join "; " } else { "None" }
 
-    # Include uptime context
-    $uptimeDays = $Results.SystemInfo.UptimeDays
     $uptimeWarning = $false
     if ($uptimeDays -gt 30) {
         $uptimeWarning = $true
@@ -3920,6 +3931,8 @@ if ($Results.PendingReboot.RebootRequired) {
     $html += "<tr><td><strong>Uptime</strong></td><td>$($Results.PendingReboot.UptimeDays) days</td></tr></table>"
 } elseif ($Results.PendingReboot.UptimeWarning) {
     $html += "<p class='warning-text'>No reboot in $($Results.PendingReboot.UptimeDays) days. Consider scheduling a restart.</p>"
+} elseif ($Results.PendingReboot.Reasons -match "queued during this session") {
+    $html += "<p>No reboot pending. A file rename operation was queued during this maintenance run and will complete on next restart. Uptime: $($Results.PendingReboot.UptimeDays) days.</p>"
 } else {
     $html += "<p>No reboot pending. Uptime: $($Results.PendingReboot.UptimeDays) days.</p>"
 }
