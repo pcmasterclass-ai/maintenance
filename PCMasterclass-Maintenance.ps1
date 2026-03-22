@@ -68,7 +68,7 @@ param(
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-$ScriptVersion = "2.9.1"
+$ScriptVersion = "2.9.2"
 
 # GitHub raw URL for the latest version of this script
 # To use: create a private GitHub repo, push the script, and set this URL
@@ -383,6 +383,7 @@ $KnownSafePrograms = @(
     "KeyPreGenTask", "UserTask", "Calibration Loader",
     "AD RMS Rights Policy",
     "UpdateOrchestrator", "WindowsUpdate", "MusUx_Logon", "PLUGScheduler",
+    "ClipESUConsumerProcessECUpdate",
     # Common legitimate software updaters
     "GoogleUpdater", "DropboxUpdater", "Adobe", "Zoom",
     # Hardware drivers - include abbreviations used in startup item names
