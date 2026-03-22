@@ -68,7 +68,7 @@ param(
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-$ScriptVersion = "2.8.2"
+$ScriptVersion = "2.9.0"
 
 # GitHub raw URL for the latest version of this script
 # To use: create a private GitHub repo, push the script, and set this URL
@@ -382,10 +382,13 @@ $KnownSafePrograms = @(
     "DirectXDatabaseUpdater", "SystemSoundsService", "MsCtfMonitor",
     "KeyPreGenTask", "UserTask", "Calibration Loader",
     "AD RMS Rights Policy",
+    "UpdateOrchestrator", "WindowsUpdate", "MusUx_Logon", "PLUGScheduler",
     # Common legitimate software updaters
     "GoogleUpdater", "DropboxUpdater", "Adobe", "Zoom",
-    # Hardware drivers
-    "RealTek", "NVIDIA", "Intel", "Synaptics", "AMD",
+    # Hardware drivers - include abbreviations used in startup item names
+    "RealTek", "Rtk", "NVIDIA", "Intel", "Synaptics", "AMD",
+    # OEM vendor software
+    "Lenovo", "Dell", "HP", "Asus", "Acer", "Samsung", "Toshiba",
     # Common user apps
     "iTunes Helper", "Spotify", "Steam", "Discord",
     # Our tools
@@ -952,9 +955,18 @@ if (-not $SkipUpdates) {
             }
         }
 
+        # Separate critical/important updates from optional ones for status purposes
+        $criticalCount = ($updateList | Where-Object { $_.IsImportant }).Count
+        $optionalCount = $pendingCount - $criticalCount
+
         $Results.WindowsUpdates = @{
-            Status         = if ($pendingCount -eq 0) { "UP TO DATE" } elseif ($pendingCount -le 3) { "UPDATES AVAILABLE" } else { "WARNING" }
+            # Status is based on critical/important updates only - optional updates (drivers,
+            # previews, feature updates) should not trigger a warning when all important
+            # updates are installed
+            Status         = if ($criticalCount -eq 0) { "UP TO DATE" } elseif ($criticalCount -le 3) { "UPDATES AVAILABLE" } else { "WARNING" }
             PendingCount   = $pendingCount
+            CriticalCount  = $criticalCount
+            OptionalCount  = $optionalCount
             Updates        = $updateList
             InstallResult  = $installResult
         }
@@ -1030,6 +1042,10 @@ try {
                     if ($xmlContent) {
                         # Parse the XML
                         try {
+                            # Sanitise common invalid XML entities produced by iDrive
+                            # iDrive sometimes writes uppercase entities like &APOS; &AMP; &QUOT;
+                            # which are not valid XML (only lowercase &apos; &amp; &quot; &lt; &gt; are)
+                            $xmlContent = $xmlContent -replace '&APOS;', '&apos;' -replace '&AMP;', '&amp;' -replace '&QUOT;', '&quot;' -replace '&LT;', '&lt;' -replace '&GT;', '&gt;'
                             [xml]$logXml = $xmlContent
                             $record = $logXml.records.record
 
@@ -2136,7 +2152,20 @@ try {
         "MicrosoftEdgeUpdate\.exe",
         "PCMasterclass-Maintenance\.ps1",
         "Apple Software Update\\SoftwareUpdate\.exe",
-        "Lenovo\.Modern\.ImController\.exe"
+        "Lenovo\.Modern\.ImController\.exe",
+        "Lenovo\\PowerMgr",
+        "Lenovo\\Vantage"
+    )
+
+    # Trusted command path patterns: if the executable lives under one of these
+    # well-known locations, the task is almost certainly legitimate even without
+    # a publisher field. OEM vendor tools and Windows system tasks often omit
+    # the Author field entirely.
+    $trustedCommandPaths = @(
+        "\\Windows\\",                # Windows system directory
+        "\\Program Files\\",          # Standard install location (64-bit)
+        "\\Program Files (x86)\\",    # Standard install location (32-bit)
+        "\\ProgramData\\"             # Common for OEM vendor services
     )
 
     $allTasks = Get-ScheduledTask -ErrorAction Stop
@@ -2185,13 +2214,30 @@ try {
         # Flag suspicious tasks
         $reasons = @()
         $isTrusted = $false
+
+        # Check 1: Publisher matches a trusted vendor name
         foreach ($tp in $trustedPublishers) {
             if ($publisher -like "*$tp*") { $isTrusted = $true; break }
         }
-        # Check if the command matches a known-safe pattern
+        # Check 2: Command matches a known-safe executable pattern
         if (-not $isTrusted) {
             foreach ($safePattern in $knownSafeCommands) {
                 if ($command -match $safePattern) { $isTrusted = $true; break }
+            }
+        }
+        # Check 3: Command path contains a trusted vendor name (covers OEM tools
+        # like Lenovo PowerMgr that set no Author field but run from vendor dirs)
+        if (-not $isTrusted) {
+            foreach ($tp in $trustedPublishers) {
+                if ($command -match [regex]::Escape($tp)) { $isTrusted = $true; break }
+            }
+        }
+        # Check 4: Executable lives in a standard trusted install location
+        # (Program Files, Windows directory, ProgramData). Tasks running from
+        # these locations are almost always legitimate software, not malware.
+        if (-not $isTrusted) {
+            foreach ($tp in $trustedCommandPaths) {
+                if ($command -match [regex]::Escape($tp)) { $isTrusted = $true; break }
             }
         }
         if (-not $isTrusted -and $publisher -eq "Unknown") {
@@ -2299,8 +2345,10 @@ try {
     # Chrome and Edge share the same Web Store IDs. Firefox uses its own addon IDs.
     # All formats are stored in one list since IDs never collide across browsers.
     $TrustedExtensionIDs = @(
-        "cjpalhdlnbpafiamejdnhcphjbkeiagm"   # uBlock Origin (Chrome/Edge)
-        "ddkjiahejlhfcafbddmgiahcphecmpfh"   # uBlock Origin Lite (Chrome/Edge)
+        "cjpalhdlnbpafiamejdnhcphjbkeiagm"   # uBlock Origin (Chrome Web Store)
+        "odfafepnkmbhccpbejgmiehpchacaeak"   # uBlock Origin (Edge Add-ons Store)
+        "ddkjiahejlhfcafbddmgiahcphecmpfh"   # uBlock Origin Lite (Chrome Web Store)
+        "cimighlppcgcoapaliogpjjdehbnofhn"   # uBlock Origin Lite (Edge Add-ons Store)
         "uBlock0@raymondhill.net"              # uBlock Origin (Firefox)
         "uBOLite@raymondhill.net"              # uBlock Origin Lite (Firefox)
         "efaidnbmnnnibpcajpcglclefindmkaj"    # Adobe Acrobat (Chrome/Edge)
@@ -2542,6 +2590,29 @@ try {
 
     # Services that are OK to be stopped/disabled
     $acceptablyStopped = @("TermService", "RemoteRegistry", "Fax", "TapiSrv")
+
+    # Context-aware exceptions: some services are expected to be stopped depending
+    # on the system configuration
+    # WinDefend: expected to be stopped/disabled when a third-party AV (e.g. Malwarebytes) is active
+    if ($Results.Malwarebytes.Installed -or $Results.Malwarebytes.ServiceRunning) {
+        $acceptablyStopped += "WinDefend"
+    }
+    # Spooler: expected to be stopped on machines with no physical printers
+    $hasPhysicalPrinter = $false
+    try {
+        $virtualPrinterCheck = @("Microsoft Print to PDF", "Microsoft XPS", "Fax", "OneNote", "Send to",
+            "Adobe PDF", "Bullzip", "CutePDF", "PDFCreator", "doPDF", "Foxit.*PDF", "PDF24", "Nitro PDF")
+        $virtualPattern = ($virtualPrinterCheck | ForEach-Object { "($_)" }) -join "|"
+        $printers = Get-CimInstance Win32_Printer -ErrorAction SilentlyContinue
+        foreach ($p in $printers) {
+            if ($p.Name -notmatch $virtualPattern -and $p.PortName -notmatch "^(FILE:|PORTPROMPT:|nul:)") {
+                $hasPhysicalPrinter = $true; break
+            }
+        }
+    } catch {}
+    if (-not $hasPhysicalPrinter) {
+        $acceptablyStopped += "Spooler"
+    }
 
     $serviceResults = @()
     $stoppedUnexpected = @()
@@ -2792,15 +2863,10 @@ try {
             $portName = $printer.PortName
             if ($portName -match "^(FILE:|PORTPROMPT:|NUL:|nul:)") { continue }
 
-            # Accept printers with physical/network ports or flagged as network printers
-            # Known physical ports: USB, LPT, WSD, TCP/IP, DOT4, IP addresses, Ne ports
-            # Also accept anything the OS flags as a network printer, or HP/vendor-specific ports
-            $isPhysical = $portName -match "(USB|LPT|WSD|IP_|TCPMON|DOT4|Ne\d)" -or
-                          $printer.Network -or
-                          $portName -match '^\d+\.\d+\.\d+\.\d+' -or
-                          $portName -match '(HP|Canon|Epson|Brother|Samsung|Xerox|Ricoh|Lexmark|Kyocera)'
-
-            if (-not $isPhysical) { continue }
+            # If a printer survived the virtual name filter and the virtual port filter
+            # above, it is almost certainly a physical printer. No need for an additional
+            # allowlist check on port names - HP Smart and other vendor apps use non-standard
+            # port names that an allowlist would miss (e.g. "HPF761BE" for HP Wi-Fi printers).
 
             $statusText = switch ($printer.PrinterStatus) {
                 1 { "Other" }
@@ -2814,13 +2880,37 @@ try {
             }
 
             # Determine connection type
-            $connType = if ($printer.Network) { "Network" }
-                        elseif ($portName -match "USB") { "USB" }
+            $connType = if ($portName -match "USB|DOT4") { "USB" }
                         elseif ($portName -match "LPT") { "Parallel" }
-                        elseif ($portName -match "WSD") { "WSD (Wi-Fi/Network)" }
-                        elseif ($portName -match '^\d+\.\d+\.\d+\.\d+|TCPMON|IP_|Ne\d') { "Network (TCP/IP)" }
-                        elseif ($portName -match 'HP|Canon|Epson|Brother') { "Network (Vendor)" }
-                        else { "Local" }
+                        elseif ($portName -match "WSD") { "Wi-Fi/Network (WSD)" }
+                        elseif ($portName -match '^\d+\.\d+\.\d+\.\d+|TCPMON|IP_') { "Network (TCP/IP)" }
+                        elseif ($portName -match 'Ne\d') { "Network (JetDirect)" }
+                        elseif ($printer.Network) { "Network" }
+                        else { "Wi-Fi/Network" }
+
+            # Try to resolve the printer's IP address for network/Wi-Fi printers
+            $printerIP = ""
+            if ($connType -ne "USB" -and $connType -ne "Parallel") {
+                try {
+                    # Method 1: Port name is already an IP address
+                    if ($portName -match '^(\d+\.\d+\.\d+\.\d+)') {
+                        $printerIP = $Matches[1]
+                    }
+                    # Method 2: Look up the port in Win32_TCPIPPrinterPort
+                    if (-not $printerIP) {
+                        $tcpPort = Get-CimInstance Win32_TCPIPPrinterPort -Filter "Name='$portName'" -ErrorAction SilentlyContinue
+                        if ($tcpPort -and $tcpPort.HostAddress) {
+                            $printerIP = $tcpPort.HostAddress
+                        }
+                    }
+                    # Method 3: Try DNS resolution on the port name (covers HP Smart
+                    # and other vendor apps that use the printer hostname as port name)
+                    if (-not $printerIP -and $portName -notmatch "^(WSD|FILE|PORTPROMPT|NUL)") {
+                        $dnsResult = [System.Net.Dns]::GetHostAddresses($portName) | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1
+                        if ($dnsResult) { $printerIP = $dnsResult.ToString() }
+                    }
+                } catch {}
+            }
 
             $isDefault = $printer.Default
 
@@ -2829,6 +2919,7 @@ try {
                 Port       = $portName
                 Status     = $statusText
                 Connection = $connType
+                IPAddress  = $printerIP
                 Default    = $isDefault
                 Shared     = $printer.Shared
                 Driver     = $printer.DriverName
@@ -3389,6 +3480,16 @@ function Get-StatusBadge {
     return "<span style='background:$colour;color:white;padding:3px 10px;border-radius:4px;font-weight:bold;font-size:0.85em;'>$Status</span>"
 }
 
+function Get-HeadingClass {
+    param([string]$Status)
+    switch -Regex ($Status) {
+        "PASS|CLEAN|UP TO DATE|REPAIRED" { return "heading-ok" }
+        "WARNING|UPDATES AVAILABLE|CHECK REQUIRED" { return "heading-warn" }
+        "FAIL|ERROR" { return "heading-error" }
+        default { return "heading-info" }
+    }
+}
+
 $overallBadge = Get-StatusBadge $overallStatus
 
 # Build the HTML
@@ -3420,6 +3521,20 @@ $html = @"
         .error-text { color: #dc2626; font-weight: 600; }
         .footer { text-align: center; color: #94a3b8; font-size: 0.8em; padding: 15px; }
         pre { background: #f8fafc; padding: 12px; border-radius: 6px; font-size: 0.8em; overflow-x: auto; max-height: 200px; overflow-y: auto; }
+        html { scroll-behavior: smooth; }
+        .section:target { outline: 2px solid #3b82f6; outline-offset: -2px; border-radius: 4px; }
+        /* Collapsible section styling */
+        .section details { width: 100%; }
+        .section details summary { cursor: pointer; list-style: none; display: flex; align-items: center; gap: 10px; font-size: 1.1em; color: #334155; font-weight: bold; padding: 2px 0; }
+        .section details summary::-webkit-details-marker { display: none; }
+        .section details summary::before { content: '\25B6'; font-size: 0.7em; transition: transform 0.2s ease; display: inline-block; min-width: 14px; }
+        .section details[open] summary::before { transform: rotate(90deg); }
+        .section details .section-body { padding-top: 10px; }
+        .section details summary .icon { font-size: 1.3em; }
+        .heading-ok { color: #16a34a; }
+        .heading-warn { color: #d97706; }
+        .heading-error { color: #dc2626; }
+        .heading-info { color: #334155; }
     </style>
 </head>
 <body>
@@ -3429,6 +3544,52 @@ $html = @"
     <h1>PC Masterclass  - Maintenance Report</h1>
     <div class="subtitle">$(if ($ClientName) { "$ClientName &bull; " })$ComputerName &bull; $($Results.OSVersion) &bull; $(Get-Date -Format 'dddd, d MMMM yyyy h:mm tt')</div>
     <div class="overall">Overall Status: $overallBadge &nbsp; ($warningCount warning(s), $errorCount error(s))</div>
+</div>
+
+<!-- CHECK RESULTS SUMMARY -->
+<div class="section" style="padding:15px 25px;">
+    <h2 style="margin-bottom:8px;"><span class="icon">&#x1F4CB;</span> Check Results Summary</h2>
+    <table style="font-size:0.88em;">
+"@
+
+# Build the clickable summary table
+$summaryItems = @(
+    @("sfc",          "System File Integrity (SFC)", $Results.SFC.Status),
+    @("disk",         "Disk Health",                 $Results.DiskHealth.Status),
+    @("updates",      "Windows Updates",             $Results.WindowsUpdates.Status),
+    @("idrive",       "iDrive Backup",               $Results.iDriveBackup.Status),
+    @("malwarebytes", "Malwarebytes",                $Results.Malwarebytes.Status),
+    @("defender",     "Windows Defender",             $Results.Defender.Status),
+    @("eventlog",     "Event Log Errors",             $Results.EventLogErrors.Status),
+    @("reboot",       "Pending Reboot",               $Results.PendingReboot.Status),
+    @("firewall",     "Windows Firewall",             $Results.Firewall.Status),
+    @("users",        "User Accounts",                $Results.UserAccounts.Status),
+    @("dism",         "DISM Component Store",          $Results.DISM.Status),
+    @("temp",         "Temp/Cache Files",              $Results.TempFiles.Status),
+    @("startup",      "Startup Programs",              $Results.StartupPrograms.Status),
+    @("schtasks",     "Scheduled Tasks",               $Results.ScheduledTasks.Status),
+    @("extensions",   "Browser Extensions",            $Results.BrowserExtensions.Status),
+    @("services",     "Service Status",                $Results.ServiceStatus.Status),
+    @("network",      "Network Config",                $Results.NetworkConfig.Status),
+    @("adwcleaner",   "AdwCleaner",                    $Results.AdwCleaner.Status),
+    @("restorepoints","Restore Points",                $Results.RestorePoints.Status),
+    @("telemetry",    "Telemetry Services",             $Results.TelemetryServices.Status)
+)
+
+$col = 0
+foreach ($item in $summaryItems) {
+    $anchor = $item[0]
+    $label = $item[1]
+    $status = $item[2]
+    if ($col % 2 -eq 0) { $html += "<tr>" }
+    $html += "<td style='padding:4px 10px;width:50%;'><a href='#$anchor' style='text-decoration:none;color:#1e40af;'>$label</a></td><td style='padding:4px 6px;'>$(Get-StatusBadge $status)</td>"
+    if ($col % 2 -eq 1) { $html += "</tr>" }
+    $col++
+}
+if ($col % 2 -eq 1) { $html += "<td></td><td></td></tr>" }
+
+$html += @"
+    </table>
 </div>
 
 <!-- SYSTEM INFO -->
@@ -3494,9 +3655,14 @@ $html += @"
 </div>
 
 <!-- SFC -->
-<div class="section">
-    <h2><span class="icon">&#x1F6E1;</span> System File Integrity (SFC) $(Get-StatusBadge $Results.SFC.Status)</h2>
+<div class="section" id="sfc">
 "@
+
+$sfcOpen = if ($Results.SFC.Status -match "PASS|CLEAN|UP TO DATE|REPAIRED") { "" } else { " open" }
+$sfcHeadClass = Get-HeadingClass $Results.SFC.Status
+
+$html += "<details$sfcOpen><summary class='$sfcHeadClass'><span class='icon'>&#x1F6E1;</span> System File Integrity (SFC) $(Get-StatusBadge $Results.SFC.Status)</summary>"
+$html += "<div class='section-body'>"
 
 if ($Results.SFC.Status -eq "SKIPPED") {
     $html += "<p class='detail'>Skipped by configuration.</p>"
@@ -3509,12 +3675,18 @@ if ($Results.SFC.Status -eq "SKIPPED") {
 }
 
 $html += @"
+</div></details>
 </div>
 
 <!-- DISK HEALTH -->
-<div class="section">
-    <h2><span class="icon">&#x1F4BE;</span> Disk Health $(Get-StatusBadge $Results.DiskHealth.Status)</h2>
+<div class="section" id="disk">
 "@
+
+$diskOpen = if ($Results.DiskHealth.Status -match "PASS|CLEAN|UP TO DATE|REPAIRED") { "" } else { " open" }
+$diskHeadClass = Get-HeadingClass $Results.DiskHealth.Status
+
+$html += "<details$diskOpen><summary class='$diskHeadClass'><span class='icon'>&#x1F4BE;</span> Disk Health $(Get-StatusBadge $Results.DiskHealth.Status)</summary>"
+$html += "<div class='section-body'>"
 
 if ($Results.DiskHealth.EventLogWarning) {
     $html += "<div style='background:#fef2f2;border:1px solid #fca5a5;border-radius:6px;padding:12px;margin-bottom:12px;'>"
@@ -3552,19 +3724,27 @@ if ($Results.DiskHealth.Volumes) {
 }
 
 $html += @"
+</div></details>
 </div>
 
 <!-- WINDOWS UPDATES -->
-<div class="section">
-    <h2><span class="icon">&#x1F504;</span> Windows Updates $(Get-StatusBadge $Results.WindowsUpdates.Status)</h2>
+<div class="section" id="updates">
 "@
+
+$updatesOpen = if ($Results.WindowsUpdates.Status -match "PASS|CLEAN|UP TO DATE|REPAIRED") { "" } else { " open" }
+$updatesHeadClass = Get-HeadingClass $Results.WindowsUpdates.Status
+
+$html += "<details$updatesOpen><summary class='$updatesHeadClass'><span class='icon'>&#x1F504;</span> Windows Updates $(Get-StatusBadge $Results.WindowsUpdates.Status)</summary>"
+$html += "<div class='section-body'>"
 
 if ($Results.WindowsUpdates.Status -eq "SKIPPED") {
     $html += "<p class='detail'>Skipped by configuration.</p>"
 } elseif ($Results.WindowsUpdates.PendingCount -eq 0) {
     $html += "<p>No pending updates. System is up to date.</p>"
 } else {
-    $html += "<p>$($Results.WindowsUpdates.PendingCount) update(s) pending. Install result: $($Results.WindowsUpdates.InstallResult)</p>"
+    $critMsg = if ($Results.WindowsUpdates.CriticalCount -gt 0) { "$($Results.WindowsUpdates.CriticalCount) critical/important" } else { "no critical" }
+    $optMsg = if ($Results.WindowsUpdates.OptionalCount -gt 0) { ", $($Results.WindowsUpdates.OptionalCount) optional" } else { "" }
+    $html += "<p>$($Results.WindowsUpdates.PendingCount) update(s) available ($critMsg$optMsg). Install result: $($Results.WindowsUpdates.InstallResult)</p>"
     $html += "<table><tr><th>Update</th><th>KB</th><th>Size</th><th>Critical?</th></tr>"
     foreach ($upd in $Results.WindowsUpdates.Updates) {
         $critBadge = if ($upd.IsImportant) { "<span class='warning-text'>Yes</span>" } else { "No" }
@@ -3574,12 +3754,19 @@ if ($Results.WindowsUpdates.Status -eq "SKIPPED") {
 }
 
 $html += @"
+</div></details>
 </div>
 
 <!-- iDRIVE BACKUP -->
-<div class="section">
-    <h2><span class="icon">&#x2601;</span> iDrive Backup $(Get-StatusBadge $Results.iDriveBackup.Status)</h2>
+<div class="section" id="idrive">
 "@
+
+# Determine if iDrive section should be open (expand warnings/errors, collapse passing)
+$idriveOpen = if ($Results.iDriveBackup.Status -match "PASS|CLEAN|UP TO DATE") { "" } else { " open" }
+$idriveHeadClass = Get-HeadingClass $Results.iDriveBackup.Status
+
+$html += "<details$idriveOpen><summary class='$idriveHeadClass'><span class='icon'>&#x2601;</span> iDrive Backup $(Get-StatusBadge $Results.iDriveBackup.Status)</summary>"
+$html += "<div class='section-body'>"
 
 if (-not $Results.iDriveBackup.Installed) {
     $html += "<p class='detail'>iDrive client not found on this system.</p>"
@@ -3600,12 +3787,18 @@ if (-not $Results.iDriveBackup.Installed) {
 }
 
 $html += @"
+</div></details>
 </div>
 
 <!-- MALWAREBYTES -->
-<div class="section">
-    <h2><span class="icon">&#x1F6E1;</span> Malwarebytes Endpoint Protection $(Get-StatusBadge $Results.Malwarebytes.Status)</h2>
+<div class="section" id="malwarebytes">
 "@
+
+$malwareOpen = if ($Results.Malwarebytes.Status -match "PASS|CLEAN|UP TO DATE|REPAIRED") { "" } else { " open" }
+$malwareHeadClass = Get-HeadingClass $Results.Malwarebytes.Status
+
+$html += "<details$malwareOpen><summary class='$malwareHeadClass'><span class='icon'>&#x1F6E1;</span> Malwarebytes Endpoint Protection $(Get-StatusBadge $Results.Malwarebytes.Status)</summary>"
+$html += "<div class='section-body'>"
 
 if (-not $Results.Malwarebytes.Installed) {
     $html += "<p class='detail'>Malwarebytes not found on this system.</p>"
@@ -3622,12 +3815,18 @@ if (-not $Results.Malwarebytes.Installed) {
 }
 
 $html += @"
+</div></details>
 </div>
 
 <!-- WINDOWS DEFENDER -->
-<div class="section">
-    <h2><span class="icon">&#x1F6E1;</span> Windows Defender / Antivirus $(Get-StatusBadge $Results.Defender.Status)</h2>
+<div class="section" id="defender">
 "@
+
+$defenderOpen = if ($Results.Defender.Status -match "PASS|CLEAN|UP TO DATE|REPAIRED") { "" } else { " open" }
+$defenderHeadClass = Get-HeadingClass $Results.Defender.Status
+
+$html += "<details$defenderOpen><summary class='$defenderHeadClass'><span class='icon'>&#x1F6E1;</span> Windows Defender / Antivirus $(Get-StatusBadge $Results.Defender.Status)</summary>"
+$html += "<div class='section-body'>"
 
 if ($Results.Defender.ThirdPartyAV) {
     $html += @"
@@ -3661,12 +3860,18 @@ if ($Results.Defender.ThirdPartyAV) {
 }
 
 $html += @"
+</div></details>
 </div>
 
 <!-- EVENT LOG ERRORS -->
-<div class="section">
-    <h2><span class="icon">&#x1F4CB;</span> Event Log Errors (Last $($Results.EventLogErrors.HoursChecked)h) $(Get-StatusBadge $Results.EventLogErrors.Status)</h2>
+<div class="section" id="eventlog">
 "@
+
+$eventlogOpen = if ($Results.EventLogErrors.Status -match "PASS|CLEAN|UP TO DATE|REPAIRED") { "" } else { " open" }
+$eventlogHeadClass = Get-HeadingClass $Results.EventLogErrors.Status
+
+$html += "<details$eventlogOpen><summary class='$eventlogHeadClass'><span class='icon'>&#x1F4CB;</span> Event Log Errors (Last $($Results.EventLogErrors.HoursChecked)h) $(Get-StatusBadge $Results.EventLogErrors.Status)</summary>"
+$html += "<div class='section-body'>"
 
 if ($Results.EventLogErrors.TotalEvents -eq 0) {
     $html += "<p>No critical or error events in the last $($Results.EventLogErrors.HoursChecked) hours. All clear.</p>"
@@ -3696,12 +3901,18 @@ if ($Results.EventLogErrors.TotalEvents -eq 0) {
 }
 
 $html += @"
+</div></details>
 </div>
 
 <!-- PENDING REBOOT -->
-<div class="section">
-    <h2><span class="icon">&#x1F504;</span> Pending Reboot $(Get-StatusBadge $Results.PendingReboot.Status)</h2>
+<div class="section" id="reboot">
 "@
+
+$rebootOpen = if ($Results.PendingReboot.Status -match "PASS|CLEAN|UP TO DATE|REPAIRED") { "" } else { " open" }
+$rebootHeadClass = Get-HeadingClass $Results.PendingReboot.Status
+
+$html += "<details$rebootOpen><summary class='$rebootHeadClass'><span class='icon'>&#x1F504;</span> Pending Reboot $(Get-StatusBadge $Results.PendingReboot.Status)</summary>"
+$html += "<div class='section-body'>"
 
 if ($Results.PendingReboot.RebootRequired) {
     $html += "<p class='warning-text'>Reboot is pending.</p>"
@@ -3714,12 +3925,18 @@ if ($Results.PendingReboot.RebootRequired) {
 }
 
 $html += @"
+</div></details>
 </div>
 
 <!-- WINDOWS FIREWALL -->
-<div class="section">
-    <h2><span class="icon">&#x1F6E1;</span> Windows Firewall $(Get-StatusBadge $Results.Firewall.Status)</h2>
+<div class="section" id="firewall">
 "@
+
+$firewallOpen = if ($Results.Firewall.Status -match "PASS|CLEAN|UP TO DATE|REPAIRED") { "" } else { " open" }
+$firewallHeadClass = Get-HeadingClass $Results.Firewall.Status
+
+$html += "<details$firewallOpen><summary class='$firewallHeadClass'><span class='icon'>&#x1F6E1;</span> Windows Firewall $(Get-StatusBadge $Results.Firewall.Status)</summary>"
+$html += "<div class='section-body'>"
 
 if ($Results.Firewall.Profiles) {
     $html += "<table><tr><th>Profile</th><th>Enabled</th><th>Inbound Default</th><th>Outbound Default</th></tr>"
@@ -3733,13 +3950,19 @@ if ($Results.Firewall.Profiles) {
 }
 
 $html += @"
+</div></details>
 </div>
 
 <!-- USER ACCOUNTS -->
-<div class="section">
-    <h2><span class="icon">&#x1F464;</span> User Accounts $(Get-StatusBadge $Results.UserAccounts.Status)</h2>
-    <p>$($Results.UserAccounts.EnabledCount) enabled account(s), $($Results.UserAccounts.AdminCount) with admin rights.</p>
+<div class="section" id="users">
 "@
+
+$usersOpen = if ($Results.UserAccounts.Status -match "PASS|CLEAN|UP TO DATE|REPAIRED") { "" } else { " open" }
+$usersHeadClass = Get-HeadingClass $Results.UserAccounts.Status
+
+$html += "<details$usersOpen><summary class='$usersHeadClass'><span class='icon'>&#x1F464;</span> User Accounts $(Get-StatusBadge $Results.UserAccounts.Status)</summary>"
+$html += "<div class='section-body'>"
+$html += "<p>$($Results.UserAccounts.EnabledCount) enabled account(s), $($Results.UserAccounts.AdminCount) with admin rights.</p>"
 
 if ($Results.UserAccounts.FlaggedCount -gt 0) {
     $html += "<h3 style='color:#dc2626;margin:10px 0 5px;font-size:0.95em;'>Flagged Accounts ($($Results.UserAccounts.FlaggedCount))</h3>"
@@ -3760,19 +3983,33 @@ if ($Results.UserAccounts.AdminAccounts) {
 }
 
 $html += @"
+</div></details>
 </div>
 
 <!-- DISM HEALTH -->
-<div class="section">
-    <h2><span class="icon">&#x1F527;</span> DISM Component Store $(Get-StatusBadge $Results.DISM.Status)</h2>
-    <p>$($Results.DISM.Result)</p>
+<div class="section" id="dism">
+"@
+
+$dismOpen = if ($Results.DISM.Status -match "PASS|CLEAN|UP TO DATE|REPAIRED") { "" } else { " open" }
+$dismHeadClass = Get-HeadingClass $Results.DISM.Status
+
+$html += "<details$dismOpen><summary class='$dismHeadClass'><span class='icon'>&#x1F527;</span> DISM Component Store $(Get-StatusBadge $Results.DISM.Status)</summary>"
+$html += "<div class='section-body'>"
+$html += "<p>$($Results.DISM.Result)</p>"
+$html += @"
+</div></details>
 </div>
 
 <!-- TEMP FILES -->
-<div class="section">
-    <h2><span class="icon">&#x1F5D1;</span> Temp and Cache Files $(Get-StatusBadge $Results.TempFiles.Status)</h2>
-    <p>Total: $($Results.TempFiles.TotalSizeGB) GB across $($Results.TempFiles.Locations.Count) location(s).</p>
+<div class="section" id="temp">
 "@
+
+$tempOpen = if ($Results.TempFiles.Status -match "PASS|CLEAN|UP TO DATE|REPAIRED") { "" } else { " open" }
+$tempHeadClass = Get-HeadingClass $Results.TempFiles.Status
+
+$html += "<details$tempOpen><summary class='$tempHeadClass'><span class='icon'>&#x1F5D1;</span> Temp and Cache Files $(Get-StatusBadge $Results.TempFiles.Status)</summary>"
+$html += "<div class='section-body'>"
+$html += "<p>Total: $($Results.TempFiles.TotalSizeGB) GB across $($Results.TempFiles.Locations.Count) location(s).</p>"
 
 if ($Results.TempFiles.Locations -and $Results.TempFiles.Locations.Count -gt 0) {
     $html += "<table><tr><th>Location</th><th>Size (MB)</th><th>Files</th></tr>"
@@ -3785,13 +4022,19 @@ if ($Results.TempFiles.Locations -and $Results.TempFiles.Locations.Count -gt 0) 
 }
 
 $html += @"
+</div></details>
 </div>
 
 <!-- STARTUP PROGRAMS -->
-<div class="section">
-    <h2><span class="icon">&#x1F680;</span> Startup Programs $(Get-StatusBadge $Results.StartupPrograms.Status)</h2>
-    <p>$($Results.StartupPrograms.TotalCount) startup items found. $($Results.StartupPrograms.FlaggedCount) flagged for review.</p>
+<div class="section" id="startup">
 "@
+
+$startupOpen = if ($Results.StartupPrograms.Status -match "PASS|CLEAN|UP TO DATE|REPAIRED") { "" } else { " open" }
+$startupHeadClass = Get-HeadingClass $Results.StartupPrograms.Status
+
+$html += "<details$startupOpen><summary class='$startupHeadClass'><span class='icon'>&#x1F680;</span> Startup Programs $(Get-StatusBadge $Results.StartupPrograms.Status)</summary>"
+$html += "<div class='section-body'>"
+$html += "<p>$($Results.StartupPrograms.TotalCount) startup items found. $($Results.StartupPrograms.FlaggedCount) flagged for review.</p>"
 
 if ($Results.StartupPrograms.FlaggedCount -gt 0) {
     $html += "<h3 style='color:#dc2626;margin:10px 0 5px;font-size:0.95em;'>WARNING: Flagged Items</h3>"
@@ -3812,13 +4055,19 @@ foreach ($item in $Results.StartupPrograms.AllItems) {
 $html += "</table></details>"
 
 $html += @"
+</div></details>
 </div>
 
 <!-- SCHEDULED TASKS AUDIT -->
-<div class="section">
-    <h2><span class="icon">&#x23F0;</span> Scheduled Tasks Audit $(Get-StatusBadge $Results.ScheduledTasks.Status)</h2>
-    <p>$($Results.ScheduledTasks.ThirdPartyCount) third-party task(s) found out of $($Results.ScheduledTasks.TotalTasks) total. $($Results.ScheduledTasks.FlaggedCount) flagged for review.</p>
+<div class="section" id="schtasks">
 "@
+
+$schtasksOpen = if ($Results.ScheduledTasks.Status -match "PASS|CLEAN|UP TO DATE|REPAIRED") { "" } else { " open" }
+$schtasksHeadClass = Get-HeadingClass $Results.ScheduledTasks.Status
+
+$html += "<details$schtasksOpen><summary class='$schtasksHeadClass'><span class='icon'>&#x23F0;</span> Scheduled Tasks Audit $(Get-StatusBadge $Results.ScheduledTasks.Status)</summary>"
+$html += "<div class='section-body'>"
+$html += "<p>$($Results.ScheduledTasks.ThirdPartyCount) third-party task(s) found out of $($Results.ScheduledTasks.TotalTasks) total. $($Results.ScheduledTasks.FlaggedCount) flagged for review.</p>"
 
 if ($Results.ScheduledTasks.FlaggedCount -gt 0) {
     $html += "<h3 style='color:#dc2626;margin:10px 0 5px;font-size:0.95em;'>Flagged Tasks ($($Results.ScheduledTasks.FlaggedCount))</h3>"
@@ -3840,13 +4089,19 @@ if ($Results.ScheduledTasks.ThirdPartyTasks -and $Results.ScheduledTasks.ThirdPa
 }
 
 $html += @"
+</div></details>
 </div>
 
 <!-- BROWSER EXTENSION AUDIT -->
-<div class="section">
-    <h2><span class="icon">&#x1F310;</span> Browser Extension Audit $(Get-StatusBadge $Results.BrowserExtensions.Status)</h2>
-    <p>Browsers found: $($Results.BrowserExtensions.BrowsersFound -join ', '). $($Results.BrowserExtensions.TotalExtensions) extension(s), $($Results.BrowserExtensions.FlaggedCount) flagged for review.</p>
+<div class="section" id="extensions">
 "@
+
+$extensionsOpen = if ($Results.BrowserExtensions.Status -match "PASS|CLEAN|UP TO DATE|REPAIRED") { "" } else { " open" }
+$extensionsHeadClass = Get-HeadingClass $Results.BrowserExtensions.Status
+
+$html += "<details$extensionsOpen><summary class='$extensionsHeadClass'><span class='icon'>&#x1F310;</span> Browser Extension Audit $(Get-StatusBadge $Results.BrowserExtensions.Status)</summary>"
+$html += "<div class='section-body'>"
+$html += "<p>Browsers found: $($Results.BrowserExtensions.BrowsersFound -join ', '). $($Results.BrowserExtensions.TotalExtensions) extension(s), $($Results.BrowserExtensions.FlaggedCount) flagged for review.</p>"
 
 if ($Results.BrowserExtensions.FlaggedCount -gt 0) {
     $html += "<h3 style='color:#dc2626;margin:10px 0 5px;font-size:0.95em;'>Flagged Extensions ($($Results.BrowserExtensions.FlaggedCount))</h3>"
@@ -3868,13 +4123,19 @@ if ($Results.BrowserExtensions.AllExtensions -and $Results.BrowserExtensions.Tot
 }
 
 $html += @"
+</div></details>
 </div>
 
 <!-- SERVICE STATUS MONITOR -->
-<div class="section">
-    <h2><span class="icon">&#x2699;</span> Service Status Monitor $(Get-StatusBadge $Results.ServiceStatus.Status)</h2>
-    <p>$($Results.ServiceStatus.TotalChecked) services checked. $($Results.ServiceStatus.RunningCount) running, $($Results.ServiceStatus.StoppedUnexpectedCount) stopped unexpectedly.</p>
+<div class="section" id="services">
 "@
+
+$servicesOpen = if ($Results.ServiceStatus.Status -match "PASS|CLEAN|UP TO DATE|REPAIRED") { "" } else { " open" }
+$servicesHeadClass = Get-HeadingClass $Results.ServiceStatus.Status
+
+$html += "<details$servicesOpen><summary class='$servicesHeadClass'><span class='icon'>&#x2699;</span> Service Status Monitor $(Get-StatusBadge $Results.ServiceStatus.Status)</summary>"
+$html += "<div class='section-body'>"
+$html += "<p>$($Results.ServiceStatus.TotalChecked) services checked. $($Results.ServiceStatus.RunningCount) running, $($Results.ServiceStatus.StoppedUnexpectedCount) stopped unexpectedly.</p>"
 
 if ($Results.ServiceStatus.StoppedUnexpectedCount -gt 0) {
     $html += "<h3 style='color:#dc2626;margin:10px 0 5px;font-size:0.95em;'>Stopped Services (Unexpected)</h3>"
@@ -3896,13 +4157,19 @@ if ($Results.ServiceStatus.AllServices -and $Results.ServiceStatus.TotalChecked 
 }
 
 $html += @"
+</div></details>
 </div>
 
 <!-- NETWORK CONFIGURATION -->
-<div class="section">
-    <h2><span class="icon">&#x1F310;</span> Network Configuration $(Get-StatusBadge $Results.NetworkConfig.Status)</h2>
-    <p>$($Results.NetworkConfig.AdapterCount) active adapter(s). Internet: $($Results.NetworkConfig.InternetAccess). Public IP: $($Results.NetworkConfig.PublicIP).</p>
+<div class="section" id="network">
 "@
+
+$networkOpen = if ($Results.NetworkConfig.Status -match "PASS|CLEAN|UP TO DATE|REPAIRED") { "" } else { " open" }
+$networkHeadClass = Get-HeadingClass $Results.NetworkConfig.Status
+
+$html += "<details$networkOpen><summary class='$networkHeadClass'><span class='icon'>&#x1F310;</span> Network Configuration $(Get-StatusBadge $Results.NetworkConfig.Status)</summary>"
+$html += "<div class='section-body'>"
+$html += "<p>$($Results.NetworkConfig.AdapterCount) active adapter(s). Internet: $($Results.NetworkConfig.InternetAccess). Public IP: $($Results.NetworkConfig.PublicIP).</p>"
 
 if ($Results.NetworkConfig.Adapters -and $Results.NetworkConfig.AdapterCount -gt 0) {
     $html += "<table><tr><th>Adapter</th><th>IPv4</th><th>Subnet</th><th>Gateway</th><th>DNS</th><th>Link Speed</th><th>DHCP</th></tr>"
@@ -3948,11 +4215,12 @@ if ($Results.NetworkConfig.SpeedTest.Tested) {
 # Physical printers
 if ($Results.NetworkConfig.PrinterCount -gt 0) {
     $html += "<h3 style='margin-top:12px;margin-bottom:6px;font-size:0.95em;'>Physical Printers ($($Results.NetworkConfig.PrinterCount))</h3>"
-    $html += "<table><tr><th>Printer</th><th>Connection</th><th>Port</th><th>Status</th><th>Default</th><th>Driver</th></tr>"
+    $html += "<table><tr><th>Printer</th><th>Connection</th><th>IP Address</th><th>Status</th><th>Default</th><th>Driver</th></tr>"
     foreach ($prt in $Results.NetworkConfig.Printers) {
         $statusColor = if ($prt.Status -match "Offline|Stopped") { "class='error-text'" } elseif ($prt.Status -eq "Idle" -or $prt.Status -eq "Printing") { "" } else { "class='warning-text'" }
         $defaultText = if ($prt.Default) { "<strong>Yes</strong>" } else { "No" }
-        $html += "<tr><td><strong>$($prt.Name)</strong></td><td>$($prt.Connection)</td><td class='detail'>$($prt.Port)</td><td $statusColor>$($prt.Status)</td><td>$defaultText</td><td class='detail'>$($prt.Driver)</td></tr>"
+        $ipDisplay = if ($prt.IPAddress) { $prt.IPAddress } else { "-" }
+        $html += "<tr><td><strong>$($prt.Name)</strong></td><td>$($prt.Connection)</td><td>$ipDisplay</td><td $statusColor>$($prt.Status)</td><td>$defaultText</td><td class='detail'>$($prt.Driver)</td></tr>"
     }
     $html += "</table>"
 } else {
@@ -3971,12 +4239,18 @@ if ($Results.NetworkConfig.IssueCount -gt 0) {
 }
 
 $html += @"
+</div></details>
 </div>
 
 <!-- ADWCLEANER -->
-<div class="section">
-    <h2><span class="icon">&#x1F50D;</span> AdwCleaner Scan $(Get-StatusBadge $Results.AdwCleaner.Status)</h2>
+<div class="section" id="adwcleaner">
 "@
+
+$adwcleanerOpen = if ($Results.AdwCleaner.Status -match "PASS|CLEAN|UP TO DATE|REPAIRED") { "" } else { " open" }
+$adwcleanerHeadClass = Get-HeadingClass $Results.AdwCleaner.Status
+
+$html += "<details$adwcleanerOpen><summary class='$adwcleanerHeadClass'><span class='icon'>&#x1F50D;</span> AdwCleaner Scan $(Get-StatusBadge $Results.AdwCleaner.Status)</summary>"
+$html += "<div class='section-body'>"
 
 if ($Results.AdwCleaner.Status -eq "SKIPPED") {
     $html += "<p class='detail'>Skipped by configuration.</p>"
@@ -4008,12 +4282,18 @@ if ($Results.AdwCleaner.Status -eq "SKIPPED") {
 }
 
 $html += @"
+</div></details>
 </div>
 
 <!-- RESTORE POINTS -->
-<div class="section">
-    <h2><span class="icon">&#x1F4BE;</span> System Restore Points $(Get-StatusBadge $Results.RestorePoints.Status)</h2>
+<div class="section" id="restorepoints">
 "@
+
+$restoreOpen = if ($Results.RestorePoints.Status -match "PASS|CLEAN|UP TO DATE|REPAIRED") { "" } else { " open" }
+$restoreHeadClass = Get-HeadingClass $Results.RestorePoints.Status
+
+$html += "<details$restoreOpen><summary class='$restoreHeadClass'><span class='icon'>&#x1F4BE;</span> System Restore Points $(Get-StatusBadge $Results.RestorePoints.Status)</summary>"
+$html += "<div class='section-body'>"
 
 if ($Results.RestorePoints.Status -eq "ERROR") {
     $html += "<p class='error-text'>Error: $($Results.RestorePoints.Error)</p>"
@@ -4037,13 +4317,16 @@ if ($Results.RestorePoints.Status -eq "ERROR") {
 }
 
 $html += @"
+</div></details>
 </div>
 
 <!-- MISCELLANEOUS (collapsed by default) -->
-<div class="section">
-    <h2><span class="icon">&#x1F4CB;</span> Miscellaneous</h2>
-    <details><summary style='cursor:pointer;color:#0d6efd;font-weight:bold;margin:8px 0;'>Telemetry Services $(Get-StatusBadge $Results.TelemetryServices.Status)</summary>
+<div class="section" id="telemetry">
 "@
+
+$html += "<details><summary class='heading-info'><span class='icon'>&#x1F4CB;</span> Miscellaneous</summary>"
+$html += "<div class='section-body'>"
+$html += "<details><summary style='cursor:pointer;color:#0d6efd;font-weight:bold;margin:8px 0;'>Telemetry Services $(Get-StatusBadge $Results.TelemetryServices.Status)</summary>"
 
 if ($Results.TelemetryServices.Status -eq "ERROR") {
     $html += "<p class='error-text'>Error: $($Results.TelemetryServices.Error)</p>"
@@ -4068,6 +4351,7 @@ if ($Results.TelemetryServices.Status -eq "ERROR") {
 
 $html += @"
     </details>
+</div></details>
 </div>
 
 <!-- ERRORS SUMMARY -->
@@ -4183,7 +4467,7 @@ ${overallColor}OVERALL STATUS: $overallStatus ($warningCount warning(s), $errorC
         $checkItems = @(
             @("System File Integrity (SFC)", $Results.SFC.Status),
             @("Disk Health", $Results.DiskHealth.Status),
-            @("Windows Updates", $(if ($Results.WindowsUpdates.PendingCount) { "$($Results.WindowsUpdates.Status) - $($Results.WindowsUpdates.PendingCount) pending" } else { $Results.WindowsUpdates.Status })),
+            @("Windows Updates", $(if ($Results.WindowsUpdates.CriticalCount -gt 0) { "$($Results.WindowsUpdates.Status) - $($Results.WindowsUpdates.CriticalCount) critical, $($Results.WindowsUpdates.OptionalCount) optional" } elseif ($Results.WindowsUpdates.OptionalCount -gt 0) { "UP TO DATE ($($Results.WindowsUpdates.OptionalCount) optional available)" } else { $Results.WindowsUpdates.Status })),
             @("iDrive Backup", $(
                 $iDriveSummary = $Results.iDriveBackup.Status
                 if ($Results.iDriveBackup.LastBackupDate) {
@@ -4241,56 +4525,74 @@ ${overallColor}OVERALL STATUS: $overallStatus ($warningCount warning(s), $errorC
         # Add iDrive backup details if installed
         if ($Results.iDriveBackup.Installed) {
             $svcStatus = if ($Results.iDriveBackup.ServiceRunning) { "[G]Running[/G]" } else { "[R]Not Running[/R]" }
-            $emailBody += "`n[H]iDRIVE BACKUP DETAILS[/H]`n"
-            $emailBody += "Last Backup".PadRight(30) + "$($Results.iDriveBackup.LastBackupDate)`n"
-            $resultText = $Results.iDriveBackup.LastBackupResult
-            if ($resultText -match "could not be backed up|failed|error") {
-                $emailBody += "Result".PadRight(30) + "[W]$resultText[/W]`n"
+            if ($Results.iDriveBackup.Status -match "PASS|CLEAN|UP TO DATE") {
+                # Compact single-line for passing status
+                $emailBody += "`n[H]iDRIVE BACKUP[/H] [G]PASS[/G] - Service running, last backup $($Results.iDriveBackup.LastBackupDate) (see HTML report for full details)`n"
             } else {
-                $emailBody += "Result".PadRight(30) + "$resultText`n"
+                # Full details for warning/error
+                $emailBody += "`n[H]iDRIVE BACKUP DETAILS[/H]`n"
+                $emailBody += "Last Backup".PadRight(30) + "$($Results.iDriveBackup.LastBackupDate)`n"
+                $resultText = $Results.iDriveBackup.LastBackupResult
+                if ($resultText -match "could not be backed up|failed|error") {
+                    $emailBody += "Result".PadRight(30) + "[W]$resultText[/W]`n"
+                } else {
+                    $emailBody += "Result".PadRight(30) + "$resultText`n"
+                }
+                $emailBody += "Files Backed Up".PadRight(30) + "$($Results.iDriveBackup.FilesBackedUp) of $($Results.iDriveBackup.FilesTotal) considered`n"
+                $emailBody += "Files In Sync".PadRight(30) + "$($Results.iDriveBackup.FilesInSync)`n"
+                $emailBody += "Computer Name".PadRight(30) + "$($Results.iDriveBackup.ComputerName)`n"
+                $emailBody += "Account".PadRight(30) + "$($Results.iDriveBackup.Account)`n"
+                $emailBody += "Service".PadRight(30) + "$svcStatus`n"
             }
-            $emailBody += "Files Backed Up".PadRight(30) + "$($Results.iDriveBackup.FilesBackedUp) of $($Results.iDriveBackup.FilesTotal) considered`n"
-            $emailBody += "Files In Sync".PadRight(30) + "$($Results.iDriveBackup.FilesInSync)`n"
-            $emailBody += "Computer Name".PadRight(30) + "$($Results.iDriveBackup.ComputerName)`n"
-            $emailBody += "Account".PadRight(30) + "$($Results.iDriveBackup.Account)`n"
-            $emailBody += "Service".PadRight(30) + "$svcStatus`n"
             $emailBody += "`n"
         }
 
         # Add Malwarebytes details if installed
         if ($Results.Malwarebytes.Installed) {
-            $mbSvcText = if ($Results.Malwarebytes.ServiceRunning) { "[G]Running[/G]" } else { "[R]Not Running[/R]" }
-            $mbRtText = switch ($Results.Malwarebytes.RealTimeProtection) {
-                "Enabled"  { "[G]Enabled[/G]" }
-                "Disabled" { "[R]Disabled[/R]" }
-                default    { $Results.Malwarebytes.RealTimeProtection }
+            if ($Results.Malwarebytes.Status -match "PASS|CLEAN") {
+                $emailBody += "`n[H]MALWAREBYTES[/H] [G]PASS[/G] - $($Results.Malwarebytes.ProductType), service running, real-time protection enabled (see HTML report for full details)`n"
+            } else {
+                $mbSvcText = if ($Results.Malwarebytes.ServiceRunning) { "[G]Running[/G]" } else { "[R]Not Running[/R]" }
+                $mbRtText = switch ($Results.Malwarebytes.RealTimeProtection) {
+                    "Enabled"  { "[G]Enabled[/G]" }
+                    "Disabled" { "[R]Disabled[/R]" }
+                    default    { $Results.Malwarebytes.RealTimeProtection }
+                }
+                $emailBody += "`n[H]MALWAREBYTES ENDPOINT PROTECTION[/H]`n"
+                $emailBody += "Product".PadRight(30) + "$($Results.Malwarebytes.ProductType)`n"
+                $emailBody += "Service".PadRight(30) + "$mbSvcText`n"
+                $emailBody += "Real-Time Protection".PadRight(30) + "$mbRtText`n"
             }
-            $emailBody += "`n[H]MALWAREBYTES ENDPOINT PROTECTION[/H]`n"
-            $emailBody += "Product".PadRight(30) + "$($Results.Malwarebytes.ProductType)`n"
-            $emailBody += "Service".PadRight(30) + "$mbSvcText`n"
-            $emailBody += "Real-Time Protection".PadRight(30) + "$mbRtText`n"
             $emailBody += "`n"
         }
 
         # Add Defender details
         if ($Results.Defender.RealTimeProtection) {
-            $emailBody += "`n[H]WINDOWS DEFENDER[/H]`n"
-            $rtpText = $Results.Defender.RealTimeProtection
-            if ($rtpText -eq "DISABLED") {
-                $emailBody += "Real-Time Protection".PadRight(30) + "[R]$rtpText[/R]`n"
+            if ($Results.Defender.Status -match "PASS|CLEAN") {
+                $defenderCompact = "real-time protection enabled"
+                if ($Results.Defender.ThirdPartyAV) {
+                    $defenderCompact += " (managed by $($Results.Defender.ThirdPartyAV))"
+                }
+                $emailBody += "`n[H]WINDOWS DEFENDER[/H] [G]PASS[/G] - $defenderCompact (see HTML report for full details)`n"
             } else {
-                $emailBody += "Real-Time Protection".PadRight(30) + "[G]$rtpText[/G]`n"
-            }
-            if ($Results.Defender.ThirdPartyAV) {
-                $emailBody += "Third-Party AV".PadRight(30) + "$($Results.Defender.ThirdPartyAV)`n"
-            } else {
-                $emailBody += "Definitions Updated".PadRight(30) + "$($Results.Defender.DefinitionsUpdated) ($($Results.Defender.DefinitionsAge))`n"
-                $emailBody += "Last Scan".PadRight(30) + "$($Results.Defender.LastScan) ($($Results.Defender.LastScanType))`n"
-                $threatCount = $Results.Defender.ThreatsLast30Days
-                if ($threatCount -gt 0) {
-                    $emailBody += "Threats (30 days)".PadRight(30) + "[R]$threatCount[/R]`n"
+                $emailBody += "`n[H]WINDOWS DEFENDER[/H]`n"
+                $rtpText = $Results.Defender.RealTimeProtection
+                if ($rtpText -eq "DISABLED") {
+                    $emailBody += "Real-Time Protection".PadRight(30) + "[R]$rtpText[/R]`n"
                 } else {
-                    $emailBody += "Threats (30 days)".PadRight(30) + "[G]$threatCount[/G]`n"
+                    $emailBody += "Real-Time Protection".PadRight(30) + "[G]$rtpText[/G]`n"
+                }
+                if ($Results.Defender.ThirdPartyAV) {
+                    $emailBody += "Third-Party AV".PadRight(30) + "$($Results.Defender.ThirdPartyAV)`n"
+                } else {
+                    $emailBody += "Definitions Updated".PadRight(30) + "$($Results.Defender.DefinitionsUpdated) ($($Results.Defender.DefinitionsAge))`n"
+                    $emailBody += "Last Scan".PadRight(30) + "$($Results.Defender.LastScan) ($($Results.Defender.LastScanType))`n"
+                    $threatCount = $Results.Defender.ThreatsLast30Days
+                    if ($threatCount -gt 0) {
+                        $emailBody += "Threats (30 days)".PadRight(30) + "[R]$threatCount[/R]`n"
+                    } else {
+                        $emailBody += "Threats (30 days)".PadRight(30) + "[G]$threatCount[/G]`n"
+                    }
                 }
             }
             $emailBody += "`n"
@@ -4298,31 +4600,35 @@ ${overallColor}OVERALL STATUS: $overallStatus ($warningCount warning(s), $errorC
 
         # Add Event Log summary
         if ($Results.EventLogErrors.TotalEvents -gt 0) {
-            $emailBody += "`n[H]EVENT LOG ANALYSIS (Last $($Results.EventLogErrors.HoursChecked)h)[/H]`n"
-            $emailBody += "Total Events".PadRight(30) + "$($Results.EventLogErrors.TotalEvents)`n"
-            if ($Results.EventLogErrors.ActionableCount -gt 0) {
-                $emailBody += "Needs Attention".PadRight(30) + "[R]$($Results.EventLogErrors.ActionableCount)[/R]`n"
+            if ($Results.EventLogErrors.Status -match "PASS|CLEAN") {
+                $emailBody += "`n[H]EVENT LOG ANALYSIS[/H] [G]PASS[/G] - $($Results.EventLogErrors.TotalEvents) events, all routine - no action required (see HTML report for full details)`n"
             } else {
-                $emailBody += "Needs Attention".PadRight(30) + "[G]$($Results.EventLogErrors.ActionableCount)[/G]`n"
-            }
-            $emailBody += "Routine (safe to ignore)".PadRight(30) + "$($Results.EventLogErrors.RoutineCount)`n`n"
+                $emailBody += "`n[H]EVENT LOG ANALYSIS (Last $($Results.EventLogErrors.HoursChecked)h)[/H]`n"
+                $emailBody += "Total Events".PadRight(30) + "$($Results.EventLogErrors.TotalEvents)`n"
+                if ($Results.EventLogErrors.ActionableCount -gt 0) {
+                    $emailBody += "Needs Attention".PadRight(30) + "[R]$($Results.EventLogErrors.ActionableCount)[/R]`n"
+                } else {
+                    $emailBody += "Needs Attention".PadRight(30) + "[G]$($Results.EventLogErrors.ActionableCount)[/G]`n"
+                }
+                $emailBody += "Routine (safe to ignore)".PadRight(30) + "$($Results.EventLogErrors.RoutineCount)`n`n"
 
-            if ($Results.EventLogErrors.ActionableCount -gt 0) {
-                $emailBody += "  [R]** EVENTS NEEDING ATTENTION **[/R]`n"
-                $evtCount = 0
-                foreach ($evt in $Results.EventLogErrors.ActionableEvents) {
-                    if ($evtCount -ge 5) { break }
-                    $evtColor = if ($evt.Level -eq "Critical") { "[R]" } else { "[W]" }
-                    $evtEnd = if ($evt.Level -eq "Critical") { "[/R]" } else { "[/W]" }
-                    $emailBody += "  ${evtColor}[$($evt.Level)] $($evt.Source) (ID:$($evt.EventID)) at $($evt.Time)${evtEnd}`n"
-                    $emailBody += "    -> $($evt.Note)`n`n"
-                    $evtCount++
+                if ($Results.EventLogErrors.ActionableCount -gt 0) {
+                    $emailBody += "  [R]** EVENTS NEEDING ATTENTION **[/R]`n"
+                    $evtCount = 0
+                    foreach ($evt in $Results.EventLogErrors.ActionableEvents) {
+                        if ($evtCount -ge 5) { break }
+                        $evtColor = if ($evt.Level -eq "Critical") { "[R]" } else { "[W]" }
+                        $evtEnd = if ($evt.Level -eq "Critical") { "[/R]" } else { "[/W]" }
+                        $emailBody += "  ${evtColor}[$($evt.Level)] $($evt.Source) (ID:$($evt.EventID)) at $($evt.Time)${evtEnd}`n"
+                        $emailBody += "    -> $($evt.Note)`n`n"
+                        $evtCount++
+                    }
+                    if ($Results.EventLogErrors.ActionableCount -gt 5) {
+                        $emailBody += "  ... and $($Results.EventLogErrors.ActionableCount - 5) more (see HTML report)`n"
+                    }
+                } else {
+                    $emailBody += "  All events are routine - no action required.`n"
                 }
-                if ($Results.EventLogErrors.ActionableCount -gt 5) {
-                    $emailBody += "  ... and $($Results.EventLogErrors.ActionableCount - 5) more (see HTML report)`n"
-                }
-            } else {
-                $emailBody += "  All events are routine - no action required.`n"
             }
             $emailBody += "`n"
         }
@@ -4370,41 +4676,57 @@ ${overallColor}OVERALL STATUS: $overallStatus ($warningCount warning(s), $errorC
             $emailBody += "`n"
         }
 
-        # Add Temp Files summary (always shown)
+        # Add Temp Files summary
         if ($Results.TempFiles.Locations -and $Results.TempFiles.Locations.Count -gt 0) {
-            $emailBody += "`n[H]TEMP AND CACHE FILES ($($Results.TempFiles.TotalSizeGB) GB total)[/H]`n"
-            foreach ($loc in $Results.TempFiles.Locations) {
-                if ($loc.SizeMB -gt 10) {
-                    $emailBody += "$($loc.Location)".PadRight(30) + "$($loc.SizeMB) MB`n"
+            if ($Results.TempFiles.Status -match "PASS|CLEAN") {
+                $emailBody += "`n[H]TEMP AND CACHE FILES[/H] [G]PASS[/G] - $($Results.TempFiles.TotalSizeGB) GB total (see HTML report for full details)`n"
+            } else {
+                $emailBody += "`n[H]TEMP AND CACHE FILES ($($Results.TempFiles.TotalSizeGB) GB total)[/H]`n"
+                foreach ($loc in $Results.TempFiles.Locations) {
+                    if ($loc.SizeMB -gt 10) {
+                        $emailBody += "$($loc.Location)".PadRight(30) + "$($loc.SizeMB) MB`n"
+                    }
                 }
             }
             $emailBody += "`n"
         }
 
-        # Add BitLocker status (always shown)
+        # Add BitLocker status
         if ($Results.SystemInfo.BitLocker) {
-            $emailBody += "`n[H]BITLOCKER ENCRYPTION[/H]`n"
-            foreach ($blVol in $Results.SystemInfo.BitLocker) {
-                $blDetail = if ($blVol.EncryptionMethod -ne "N/A") { "$($blVol.ProtectionStatus) ($($blVol.EncryptionMethod))" } else { $blVol.ProtectionStatus }
-                if ($blVol.ProtectionStatus -eq "On") {
-                    $emailBody += "$($blVol.Drive)".PadRight(30) + "[G]$blDetail[/G]`n"
-                } elseif ($blVol.ProtectionStatus -eq "Off") {
-                    $emailBody += "$($blVol.Drive)".PadRight(30) + "[W]$blDetail[/W]`n"
-                } else {
-                    $emailBody += "$($blVol.Drive)".PadRight(30) + "$blDetail`n"
+            $blAllOn = ($Results.SystemInfo.BitLocker | Where-Object { $_.ProtectionStatus -eq "On" }).Count -eq $Results.SystemInfo.BitLocker.Count
+            if ($blAllOn) {
+                $blDrives = ($Results.SystemInfo.BitLocker | ForEach-Object { "$($_.Drive) $($_.EncryptionMethod)" }) -join ", "
+                $emailBody += "`n[H]BITLOCKER ENCRYPTION[/H] [G]PASS[/G] - All volumes encrypted ($blDrives) (see HTML report for full details)`n"
+            } else {
+                $emailBody += "`n[H]BITLOCKER ENCRYPTION[/H]`n"
+                foreach ($blVol in $Results.SystemInfo.BitLocker) {
+                    $blDetail = if ($blVol.EncryptionMethod -ne "N/A") { "$($blVol.ProtectionStatus) ($($blVol.EncryptionMethod))" } else { $blVol.ProtectionStatus }
+                    if ($blVol.ProtectionStatus -eq "On") {
+                        $emailBody += "$($blVol.Drive)".PadRight(30) + "[G]$blDetail[/G]`n"
+                    } elseif ($blVol.ProtectionStatus -eq "Off") {
+                        $emailBody += "$($blVol.Drive)".PadRight(30) + "[W]$blDetail[/W]`n"
+                    } else {
+                        $emailBody += "$($blVol.Drive)".PadRight(30) + "$blDetail`n"
+                    }
                 }
             }
             $emailBody += "`n"
         }
 
-        # Add disk space summary (always shown)
+        # Add disk space summary
         if ($Results.DiskHealth.Volumes) {
-            $emailBody += "`n[H]DISK SPACE[/H]`n"
-            foreach ($vol in $Results.DiskHealth.Volumes) {
-                if ($vol.Warning) {
-                    $emailBody += "  [R]$($vol.Drive) $($vol.Label) - $($vol.FreeGB)GB free of $($vol.SizeGB)GB ($($vol.FreePercent)% free) *** LOW SPACE ***[/R]`n"
-                } else {
-                    $emailBody += "  $($vol.Drive) ($($vol.Label)) - $($vol.FreeGB)GB free of $($vol.SizeGB)GB ($($vol.FreePercent)% free)`n"
+            $diskWarnings = ($Results.DiskHealth.Volumes | Where-Object { $_.Warning }).Count
+            if ($diskWarnings -eq 0) {
+                $diskSummary = ($Results.DiskHealth.Volumes | ForEach-Object { "$($_.Drive) $($_.FreePercent)% free" }) -join ", "
+                $emailBody += "`n[H]DISK SPACE[/H] [G]PASS[/G] - $diskSummary (see HTML report for full details)`n"
+            } else {
+                $emailBody += "`n[H]DISK SPACE[/H]`n"
+                foreach ($vol in $Results.DiskHealth.Volumes) {
+                    if ($vol.Warning) {
+                        $emailBody += "  [R]$($vol.Drive) $($vol.Label) - $($vol.FreeGB)GB free of $($vol.SizeGB)GB ($($vol.FreePercent)% free) *** LOW SPACE ***[/R]`n"
+                    } else {
+                        $emailBody += "  $($vol.Drive) ($($vol.Label)) - $($vol.FreeGB)GB free of $($vol.SizeGB)GB ($($vol.FreePercent)% free)`n"
+                    }
                 }
             }
             $emailBody += "`n"
@@ -4453,22 +4775,30 @@ ${overallColor}OVERALL STATUS: $overallStatus ($warningCount warning(s), $errorC
 
         # Add AdwCleaner details
         if ($Results.AdwCleaner.Status -and $Results.AdwCleaner.Status -ne "SKIPPED" -and $Results.AdwCleaner.Status -ne "ERROR") {
-            $emailBody += "`n[H]ADWCLEANER SCAN[/H]`n"
-            if ($Results.AdwCleaner.DetectionCount -gt 0 -and $Results.AdwCleaner.Detections) {
-                $emailBody += "Adware/Malware Found".PadRight(30) + "[R]$($Results.AdwCleaner.DetectionCount)[/R]`n`n"
-                foreach ($detection in $Results.AdwCleaner.Detections) {
-                    $emailBody += "  [R]$($detection.Trim())[/R]`n"
+            if ($Results.AdwCleaner.Status -match "PASS|CLEAN") {
+                $adwCompact = "No adware or malware found"
+                if ($Results.AdwCleaner.PreinstalledCount -gt 0) {
+                    $adwCompact += ", $($Results.AdwCleaner.PreinstalledCount) preinstalled item(s) noted"
                 }
-                $emailBody += "`n"
+                $emailBody += "`n[H]ADWCLEANER SCAN[/H] [G]CLEAN[/G] - $adwCompact (see HTML report for full details)`n"
             } else {
-                $emailBody += "[G]No adware or malware found.[/G]`n`n"
-            }
-            if ($Results.AdwCleaner.PreinstalledCount -gt 0) {
-                $emailBody += "Preinstalled Software".PadRight(30) + "$($Results.AdwCleaner.PreinstalledCount) item(s)`n"
-                foreach ($item in $Results.AdwCleaner.PreinstalledItems) {
-                    $emailBody += "  $item`n"
+                $emailBody += "`n[H]ADWCLEANER SCAN[/H]`n"
+                if ($Results.AdwCleaner.DetectionCount -gt 0 -and $Results.AdwCleaner.Detections) {
+                    $emailBody += "Adware/Malware Found".PadRight(30) + "[R]$($Results.AdwCleaner.DetectionCount)[/R]`n`n"
+                    foreach ($detection in $Results.AdwCleaner.Detections) {
+                        $emailBody += "  [R]$($detection.Trim())[/R]`n"
+                    }
+                    $emailBody += "`n"
+                } else {
+                    $emailBody += "[G]No adware or malware found.[/G]`n`n"
                 }
-                $emailBody += "`n"
+                if ($Results.AdwCleaner.PreinstalledCount -gt 0) {
+                    $emailBody += "Preinstalled Software".PadRight(30) + "$($Results.AdwCleaner.PreinstalledCount) item(s)`n"
+                    foreach ($item in $Results.AdwCleaner.PreinstalledItems) {
+                        $emailBody += "  $item`n"
+                    }
+                    $emailBody += "`n"
+                }
             }
         }
 
@@ -4486,81 +4816,100 @@ ${overallColor}OVERALL STATUS: $overallStatus ($warningCount warning(s), $errorC
             }
         }
 
-        # Add Network Config details (always shown for visibility)
+        # Add Network Config details
         if ($Results.NetworkConfig.AdapterCount -gt 0) {
-            $emailBody += "`n[H]NETWORK CONFIGURATION[/H]`n"
-            $emailBody += "Active Adapters".PadRight(30) + "$($Results.NetworkConfig.AdapterCount)`n"
-            $emailBody += "Internet Access".PadRight(30) + "$($Results.NetworkConfig.InternetAccess)`n"
-            $emailBody += "DNS Reachable".PadRight(30) + "$($Results.NetworkConfig.DNSReachable)`n"
-            $emailBody += "Public IP".PadRight(30) + "$($Results.NetworkConfig.PublicIP)`n`n"
-            foreach ($nic in $Results.NetworkConfig.Adapters) {
-                $speedText = if ($nic.LinkSpeedMbps -ne "Unknown") { "$($nic.LinkSpeedMbps) Mbps" } else { "Unknown" }
-                $dhcpText = if ($nic.DHCP) { "DHCP" } else { "Static" }
-                $emailBody += "  [B]$($nic.Name)[/B]`n"
-                $emailBody += "    IPv4: $($nic.IPv4) / $($nic.SubnetMask) | Gateway: $($nic.Gateway)`n"
-                $emailBody += "    DNS: $($nic.DNS) | Link: $speedText | $dhcpText`n"
-                if ($nic.DHCP -and $nic.LeaseExpires -ne "N/A") {
-                    $emailBody += "    DHCP Lease: $($nic.LeaseObtained) to $($nic.LeaseExpires)`n"
+            if ($Results.NetworkConfig.Status -match "PASS|CLEAN" -and $Results.NetworkConfig.IssueCount -eq 0) {
+                # Compact summary for passing network
+                $netCompact = "Internet: $($Results.NetworkConfig.InternetAccess), Public IP: $($Results.NetworkConfig.PublicIP)"
+                if ($Results.NetworkConfig.SpeedTest.Tested) {
+                    $st = $Results.NetworkConfig.SpeedTest
+                    $netCompact += ", Speed: $($st.DownloadMbps)/$($st.UploadMbps) Mbps"
                 }
-                $emailBody += "`n"
-            }
-            # Speed test results
-            if ($Results.NetworkConfig.SpeedTest.Tested) {
-                $st = $Results.NetworkConfig.SpeedTest
-                $dlText = if ($st.DownloadMbps -lt 10) { "[R]$($st.DownloadMbps) Mbps[/R]" } elseif ($st.DownloadMbps -lt 50) { "[W]$($st.DownloadMbps) Mbps[/W]" } else { "[G]$($st.DownloadMbps) Mbps[/G]" }
-                $ulText = if ($st.UploadMbps -lt 5) { "[R]$($st.UploadMbps) Mbps[/R]" } elseif ($st.UploadMbps -lt 20) { "[W]$($st.UploadMbps) Mbps[/W]" } else { "[G]$($st.UploadMbps) Mbps[/G]" }
-                $pingText = if ($st.PingMs -gt 100) { "[R]$($st.PingMs) ms[/R]" } elseif ($st.PingMs -gt 50) { "[W]$($st.PingMs) ms[/W]" } else { "[G]$($st.PingMs) ms[/G]" }
-                $jitterText = if ($st.JitterMs -gt 30) { "[R]$($st.JitterMs) ms[/R]" } elseif ($st.JitterMs -gt 10) { "[W]$($st.JitterMs) ms[/W]" } else { "[G]$($st.JitterMs) ms[/G]" }
-                $emailBody += "  [B]Internet Speed Test[/B]`n"
-                $emailBody += "  Download".PadRight(30) + "$dlText`n"
-                $emailBody += "  Upload".PadRight(30) + "$ulText`n"
-                $emailBody += "  Ping (Latency)".PadRight(30) + "$pingText`n"
-                $emailBody += "  Jitter".PadRight(30) + "$jitterText`n"
-                $emailBody += "  ISP".PadRight(30) + "$($st.ISP)`n`n"
-            }
-
-            # Physical printers
-            if ($Results.NetworkConfig.PrinterCount -gt 0) {
-                $emailBody += "  [B]Physical Printers ($($Results.NetworkConfig.PrinterCount))[/B]`n"
-                foreach ($prt in $Results.NetworkConfig.Printers) {
-                    $defaultTag = if ($prt.Default) { " [default]" } else { "" }
-                    if ($prt.Status -match "Offline|Stopped") {
-                        $emailBody += "  [R]$($prt.Name)[/R]".PadRight(36) + "$($prt.Connection), [R]$($prt.Status)[/R]$defaultTag`n"
-                    } else {
-                        $emailBody += "  $($prt.Name)".PadRight(30) + "$($prt.Connection), $($prt.Status)$defaultTag`n"
-                    }
+                if ($Results.NetworkConfig.PrinterCount -gt 0) {
+                    $prtNames = ($Results.NetworkConfig.Printers | ForEach-Object { $_.Name }) -join ", "
+                    $netCompact += ", Printers: $prtNames"
                 }
-                $emailBody += "`n"
+                $emailBody += "`n[H]NETWORK CONFIGURATION[/H] [G]PASS[/G] - $netCompact (see HTML report for full details)`n"
             } else {
-                $emailBody += "  [B]Physical Printers[/B]        None detected`n`n"
-            }
-
-            if ($Results.NetworkConfig.IssueCount -gt 0) {
-                $emailBody += "  [R]** NETWORK ISSUES DETECTED **[/R]`n"
-                foreach ($issue in $Results.NetworkConfig.Issues) {
-                    $issueColor = if ($issue.Severity -eq "ERROR") { "[R]" } else { "[W]" }
-                    $issueEnd = if ($issue.Severity -eq "ERROR") { "[/R]" } else { "[/W]" }
-                    $emailBody += "  ${issueColor}[$($issue.Severity)] $($issue.Adapter): $($issue.Issue)${issueEnd}`n"
+                $emailBody += "`n[H]NETWORK CONFIGURATION[/H]`n"
+                $emailBody += "Active Adapters".PadRight(30) + "$($Results.NetworkConfig.AdapterCount)`n"
+                $emailBody += "Internet Access".PadRight(30) + "$($Results.NetworkConfig.InternetAccess)`n"
+                $emailBody += "DNS Reachable".PadRight(30) + "$($Results.NetworkConfig.DNSReachable)`n"
+                $emailBody += "Public IP".PadRight(30) + "$($Results.NetworkConfig.PublicIP)`n`n"
+                foreach ($nic in $Results.NetworkConfig.Adapters) {
+                    $speedText = if ($nic.LinkSpeedMbps -ne "Unknown") { "$($nic.LinkSpeedMbps) Mbps" } else { "Unknown" }
+                    $dhcpText = if ($nic.DHCP) { "DHCP" } else { "Static" }
+                    $emailBody += "  [B]$($nic.Name)[/B]`n"
+                    $emailBody += "    IPv4: $($nic.IPv4) / $($nic.SubnetMask) | Gateway: $($nic.Gateway)`n"
+                    $emailBody += "    DNS: $($nic.DNS) | Link: $speedText | $dhcpText`n"
+                    if ($nic.DHCP -and $nic.LeaseExpires -ne "N/A") {
+                        $emailBody += "    DHCP Lease: $($nic.LeaseObtained) to $($nic.LeaseExpires)`n"
+                    }
+                    $emailBody += "`n"
                 }
-                $emailBody += "`n"
+                # Speed test results
+                if ($Results.NetworkConfig.SpeedTest.Tested) {
+                    $st = $Results.NetworkConfig.SpeedTest
+                    $dlText = if ($st.DownloadMbps -lt 10) { "[R]$($st.DownloadMbps) Mbps[/R]" } elseif ($st.DownloadMbps -lt 50) { "[W]$($st.DownloadMbps) Mbps[/W]" } else { "[G]$($st.DownloadMbps) Mbps[/G]" }
+                    $ulText = if ($st.UploadMbps -lt 5) { "[R]$($st.UploadMbps) Mbps[/R]" } elseif ($st.UploadMbps -lt 20) { "[W]$($st.UploadMbps) Mbps[/W]" } else { "[G]$($st.UploadMbps) Mbps[/G]" }
+                    $pingText = if ($st.PingMs -gt 100) { "[R]$($st.PingMs) ms[/R]" } elseif ($st.PingMs -gt 50) { "[W]$($st.PingMs) ms[/W]" } else { "[G]$($st.PingMs) ms[/G]" }
+                    $jitterText = if ($st.JitterMs -gt 30) { "[R]$($st.JitterMs) ms[/R]" } elseif ($st.JitterMs -gt 10) { "[W]$($st.JitterMs) ms[/W]" } else { "[G]$($st.JitterMs) ms[/G]" }
+                    $emailBody += "  [B]Internet Speed Test[/B]`n"
+                    $emailBody += "  Download".PadRight(30) + "$dlText`n"
+                    $emailBody += "  Upload".PadRight(30) + "$ulText`n"
+                    $emailBody += "  Ping (Latency)".PadRight(30) + "$pingText`n"
+                    $emailBody += "  Jitter".PadRight(30) + "$jitterText`n"
+                    $emailBody += "  ISP".PadRight(30) + "$($st.ISP)`n`n"
+                }
+
+                # Physical printers
+                if ($Results.NetworkConfig.PrinterCount -gt 0) {
+                    $emailBody += "  [B]Physical Printers ($($Results.NetworkConfig.PrinterCount))[/B]`n"
+                    foreach ($prt in $Results.NetworkConfig.Printers) {
+                        $defaultTag = if ($prt.Default) { " [default]" } else { "" }
+                        $ipTag = if ($prt.IPAddress) { " ($($prt.IPAddress))" } else { "" }
+                        if ($prt.Status -match "Offline|Stopped") {
+                            $emailBody += "  [R]$($prt.Name)[/R]".PadRight(36) + "$($prt.Connection)$ipTag, [R]$($prt.Status)[/R]$defaultTag`n"
+                        } else {
+                            $emailBody += "  $($prt.Name)".PadRight(30) + "$($prt.Connection)$ipTag, $($prt.Status)$defaultTag`n"
+                        }
+                    }
+                    $emailBody += "`n"
+                } else {
+                    $emailBody += "  [B]Physical Printers[/B]        None detected`n`n"
+                }
+
+                if ($Results.NetworkConfig.IssueCount -gt 0) {
+                    $emailBody += "  [R]** NETWORK ISSUES DETECTED **[/R]`n"
+                    foreach ($issue in $Results.NetworkConfig.Issues) {
+                        $issueColor = if ($issue.Severity -eq "ERROR") { "[R]" } else { "[W]" }
+                        $issueEnd = if ($issue.Severity -eq "ERROR") { "[/R]" } else { "[/W]" }
+                        $emailBody += "  ${issueColor}[$($issue.Severity)] $($issue.Adapter): $($issue.Issue)${issueEnd}`n"
+                    }
+                    $emailBody += "`n"
+                }
             }
         }
 
         # Add Restore Point details
         if ($Results.RestorePoints.Status -and $Results.RestorePoints.Status -ne "ERROR") {
-            $emailBody += "`n[H]SYSTEM RESTORE POINTS[/H]`n"
-            $srText = if ($Results.RestorePoints.Enabled) { "[G]Enabled[/G]" } else { "[R]DISABLED[/R]" }
-            $emailBody += "System Restore".PadRight(30) + "$srText`n"
-            $emailBody += "Restore Points".PadRight(30) + "$($Results.RestorePoints.Count)`n"
-            $emailBody += "Disk Usage".PadRight(30) + "$($Results.RestorePoints.DiskUsage)`n"
-            if ($Results.RestorePoints.Note) {
-                $noteTag = if ($Results.RestorePoints.Status -eq "WARNING") { "[W]$($Results.RestorePoints.Note)[/W]" } else { "[G]$($Results.RestorePoints.Note)[/G]" }
-                $emailBody += "Note".PadRight(30) + "$noteTag`n"
-            }
-            if ($Results.RestorePoints.Points.Count -gt 0) {
-                $emailBody += "`n  Recent restore points:`n"
-                foreach ($rp in $Results.RestorePoints.Points) {
-                    $emailBody += "  $($rp.Created)".PadRight(28) + "$($rp.Type) - $($rp.Description)`n"
+            if ($Results.RestorePoints.Status -match "PASS|CLEAN") {
+                $emailBody += "`n[H]SYSTEM RESTORE POINTS[/H] [G]PASS[/G] - Enabled, $($Results.RestorePoints.Count) restore point(s), $($Results.RestorePoints.DiskUsage) disk usage (see HTML report for full details)`n"
+            } else {
+                $emailBody += "`n[H]SYSTEM RESTORE POINTS[/H]`n"
+                $srText = if ($Results.RestorePoints.Enabled) { "[G]Enabled[/G]" } else { "[R]DISABLED[/R]" }
+                $emailBody += "System Restore".PadRight(30) + "$srText`n"
+                $emailBody += "Restore Points".PadRight(30) + "$($Results.RestorePoints.Count)`n"
+                $emailBody += "Disk Usage".PadRight(30) + "$($Results.RestorePoints.DiskUsage)`n"
+                if ($Results.RestorePoints.Note) {
+                    $noteTag = if ($Results.RestorePoints.Status -eq "WARNING") { "[W]$($Results.RestorePoints.Note)[/W]" } else { "[G]$($Results.RestorePoints.Note)[/G]" }
+                    $emailBody += "Note".PadRight(30) + "$noteTag`n"
+                }
+                if ($Results.RestorePoints.Points.Count -gt 0) {
+                    $emailBody += "`n  Recent restore points:`n"
+                    foreach ($rp in $Results.RestorePoints.Points) {
+                        $emailBody += "  $($rp.Created)".PadRight(28) + "$($rp.Type) - $($rp.Description)`n"
+                    }
                 }
             }
             $emailBody += "`n"
@@ -4568,21 +4917,7 @@ ${overallColor}OVERALL STATUS: $overallStatus ($warningCount warning(s), $errorC
 
         # Add Miscellaneous section (Telemetry Services)
         if ($Results.TelemetryServices.Status -and $Results.TelemetryServices.Status -ne "ERROR") {
-            $emailBody += "`n[H]MISCELLANEOUS[/H]`n"
-            $emailBody += "[B]Telemetry Services (read-only audit)[/B]`n"
-            $emailBody += "Services Found".PadRight(30) + "$($Results.TelemetryServices.TotalFound)`n"
-            $emailBody += "Running".PadRight(30) + "$($Results.TelemetryServices.RunningCount)`n"
-            $emailBody += "Disabled".PadRight(30) + "$($Results.TelemetryServices.DisabledCount)`n`n"
-            foreach ($ts in $Results.TelemetryServices.Services) {
-                $svcStatus = switch ($ts.Status) {
-                    "Running" { "[W]Running[/W]" }
-                    "Stopped" { "[G]Stopped[/G]" }
-                    default   { $ts.Status }
-                }
-                $emailBody += "  $($ts.FriendlyName)`n"
-                $emailBody += "    ($($ts.ServiceName))".PadRight(30) + "$svcStatus | Startup: $($ts.StartType)`n"
-            }
-            $emailBody += "`n"
+            $emailBody += "`n[H]MISCELLANEOUS[/H] Telemetry: $($Results.TelemetryServices.RunningCount) running / $($Results.TelemetryServices.DisabledCount) disabled (see HTML report for full details)`n"
         }
 
         # Add errors if any
