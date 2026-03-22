@@ -68,7 +68,7 @@ param(
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-$ScriptVersion = "2.9.3"
+$ScriptVersion = "2.9.4"
 
 # GitHub raw URL for the latest version of this script
 # To use: create a private GitHub repo, push the script, and set this URL
@@ -2687,12 +2687,12 @@ try {
     }
 
     $Results.ServiceStatus = @{
-        Status              = $svcStatus
-        TotalChecked        = $serviceResults.Count
-        Running             = ($serviceResults | Where-Object { $_.Status -eq "Running" }).Count
-        StoppedUnexpected   = $stoppedUnexpected.Count
-        FlaggedServices     = $stoppedUnexpected
-        AllServices         = $serviceResults
+        Status                  = $svcStatus
+        TotalChecked            = $serviceResults.Count
+        RunningCount            = ($serviceResults | Where-Object { $_.Status -eq "Running" }).Count
+        StoppedUnexpectedCount  = $stoppedUnexpected.Count
+        Issues                  = $stoppedUnexpected
+        AllServices             = $serviceResults
     }
 
     Write-Log "Services: $($serviceResults.Count) checked, $(($serviceResults | Where-Object { $_.Status -eq 'Running' }).Count) running, $($stoppedUnexpected.Count) unexpectedly stopped"
@@ -4534,6 +4534,23 @@ ${overallColor}OVERALL STATUS: $overallStatus ($warningCount warning(s), $errorC
         $emailBody += @"
 
 "@
+
+        # Add Windows Updates details if pending
+        if ($Results.WindowsUpdates.PendingCount -gt 0) {
+            if ($Results.WindowsUpdates.CriticalCount -eq 0) {
+                $emailBody += "`n[H]WINDOWS UPDATES[/H] [G]UP TO DATE[/G] - $($Results.WindowsUpdates.OptionalCount) optional update(s) available (see HTML report for full details)`n"
+            } else {
+                $emailBody += "`n[H]WINDOWS UPDATES[/H]`n"
+                $emailBody += "Critical/Important".PadRight(30) + "[R]$($Results.WindowsUpdates.CriticalCount)[/R]`n"
+                $emailBody += "Optional".PadRight(30) + "$($Results.WindowsUpdates.OptionalCount)`n`n"
+                foreach ($upd in $Results.WindowsUpdates.Updates) {
+                    $critTag = if ($upd.IsImportant) { "[R]Critical[/R]" } else { "Optional" }
+                    $emailBody += "  $($upd.Title)`n"
+                    $emailBody += "    KB: $($upd.KB) | Size: $($upd.SizeMB) MB | $critTag`n`n"
+                }
+            }
+            $emailBody += "`n"
+        }
 
         # Add iDrive backup details if installed
         if ($Results.iDriveBackup.Installed) {
