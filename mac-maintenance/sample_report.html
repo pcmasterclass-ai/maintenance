@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Maintenance Report — mac.lan</title>
+<style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f1f5f9; color: #1e293b; line-height: 1.5; padding: 20px; }
+    .container { max-width: 900px; margin: 0 auto; }
+    .header { background: linear-gradient(135deg, #1e3a5f 0%, #2d5a87 100%); color: white; padding: 30px; border-radius: 12px 12px 0 0; }
+    .header h1 { font-size: 1.5em; margin-bottom: 5px; }
+    .header .subtitle { opacity: 0.8; font-size: 0.9em; }
+    .header .overall { margin-top: 15px; font-size: 1.1em; }
+    .section { background: white; border: 1px solid #e2e8f0; margin-bottom: 2px; padding: 20px 25px; }
+    .section:last-child { border-radius: 0 0 12px 12px; margin-bottom: 20px; }
+    .section h2 { font-size: 1.1em; color: #334155; margin-bottom: 10px; display: flex; align-items: center; gap: 10px; }
+    .section h2 .icon { font-size: 1.3em; }
+    table { width: 100%; border-collapse: collapse; margin: 10px 0; font-size: 0.9em; }
+    th { background: #f8fafc; text-align: left; padding: 8px 12px; border-bottom: 2px solid #e2e8f0; color: #64748b; font-weight: 600; }
+    td { padding: 8px 12px; border-bottom: 1px solid #f1f5f9; }
+    tr:hover td { background: #f8fafc; }
+    .flagged { background: #fef2f2 !important; }
+    .detail { color: #64748b; font-size: 0.85em; }
+    .warning-text { color: #d97706; font-weight: 600; }
+    .error-text { color: #dc2626; font-weight: 600; }
+    .footer { text-align: center; color: #94a3b8; font-size: 0.8em; padding: 15px; }
+    html { scroll-behavior: smooth; }
+    .heading-ok { color: #16a34a; }
+    .heading-warn { color: #d97706; }
+    .heading-error { color: #dc2626; }
+    .heading-info { color: #334155; }
+    details summary { cursor: pointer; list-style: none; display: flex; align-items: center; gap: 10px; font-size: 1.1em; color: #334155; font-weight: bold; padding: 2px 0; }
+    details summary::-webkit-details-marker { display: none; }
+    details summary::before { content: '\25B6'; font-size: 0.7em; transition: transform 0.2s ease; display: inline-block; min-width: 14px; }
+    details[open] summary::before { transform: rotate(90deg); }
+    details .section-body { padding-top: 10px; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<div class="header">
+    <h1>PC Master Class — Maintenance Report</h1>
+    <div class="subtitle">Paul Benjamin (Test) • mac.lan • macOS 15.7.5 • Monday, 04 May 2026 06:18 AM</div>
+    <div class="overall">Overall Status: <span style="background:#dc2626;color:white;padding:4px 12px;border-radius:4px;font-weight:bold;font-size:0.9em;">Errors Found</span> &nbsp; (5 warning(s), 1 error(s))</div>
+</div>
+
+<!-- CHECK RESULTS SUMMARY -->
+<div class="section" style="padding:15px 25px;">
+    <h2 style="margin-bottom:8px;"><span class="icon">&#x1F4CB;</span> Check Results Summary</h2>
+    <table style="font-size:0.88em;">
+<tr><td style='padding:4px 10px;width:50%;'><a href='#disk' style='text-decoration:none;color:#1e40af;'>Disk Health</a></td><td style='padding:4px 6px;'><span style="background:#d97706;color:white;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:bold;">WARNING</span></td><td style='padding:4px 10px;width:50%;'><a href='#updates' style='text-decoration:none;color:#1e40af;'>Software Updates</a></td><td style='padding:4px 6px;'><span style="background:#d97706;color:white;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:bold;">WARNING</span></td></tr><tr><td style='padding:4px 10px;width:50%;'><a href='#backup' style='text-decoration:none;color:#1e40af;'>Backup Status</a></td><td style='padding:4px 6px;'><span style="background:#d97706;color:white;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:bold;">WARNING</span></td><td style='padding:4px 10px;width:50%;'><a href='#malwarebytes' style='text-decoration:none;color:#1e40af;'>Malwarebytes</a></td><td style='padding:4px 6px;'><span style="background:#3b82f6;color:white;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:bold;">INFO</span></td></tr><tr><td style='padding:4px 10px;width:50%;'><a href='#security' style='text-decoration:none;color:#1e40af;'>macOS Security</a></td><td style='padding:4px 6px;'><span style="background:#16a34a;color:white;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:bold;">PASS</span></td><td style='padding:4px 10px;width:50%;'><a href='#logs' style='text-decoration:none;color:#1e40af;'>System Log Errors</a></td><td style='padding:4px 6px;'><span style="background:#d97706;color:white;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:bold;">WARNING</span></td></tr><tr><td style='padding:4px 10px;width:50%;'><a href='#reboot' style='text-decoration:none;color:#1e40af;'>Pending Reboot</a></td><td style='padding:4px 6px;'><span style="background:#16a34a;color:white;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:bold;">PASS</span></td><td style='padding:4px 10px;width:50%;'><a href='#firewall' style='text-decoration:none;color:#1e40af;'>Firewall</a></td><td style='padding:4px 6px;'><span style="background:#dc2626;color:white;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:bold;">ERROR</span></td></tr><tr><td style='padding:4px 10px;width:50%;'><a href='#users' style='text-decoration:none;color:#1e40af;'>User Accounts</a></td><td style='padding:4px 6px;'><span style="background:#16a34a;color:white;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:bold;">PASS</span></td><td style='padding:4px 10px;width:50%;'><a href='#temp' style='text-decoration:none;color:#1e40af;'>Temp/Cache Files</a></td><td style='padding:4px 6px;'><span style="background:#d97706;color:white;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:bold;">WARNING</span></td></tr><tr><td style='padding:4px 10px;width:50%;'><a href='#startup' style='text-decoration:none;color:#1e40af;'>Startup/Login Items</a></td><td style='padding:4px 6px;'><span style="background:#16a34a;color:white;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:bold;">PASS</span></td><td style='padding:4px 10px;width:50%;'><a href='#tasks' style='text-decoration:none;color:#1e40af;'>Scheduled Tasks</a></td><td style='padding:4px 6px;'><span style="background:#16a34a;color:white;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:bold;">PASS</span></td></tr><tr><td style='padding:4px 10px;width:50%;'><a href='#extensions' style='text-decoration:none;color:#1e40af;'>Browser Extensions</a></td><td style='padding:4px 6px;'><span style="background:#16a34a;color:white;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:bold;">PASS</span></td><td style='padding:4px 10px;width:50%;'><a href='#services' style='text-decoration:none;color:#1e40af;'>Service Status</a></td><td style='padding:4px 6px;'><span style="background:#16a34a;color:white;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:bold;">PASS</span></td></tr><tr><td style='padding:4px 10px;width:50%;'><a href='#network' style='text-decoration:none;color:#1e40af;'>Network Config</a></td><td style='padding:4px 6px;'><span style="background:#16a34a;color:white;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:bold;">PASS</span></td><td></td><td></td></tr></table></div>
+<div class="section">
+    <h2><span class="icon">&#x1F4BB;</span> System Information</h2>
+    <table>
+        <tr><td><strong>Client</strong></td><td><strong style='font-size:1.1em;'>Paul Benjamin (Test)</strong></td></tr>
+        <tr><td><strong>Computer</strong></td><td>mac.lan</td></tr>
+        <tr><td><strong>Make / Model</strong></td><td>Apple Mac16,9 (Mac16,9)</td></tr>
+        <tr><td><strong>Serial Number</strong></td><td>KFK0X6XJPV</td></tr>
+        <tr><td><strong>macOS</strong></td><td>15.7.5 (arm64)</td></tr>
+        <tr><td><strong>CPU</strong></td><td>Apple M4 Max (14 cores / 14 threads)</td></tr>
+        <tr><td><strong>RAM</strong></td><td>36.0 GB</td></tr>
+        <tr><td><strong>FileVault</strong></td><td>On</td></tr>
+        <tr><td><strong>Last Boot</strong></td><td>2026-04-14 20:57:54 (Uptime: 19.4 days)</td></tr>
+        <tr><td><strong>Script Version</strong></td><td>v1.0.0</td></tr>
+    </table>
+</div>
+
+<div class="section" id="disk">
+<details open><summary class="heading-warn"><span class="icon">&#x1F4BE;</span> Disk Health <span style="background:#d97706;color:white;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:bold;">WARNING</span></summary>
+<div class="section-body">
+
+<table><tr><th>Disk</th><th>Type</th><th>Size</th><th>Health</th></tr>
+</table><table><tr><th>Filesystem</th><th>Mount</th><th>Size</th><th>Used</th><th>Avail</th><th>Used %</th></tr><tr><td>/dev/disk3s3s1</td><td>/</td><td>460Gi</td><td>10Gi</td><td>319Gi</td><td>4%</td></tr><tr class='flagged'><td>devfs</td><td>/dev</td><td>198Ki</td><td>198Ki</td><td>0Bi</td><td><span class='warning-text'>100% WARNING</span></td></tr><tr><td>/dev/disk3s6</td><td>/System/Volumes/VM</td><td>460Gi</td><td>4.0Gi</td><td>319Gi</td><td>2%</td></tr><tr><td>/dev/disk3s4</td><td>/System/Volumes/Preboot</td><td>460Gi</td><td>6.6Gi</td><td>319Gi</td><td>3%</td></tr><tr><td>/dev/disk3s2</td><td>/System/Volumes/Update</td><td>460Gi</td><td>41Mi</td><td>319Gi</td><td>1%</td></tr><tr><td>/dev/disk1s2</td><td>/System/Volumes/xarts</td><td>500Mi</td><td>6.0Mi</td><td>482Mi</td><td>2%</td></tr><tr><td>/dev/disk1s1</td><td>/System/Volumes/iSCPreboot</td><td>500Mi</td><td>5.6Mi</td><td>482Mi</td><td>2%</td></tr><tr><td>/dev/disk1s3</td><td>/System/Volumes/Hardware</td><td>500Mi</td><td>1.2Mi</td><td>482Mi</td><td>1%</td></tr><tr><td>/dev/disk3s1</td><td>/System/Volumes/Data</td><td>460Gi</td><td>119Gi</td><td>319Gi</td><td>28%</td></tr><tr><td>map</td><td>-</td><td>auto_home</td><td>0Bi</td><td>0Bi</td><td>0%</td></tr></table><p class='detail'>smartmontools not installed. Install via 'brew install smartmontools' for detailed SMART data.</p></div></details></div>
+<div class="section" id="updates">
+<details open><summary class="heading-warn"><span class="icon">&#x1F504;</span> Software Updates <span style="background:#d97706;color:white;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:bold;">WARNING</span></summary>
+<div class="section-body">
+<p>1 macOS update(s) available.</p><table><tr><th>Update</th></tr><tr><td>Label: macOS Tahoe 26.4.1-25E253</td></tr></table><p class='detail'>3 Homebrew package(s) outdated.</p><p class='warning-text'>A restart is required to complete pending updates.</p></div></details></div>
+<div class="section" id="backup">
+<details open><summary class="heading-warn"><span class="icon">&#x2601;</span> Backup Status <span style="background:#d97706;color:white;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:bold;">WARNING</span></summary>
+<div class="section-body">
+<p class='detail'>iDrive not installed.</p><p class='detail'>Time Machine not configured.</p><p class='warning-text'>No backup solution detected or backup is stale.</p></div></details></div>
+<div class="section" id="malwarebytes">
+<details open><summary class="heading-info"><span class="icon">&#x1F6E1;</span> Malwarebytes Endpoint Protection <span style="background:#3b82f6;color:white;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:bold;">INFO</span></summary>
+<div class="section-body">
+<p class='detail'>Malwarebytes not installed on this Mac.</p></div></details></div>
+<div class="section" id="security">
+<details><summary class="heading-ok"><span class="icon">&#x1F6E1;</span> macOS Security <span style="background:#16a34a;color:white;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:bold;">PASS</span></summary>
+<div class="section-body">
+    <table>
+        <tr><td><strong>Gatekeeper</strong></td><td>Enabled</td></tr>
+        <tr><td><strong>XProtect</strong></td><td>Unknown</td></tr>
+        
+        <tr><td><strong>System Integrity Protection</strong></td><td>Enabled</td></tr>
+    </table>
+</div></details></div>
+
+<div class="section" id="logs">
+<details open><summary class="heading-warn"><span class="icon">&#x1F4CB;</span> System Log Errors (Last 24h) <span style="background:#d97706;color:white;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:bold;">WARNING</span></summary>
+<div class="section-body">
+<p>No critical or error events in the last 24 hours. All clear.</p><h3 style='color:#d97706;margin:10px 0 5px;font-size:0.95em;'>Recent Crash Reports</h3><ul><li>proactive_event_tracker-com_apple_Trial-com_apple_triald_2026-05-03-085932_Brunos-Mac-Studio.diag</li><li>SFA-swtransparency.json_2026-05-04-025852_Brunos-Mac-Studio.diag</li><li>SFA-CloudServices.json_2026-05-03-145850_Brunos-Mac-Studio.diag</li><li>SFA-rootNetworking.json_2026-05-03-145850_Brunos-Mac-Studio.diag</li><li>SFA-transparency.json_2026-05-03-145851_Brunos-Mac-Studio.diag</li></ul></div></details></div>
+<div class="section" id="reboot">
+<details><summary class="heading-ok"><span class="icon">&#x1F504;</span> Pending Reboot <span style="background:#16a34a;color:white;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:bold;">PASS</span></summary>
+<div class="section-body">
+<p class='warning-text'>A restart is required to complete pending updates.</p></div></details></div>
+<div class="section" id="firewall">
+<details open><summary class="heading-error"><span class="icon">&#x1F6E1;</span> Firewall <span style="background:#dc2626;color:white;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:bold;">ERROR</span></summary>
+<div class="section-body">
+    <table>
+        <tr><td><strong>Enabled</strong></td><td><span class="error-text">NO</span></td></tr>
+        
+    </table>
+</div></details></div>
+
+<div class="section" id="users">
+<details><summary class="heading-ok"><span class="icon">&#x1F464;</span> User Accounts <span style="background:#16a34a;color:white;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:bold;">PASS</span></summary>
+<div class="section-body">
+    <p>1 local account(s), 0 with admin rights.</p>
+    <table><tr><th>Account</th><th>Admin</th><th>Last Login</th></tr>
+<tr><td>brunobear</td><td>No</td><td>brunobear  ttys000                         Sat May</td></tr></table></div></details></div>
+<div class="section" id="temp">
+<details open><summary class="heading-warn"><span class="icon">&#x1F4C1;</span> Temp/Cache Files <span style="background:#d97706;color:white;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:bold;">WARNING</span></summary>
+<div class="section-body">
+    <table><tr><th>Directory</th><th>Label</th><th>Size</th><th>Files</th></tr>
+<tr><td>/tmp</td><td>System temp</td><td>2.2 MB</td><td>141</td></tr><tr><td>/var/tmp</td><td>Var temp</td><td>0.0 MB</td><td>0</td></tr><tr class='flagged'><td>/Users/brunobear/Library/Caches</td><td>User caches</td><td><span class='warning-text'>4828.4 MB</span></td><td>36464</td></tr><tr class='flagged'><td>/Users/brunobear/Library/Caches/Firefox</td><td>Firefox cache</td><td><span class='warning-text'>1053.0 MB</span></td><td>22737</td></tr></table></div></details></div>
+<div class="section" id="startup">
+<details><summary class="heading-ok"><span class="icon">&#x1F504;</span> Startup/Login Items <span style="background:#16a34a;color:white;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:bold;">PASS</span></summary>
+<div class="section-body">
+    <h3 style="margin:10px 0 5px;font-size:0.95em;">Login Items</h3>
+    <ul>
+<li class='detail'>None found</li></ul><h3 style='margin:10px 0 5px;font-size:0.95em;'>LaunchAgents</h3><ul><li>com.dropbox.dropboxmacupdate.xpcservice.plist</li><li>com.pcmasterclass.hermes-gateway.plist</li><li>com.dropbox.DropboxUpdater.wake.plist</li><li>ai.hermes.gateway.plist</li><li>com.dropbox.dropboxmacupdate.agent.plist</li></ul></div></details></div>
+<div class="section" id="tasks">
+<details><summary class="heading-ok"><span class="icon">&#x23F0;</span> Scheduled Tasks <span style="background:#16a34a;color:white;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:bold;">PASS</span></summary>
+<div class="section-body">
+    <table><tr><th>Label</th><th>PID</th><th>Status</th></tr>
+<tr><td>com.apple.SafariHistoryServiceAgent</td><td>-</td><td>0</td></tr><tr><td>com.apple.progressd</td><td>21849</td><td>-9</td></tr><tr><td>com.apple.cloudphotod</td><td>18185</td><td>-9</td></tr><tr><td>com.apple.MENotificationService</td><td>32695</td><td>-9</td></tr><tr><td>com.apple.Finder</td><td>611</td><td>0</td></tr><tr><td>com.apple.homed</td><td>575</td><td>0</td></tr><tr><td>com.apple.dataaccess.dataaccessd</td><td>6328</td><td>-9</td></tr><tr><td>com.apple.quicklook</td><td>-</td><td>0</td></tr><tr><td>com.apple.parentalcontrols.check</td><td>-</td><td>0</td></tr><tr><td>com.apple.mediaremoteagent</td><td>689</td><td>0</td></tr><tr><td>com.apple.FontWorker</td><td>622</td><td>0</td></tr><tr><td>com.apple.bird</td><td>6406</td><td>-9</td></tr><tr><td>com.apple.amp.mediasharingd</td><td>-</td><td>0</td></tr><tr><td>com.apple.knowledgeconstructiond</td><td>-</td><td>-9</td></tr><tr><td>com.apple.inputanalyticsd</td><td>32257</td><td>-9</td></tr><tr><td>com.apple.familycontrols.useragent</td><td>-</td><td>0</td></tr><tr><td>com.apple.AssetCache.agent</td><td>-</td><td>0</td></tr><tr><td>com.apple.GameController.gamecontrolleragentd</td><td>33001</td><td>0</td></tr><tr><td>com.apple.universalaccessAuthWarn</td><td>2663</td><td>0</td></tr><tr><td>com.apple.UserPictureSyncAgent</td><td>-</td><td>0</td></tr></table></div></details></div>
+<div class="section" id="extensions">
+<details><summary class="heading-ok"><span class="icon">&#x1F527;</span> Browser Extensions <span style="background:#16a34a;color:white;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:bold;">PASS</span></summary>
+<div class="section-body">
+    <h3 style="margin:10px 0 5px;font-size:0.95em;">Chrome Extensions</h3>
+    <table><tr><th>Name</th><th>ID</th></tr>
+<tr><td class='detail' colspan='2'>No Chrome extensions found or Chrome not installed.</td></tr></table></div></details></div>
+<div class="section" id="services">
+<details><summary class="heading-ok"><span class="icon">&#x2699;</span> Service Status <span style="background:#16a34a;color:white;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:bold;">PASS</span></summary>
+<div class="section-body">
+    <table><tr><th>Service</th><th>Running</th></tr>
+<tr><td>com.apple.WindowServer</td><td><span class="warning-text">No</span></td></tr><tr><td>com.apple.metadata.mds</td><td><span class="warning-text">No</span></td></tr><tr><td>com.apple.systempreferences</td><td><span class="warning-text">No</span></td></tr><tr><td>com.apple.audio.coreaudiod</td><td><span class="warning-text">No</span></td></tr><tr><td>com.apple.blued</td><td><span class="warning-text">No</span></td></tr></table></div></details></div>
+<div class="section" id="network">
+<details><summary class="heading-ok"><span class="icon">&#x1F310;</span> Network Configuration <span style="background:#16a34a;color:white;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:bold;">PASS</span></summary>
+<div class="section-body">
+    <table>
+        
+        <tr><td><strong>Default Gateway</strong></td><td>192.168.86.1</td></tr>
+        <tr><td><strong>DNS Servers</strong></td><td>192.168.86.1</td></tr>
+    </table>
+</div></details></div>
+
+<div class="footer">
+    Report generated by PC Master Class macOS Maintenance Script v1.0.0<br>
+    &copy; 2026 PC Master Class — pc-masterclass.com.au
+</div>
+
+</div>
+</body>
+</html>

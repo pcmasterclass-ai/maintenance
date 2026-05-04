@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+PC Master Class macOS Maintenance — LaunchAgent
+
+Install:
+  cp com.pcmasterclass.maintenance.agent.plist ~/Library/LaunchAgents/
+  launchctl load ~/Library/LaunchAgents/com.pcmasterclass.maintenance.agent.plist
+
+Uninstall:
+  launchctl unload ~/Library/LaunchAgents/com.pcmasterclass.maintenance.agent.plist
+  rm ~/Library/LaunchAgents/com.pcmasterclass.maintenance.agent.plist
+
+Note: This is a LaunchAgent (runs as the logged-in user). For background service
+behavior without GUI, a LaunchDaemon at /Library/LaunchDaemons/ would be needed,
+but that requires admin/root installation. The LaunchAgent approach is simpler
+for remote deployment via TeamViewer.
+
+Schedule: Quarterly — Jan 15, Apr 15, Jul 15, Oct 15 at 01:00 local time
+The script itself auto-updates from GitHub before each run.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.pcmasterclass.maintenance.agent</string>
+
+    <!-- Program to execute -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <!-- Path to the maintenance script (set during installation) -->
+        <string>/Users/REPLACEME/Library/PCMasterClass/pcm_mac_maintenance.py</string>
+        <string>--email-to</string>
+        <string>REPLACEME_RECIPIENT</string>
+        <string>--client-name</string>
+        <string>REPLACEME_CLIENTNAME</string>
+    </array>
+
+    <!-- Run quarterly on the 15th of Jan/Apr/Jul/Oct at 1:00 AM -->
+    <!-- Month is 1-based: 1=Jan, 4=Apr, 7=Jul, 10=Oct -->
+    <!-- IMPORTANT: LaunchAgents only support single-date scheduling.
+         To stagger multiple clients across different months, create
+         separate plists for each client with different dates (e.g.:
+         Jan 15, Apr 15, Jul 15, Oct 15 — or shift by a day for each
+         client to spread load).
+         
+         Alternatively, use a shell wrapper script that checks if today
+         is the right day before running, and schedule the LaunchAgent
+         to run daily at 1:00 AM. This is simpler for bulk deployment.
+    -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Month</key>
+        <integer>1</integer>
+        <key>Day</key>
+        <integer>15</integer>
+        <key>Hour</key>
+        <integer>1</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <!-- Prevent overlapping runs (if the script takes longer than expected) -->
+    <key>ThrottleInterval</key>
+    <integer>3600</integer>
+
+    <!-- Don't re-run if the process exits with an abnormal code (let email alert you) -->
+    <key>KeepAlive</key>
+    <false/>
+
+    <!-- Run at load (false — we only want scheduled runs, not at login) -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- Log output -->
+    <key>StandardOutPath</key>
+    <string>/Users/REPLACEME/Library/PCMasterClass/Logs/maintenance.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/REPLACEME/Library/PCMasterClass/Logs/maintenance.err.log</string>
+
+    <!-- Environment -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>PYTHONIOENCODING</key>
+        <string>utf-8</string>
+    </dict>
+</dict>
+</plist>

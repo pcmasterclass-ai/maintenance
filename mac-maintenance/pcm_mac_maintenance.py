@@ -1,0 +1,1716 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+PC Master Class - macOS Maintenance Script
+Version: 1.0.0
+Author: Paul Benjamin
+License: Proprietary
+
+Runs a comprehensive maintenance checklist on client Apple Mac computers
+and generates a branded HTML report with email delivery. Designed to be
+installed via a simple shell script and run periodically via LaunchAgent.
+
+USAGE:
+  First-time credential setup (interactive):
+    python3 pcm_mac_maintenance.py --save-credential \
+        --smtp-user reports@pcmasterclass.com.au \
+        --smtp-password YOUR_APP_PASSWORD \
+        --email-to paul@pcmasterclass.com.au
+
+  Normal run (pulls credential from macOS Keychain):
+    python3 pcm_mac_maintenance.py --email-to paul@pcmasterclass.com.au
+
+  Options:
+    --skip-updates      Skip Apple software update check
+    --skip-smart        Skip disk health/SMART check (requires smartmontools)
+    --client-name       Client name for report header
+    --report-path       Custom path for report output
+    --email-to          Send report via email
+    --smtp-user         SMTP username
+    --smtp-password     SMTP password (App Password for Gmail)
+    --smtp-server       SMTP server (default: smtp.gmail.com)
+    --smtp-port         SMTP port (default: 587)
+    --email-from        Sender address
+    --save-credential   Store credentials in macOS Keychain
+    --skip-update-check Skip auto-update check from GitHub
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import smtplib
+import ssl
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from pathlib import Path
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+SCRIPT_VERSION = "1.0.0"
+UPDATE_URL = "https://raw.githubusercontent.com/pcmasterclass-ai/maintenance/main/pcm_mac_maintenance.py"
+UPDATE_TOKEN = ""  # Leave empty for public repos
+
+# macOS Keychain service name for stored credentials
+KEYCHAIN_SERVICE = "PCMasterClass Maintenance SMTP"
+
+# ============================================================================
+# LOGGING
+# ============================================================================
+class Logger:
+    def __init__(self, log_file=None):
+        self.log_file = log_file
+        self.entries = []
+
+    def log(self, message, level="INFO"):
+        entry = f"[{level}] {datetime.now().strftime('%H:%M:%S')} - {message}"
+        print(entry)
+        self.entries.append(entry)
+        if self.log_file:
+            try:
+                with open(self.log_file, 'a', encoding='utf-8') as f:
+                    f.write(entry + '\n')
+            except Exception:
+                pass
+
+    def info(self, message):
+        self.log(message, "INFO")
+
+    def warn(self, message):
+        self.log(message, "WARN")
+
+    def error(self, message):
+        self.log(message, "ERROR")
+
+
+# ============================================================================
+# KEYCHAIN CREDENTIAL MANAGEMENT
+# ============================================================================
+def keychain_store(account, password, smtp_server="smtp.gmail.com", smtp_port=587, email_from=""):
+    """Store SMTP credentials in macOS Keychain."""
+    if not email_from:
+        email_from = account
+
+    # Build the JSON payload
+    payload = json.dumps({
+        "smtp_user": account,
+        "smtp_server": smtp_server,
+        "smtp_port": str(smtp_port),
+        "email_from": email_from,
+        "version": SCRIPT_VERSION
+    })
+
+    # Store password using security command
+    # We use the account name as the keychain 'account' field
+    cmd = [
+        "security", "add-generic-password",
+        "-s", KEYCHAIN_SERVICE,
+        "-a", account,
+        "-w", password,
+        "-T", "",  # Allow any application to access (simplifies script execution)
+        "-U"       # Update if exists
+    ]
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as e:
+        # If item already exists, try delete then re-add
+        if "already exists" in e.stderr.lower() or e.returncode == 45:
+            subprocess.run(["security", "delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account],
+                             capture_output=True, text=True)
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+        else:
+            raise RuntimeError(f"Failed to store credential in Keychain: {e.stderr}")
+
+    # Store additional config (server, port, from) in a note
+    note_cmd = [
+        "security", "add-generic-password",
+        "-s", KEYCHAIN_SERVICE + " Config",
+        "-a", account,
+        "-w", payload,
+        "-T", "",
+        "-U"
+    ]
+    try:
+        subprocess.run(note_cmd, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError:
+        subprocess.run(["security", "delete-generic-password", "-s", KEYCHAIN_SERVICE + " Config", "-a", account],
+                         capture_output=True, text=True)
+        subprocess.run(note_cmd, capture_output=True, text=True, check=True)
+
+    return True
+
+
+def keychain_load(account):
+    """Load SMTP credentials from macOS Keychain."""
+    # Get password
+    cmd = ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account, "-w"]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        return None
+    password = result.stdout.strip()
+
+    # Get config
+    cmd2 = ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE + " Config", "-a", account, "-w"]
+    result2 = subprocess.run(cmd2, capture_output=True, text=True)
+    config = {}
+    if result2.returncode == 0:
+        try:
+            config = json.loads(result2.stdout.strip())
+        except json.JSONDecodeError:
+            pass
+
+    return {
+        "smtp_user": account,
+        "smtp_password": password,
+        "smtp_server": config.get("smtp_server", "smtp.gmail.com"),
+        "smtp_port": int(config.get("smtp_port", "587")),
+        "email_from": config.get("email_from", account),
+    }
+
+
+def keychain_list_accounts():
+    """List all accounts stored in Keychain for this service."""
+    cmd = ["security", "dump-keychain"]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    accounts = []
+    if result.returncode == 0:
+        # Parse output for our service
+        for line in result.stdout.split('\n'):
+            if KEYCHAIN_SERVICE in line and "svce" in line:
+                # This is a heuristic; a more robust approach is needed
+                pass
+    # Simpler: try to find any password entries for our service
+    cmd = ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-g"]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    # If we have an account-specific entry, the account name was passed
+    # Since we don't know accounts a priori, we iterate common ones
+    return []
+
+
+# ============================================================================
+# AUTO-UPDATE FROM GITHUB
+# ============================================================================
+def check_and_update():
+    """Check for newer version on GitHub and self-update if found."""
+    try:
+        headers = {}
+        if UPDATE_TOKEN:
+            headers["Authorization"] = f"token {UPDATE_TOKEN}"
+
+        req = urllib.request.Request(UPDATE_URL, headers=headers)
+        context = ssl.create_default_context()
+        with urllib.request.urlopen(req, context=context, timeout=15) as response:
+            remote_content = response.read().decode('utf-8')
+
+        # Extract remote version
+        match = re.search(r'SCRIPT_VERSION\s*=\s*"([^"]+)"', remote_content)
+        if not match:
+            return False
+        remote_version = match.group(1)
+
+        try:
+            from packaging import version as pv
+            needs_update = pv.parse(remote_version) > pv.parse(SCRIPT_VERSION)
+        except ImportError:
+            needs_update = remote_version != SCRIPT_VERSION
+
+        if not needs_update:
+            # Even if versions match, check hash for hotfixes
+            current_path = Path(sys.argv[0]).resolve()
+            local_hash = hashlib.sha256(current_path.read_bytes()).hexdigest()
+            remote_hash = hashlib.sha256(remote_content.encode('utf-8')).hexdigest()
+            if local_hash != remote_hash:
+                print(f"[UPDATE] Same version ({SCRIPT_VERSION}) but content differs — applying hotfix...")
+                needs_update = True
+
+        if needs_update:
+            print(f"[UPDATE] New version available: {remote_version} (current: {SCRIPT_VERSION})")
+            current_path = Path(sys.argv[0]).resolve()
+            backup = current_path.with_suffix('.py.bak')
+            shutil.copy2(current_path, backup)
+            current_path.write_text(remote_content, encoding='utf-8')
+            print(f"[UPDATE] Updated to v{remote_version}. Restarting...")
+            os.execv(sys.executable, [sys.executable, str(current_path)] + sys.argv[1:])
+            return True
+
+        return False
+
+    except Exception as e:
+        print(f"[WARNING] Auto-update check failed: {e}")
+        return False
+
+
+# ============================================================================
+# SYSTEM INFO MODULE
+# ============================================================================
+def run_system_info():
+    """Gather basic system information."""
+    logger.info("Gathering system information...")
+    result = {
+        "Status": "PASS",
+        "Hostname": platform.node(),
+        "OS": platform.mac_ver()[0],
+        "Build": platform.mac_ver()[2],
+    }
+
+    # Model
+    try:
+        model = subprocess.run(["sysctl", "-n", "hw.model"], capture_output=True, text=True, check=True).stdout.strip()
+        result["Model"] = model
+    except Exception:
+        result["Model"] = "Unknown"
+
+    # CPU
+    try:
+        cpu = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True, check=True).stdout.strip()
+        cores = subprocess.run(["sysctl", "-n", "hw.physicalcpu"], capture_output=True, text=True, check=True).stdout.strip()
+        threads = subprocess.run(["sysctl", "-n", "hw.logicalcpu"], capture_output=True, text=True, check=True).stdout.strip()
+        result["CPU"] = f"{cpu} ({cores} cores / {threads} threads)"
+    except Exception:
+        result["CPU"] = "Unknown"
+
+    # RAM
+    try:
+        mem_bytes = int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, check=True).stdout.strip())
+        result["RAM_GB"] = round(mem_bytes / (1024 ** 3), 1)
+    except Exception:
+        result["RAM_GB"] = "Unknown"
+
+    # Serial
+    try:
+        serial = subprocess.run(["system_profiler", "SPHardwareDataType", "-json"], capture_output=True, text=True, check=True).stdout.strip()
+        data = json.loads(serial)
+        sp = data.get("SPHardwareDataType", [{}])[0]
+        result["SerialNumber"] = sp.get("serial_number", "Unknown")
+        result["Manufacturer"] = "Apple"
+        result["ModelName"] = sp.get("machine_model", "Unknown")
+    except Exception:
+        result["SerialNumber"] = "Unknown"
+        result["Manufacturer"] = "Apple"
+        result["ModelName"] = "Unknown"
+
+    # Boot time / uptime
+    try:
+        boot_time = int(subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True, text=True, check=True).stdout.strip().split("{")[1].split("}")[0].split("sec = ")[1].split(",")[0].strip())
+        uptime_seconds = int(time.time()) - boot_time
+        uptime_days = round(uptime_seconds / 86400, 1)
+        result["UptimeDays"] = uptime_days
+        result["LastBoot"] = datetime.fromtimestamp(boot_time).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        result["UptimeDays"] = "Unknown"
+        result["LastBoot"] = "Unknown"
+
+    # Battery (if applicable)
+    try:
+        bat = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True)
+        if bat.returncode == 0 and "Battery" in bat.stdout:
+            lines = bat.stdout.strip().split('\n')
+            for line in lines:
+                if "%;" in line:
+                    pct = line.split("%;")[0].split()[-1] + "%"
+                    result["Battery"] = pct
+                    break
+    except Exception:
+        pass
+
+    # FileVault status
+    try:
+        fv = subprocess.run(["fdesetup", "status"], capture_output=True, text=True, check=True)
+        fv_out = fv.stdout.strip()
+        if "FileVault is On" in fv_out:
+            result["FileVault"] = "On"
+        elif "FileVault is Off" in fv_out:
+            result["FileVault"] = "Off"
+        else:
+            result["FileVault"] = fv_out
+    except Exception:
+        result["FileVault"] = "Unknown"
+
+    # Network adapters
+    result["NetworkAdapters"] = []
+    try:
+        iface = subprocess.run(["ifconfig"], capture_output=True, text=True, check=True).stdout
+        current = {}
+        for line in iface.split('\n'):
+            if line.startswith('\\t') or line.startswith('    '):
+                if 'inet ' in line and 'netmask' in line:
+                    ip = line.split('inet ')[1].split()[0]
+                    current['IPv4'] = ip
+                if 'ether ' in line:
+                    current['MAC'] = line.split('ether ')[1].split()[0]
+            elif ':' in line and not line.startswith(' '):
+                if current and current.get('IPv4'):
+                    result["NetworkAdapters"].append(current)
+                current = {"Name": line.split(':')[0], "IPv4": "", "MAC": "", "Gateway": "", "DNS": ""}
+        if current and current.get('IPv4'):
+            result["NetworkAdapters"].append(current)
+    except Exception:
+        pass
+
+    return result
+
+
+# ============================================================================
+# DISK HEALTH MODULE
+# ============================================================================
+def run_disk_health():
+    """Check disk health, usage, and SMART if smartmontools is installed."""
+    logger.info("Checking disk health...")
+    result = {"Status": "PASS", "Disks": [], "Volumes": []}
+
+    # Disk info via diskutil
+    try:
+        disk_list = json.loads(subprocess.run(["diskutil", "list", "-json"], capture_output=True, text=True, check=True).stdout)
+        for disk in disk_list.get("AllDisksAndPartitions", []):
+            disk_id = disk.get("DeviceIdentifier", "unknown")
+            size = disk.get("Size", 0)
+            size_gb = round(size / (1024 ** 3), 1) if size else "?"
+            try:
+                info = json.loads(subprocess.run(["diskutil", "info", "-json", disk_id], capture_output=True, text=True, check=True).stdout)
+                di = info.get("Disk", {})
+                result["Disks"].append({
+                    "Name": disk_id,
+                    "Type": di.get("SolidState", False) and "SSD" or "HDD",
+                    "SizeGB": size_gb,
+                    "Protocol": di.get("Protocol", "Unknown"),
+                    " SMART": "N/A"
+                })
+            except Exception:
+                result["Disks"].append({"Name": disk_id, "Type": "?", "SizeGB": size_gb, "Protocol": "?", " SMART": "N/A"})
+    except Exception as e:
+        result["Status"] = "WARNING"
+        result["Error"] = str(e)
+
+    # Volumes
+    try:
+        df = subprocess.run(["df", "-h"], capture_output=True, text=True, check=True).stdout
+        for line in df.split('\n')[1:]:
+            parts = line.split()
+            if len(parts) >= 9:
+                filesystem = parts[0]
+                # Skip virtual filesystems
+                if filesystem in ("devfs", "map", "com.apple") or filesystem.startswith("com.apple"):
+                    continue
+                size = parts[1]
+                used = parts[2]
+                avail = parts[3]
+                pct_str = parts[4]
+                mount = parts[8]
+                try:
+                    pct = int(pct_str.replace('%', ''))
+                except ValueError:
+                    pct = 0
+                warning = pct > 85
+                result["Volumes"].append({
+                    "Filesystem": filesystem,
+                    "Mount": mount,
+                    "Size": size,
+                    "Used": used,
+                    "Avail": avail,
+                    "UsedPercent": pct,
+                    "Warning": warning
+                })
+                if warning:
+                    result["Status"] = "WARNING"
+    except Exception as e:
+        logger.error(f"Disk volume check failed: {e}")
+
+    # SMART via smartmontools (optional)
+    smart_path = shutil.which("smartctl")
+    if smart_path:
+        try:
+            for disk in result["Disks"]:
+                disk_id = disk["Name"]
+                smart = subprocess.run([smart_path, "-a", f"/dev/{disk_id}"], capture_output=True, text=True)
+                if smart.returncode in (0, 2):
+                    # Parse SMART for overall health
+                    if "PASSED" in smart.stdout:
+                        disk["SMART"] = "PASSED"
+                    elif "FAILED" in smart.stdout:
+                        disk["SMART"] = "FAILED"
+                        result["Status"] = "WARNING"
+                    else:
+                        disk["SMART"] = "Unknown"
+        except Exception:
+            pass
+    else:
+        result["SMARTNote"] = "smartmontools not installed. Install via 'brew install smartmontools' for detailed SMART data."
+
+    return result
+
+
+# ============================================================================
+# SOFTWARE UPDATES MODULE
+# ============================================================================
+def run_software_updates():
+    """Check for pending macOS and optionally Homebrew updates."""
+    logger.info("Checking for software updates...")
+    result = {"Status": "PASS", "PendingCount": 0, "Updates": [], "RebootRequired": False}
+
+    try:
+        updates = subprocess.run(["softwareupdate", "-l"], capture_output=True, text=True)
+        out = updates.stdout + updates.stderr
+
+        # Parse recommended updates
+        recommended = []
+        in_section = False
+        for line in out.split('\n'):
+            if "Recommended\\s*" in line or "Recommended" in line:
+                in_section = True
+                continue
+            if in_section and line.strip().startswith("*"):
+                recommended.append(line.strip().lstrip("* ").strip())
+            elif in_section and not line.strip():
+                break
+
+        if recommended:
+            for upd in recommended:
+                result["Updates"].append({"Title": upd, "IsImportant": True})
+            result["PendingCount"] = len(recommended)
+            result["Status"] = "WARNING"
+        else:
+            # Check for no updates available
+            if "No new software available" in out or "No updates available" in out:
+                result["PendingCount"] = 0
+            else:
+                result["PendingCount"] = 0  # Assume none if we can't parse
+
+        # Reboot required?
+        if "restart" in out.lower() or "reboot" in out.lower():
+            result["RebootRequired"] = True
+
+    except Exception as e:
+        result["Status"] = "ERROR"
+        result["Error"] = str(e)
+
+    # Homebrew check (optional)
+    if shutil.which("brew"):
+        try:
+            brew = subprocess.run(["brew", "outdated"], capture_output=True, text=True)
+            if brew.stdout.strip():
+                brew_packages = brew.stdout.strip().split('\n')
+                result["HomebrewUpdates"] = len(brew_packages)
+                result["Status"] = "WARNING" if result["Status"] != "ERROR" else result["Status"]
+        except Exception:
+            pass
+
+    return result
+
+
+# ============================================================================
+# BACKUP MODULE (iDrive + Time Machine)
+# ============================================================================
+def run_backup_check():
+    """Check iDrive and/or Time Machine backup status."""
+    logger.info("Checking backup status...")
+    result = {
+        "Status": "PASS",
+        "iDrive": {"Installed": False},
+        "TimeMachine": {"Configured": False}
+    }
+
+    # iDrive check
+    idrive_app = Path("/Applications/iDrive.app")
+    if idrive_app.exists():
+        result["iDrive"]["Installed"] = True
+        # Try to find iDrive service or status
+        try:
+            ps = subprocess.run(["pgrep", "-f", "iDrive"], capture_output=True, text=True)
+            result["iDrive"]["Running"] = ps.returncode == 0 and ps.stdout.strip() != ""
+        except Exception:
+            result["iDrive"]["Running"] = False
+
+        # Try to read iDrive logs or status
+        # iDrive on macOS stores logs in ~/Library/Application Support/iDrive
+        user_home = Path.home()
+        idrive_logs = user_home / "Library/Application Support/iDrive"
+        if idrive_logs.exists():
+            result["iDrive"]["LogPath"] = str(idrive_logs)
+            # Look for the most recent backup timestamp in log files
+            latest = 0
+            for log_file in idrive_logs.glob("*.log"):
+                try:
+                    mtime = log_file.stat().st_mtime
+                    if mtime > latest:
+                        latest = mtime
+                except Exception:
+                    pass
+            if latest:
+                result["iDrive"]["LastLog"] = datetime.fromtimestamp(latest).strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        result["iDrive"]["Installed"] = False
+
+    # Time Machine check
+    try:
+        tm = subprocess.run(["tmutil", "latestbackup"], capture_output=True, text=True)
+        if tm.returncode == 0 and tm.stdout.strip():
+            result["TimeMachine"]["Configured"] = True
+            path = tm.stdout.strip()
+            result["TimeMachine"]["LastBackupPath"] = path
+            # Extract date from path (e.g., /Volumes/.../2026-05-01-123456/Macintosh HD)
+            match = re.search(r'(\\d{4}-\\d{2}-\\d{2}-\\d{6})', path)
+            if match:
+                dt_str = match.group(1)
+                result["TimeMachine"]["LastBackupDate"] = datetime.strptime(dt_str, "%Y-%m-%d-%H%M%S").strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                result["TimeMachine"]["LastBackupDate"] = "Unknown"
+
+            # Check destination
+            dest = subprocess.run(["tmutil", "destinationinfo"], capture_output=True, text=True)
+            if dest.returncode == 0:
+                result["TimeMachine"]["Destinations"] = dest.stdout.strip()
+        else:
+            result["TimeMachine"]["Configured"] = False
+    except Exception as e:
+        result["TimeMachine"]["Configured"] = False
+        result["TimeMachine"]["Error"] = str(e)
+
+    # Determine overall status
+    if not result["iDrive"].get("Installed") and not result["TimeMachine"].get("Configured"):
+        result["Status"] = "WARNING"
+    elif result["TimeMachine"].get("Configured"):
+        # Check if backup is old (> 7 days)
+        try:
+            last = result["TimeMachine"].get("LastBackupDate", "")
+            if last and last != "Unknown":
+                last_dt = datetime.strptime(last, "%Y-%m-%d %H:%M:%S")
+                days_since = (datetime.now() - last_dt).days
+                if days_since > 7:
+                    result["Status"] = "WARNING"
+                    result["TimeMachine"]["DaysSince"] = days_since
+        except Exception:
+            pass
+
+    return result
+
+
+# ============================================================================
+# MALWAREBYTES MODULE
+# ============================================================================
+def run_malwarebytes_check():
+    """Check Malwarebytes for Mac status."""
+    logger.info("Checking Malwarebytes...")
+    result = {"Status": "PASS", "Installed": False}
+
+    # Check for Malwarebytes app
+    mb_app = Path("/Applications/Malwarebytes.app")
+    if not mb_app.exists():
+        mb_app = Path("/Applications/Malwarebytes Endpoint Protection.app")
+
+    if mb_app.exists():
+        result["Installed"] = True
+        result["ProductType"] = mb_app.name
+
+        # Check if service is running
+        try:
+            ps = subprocess.run(["pgrep", "-f", "Malwarebytes"], capture_output=True, text=True)
+            result["ServiceRunning"] = ps.returncode == 0 and ps.stdout.strip() != ""
+        except Exception:
+            result["ServiceRunning"] = False
+
+        if not result["ServiceRunning"]:
+            result["Status"] = "WARNING"
+    else:
+        result["Status"] = "INFO"
+        result["Note"] = "Malwarebytes not installed on this Mac."
+
+    return result
+
+
+# ============================================================================
+# XPROTECT / GATEKEEPER MODULE (replaces Windows Defender)
+# ============================================================================
+def run_security_check():
+    """Check macOS security: Gatekeeper, XProtect, SIP."""
+    logger.info("Checking macOS security status...")
+    result = {"Status": "PASS", "Gatekeeper": "Unknown", "XProtect": "Unknown", "SIP": "Unknown"}
+
+    # Gatekeeper
+    try:
+        gk = subprocess.run(["spctl", "--status"], capture_output=True, text=True)
+        if "assessments enabled" in gk.stdout:
+            result["Gatekeeper"] = "Enabled"
+        elif "disabled" in gk.stdout:
+            result["Gatekeeper"] = "Disabled"
+            result["Status"] = "WARNING"
+        else:
+            result["Gatekeeper"] = gk.stdout.strip()
+    except Exception:
+        pass
+
+    # XProtect version
+    try:
+        xp = subprocess.run(["system_profiler", "SPInstallHistoryDataType", "-json"], capture_output=True, text=True)
+        if xp.returncode == 0:
+            data = json.loads(xp.stdout)
+            for item in data.get("SPInstallHistoryDataType", []):
+                if "XProtect" in item.get("package_id", ""):
+                    result["XProtect"] = item.get("package_version", "Unknown")
+                    result["XProtectInstallDate"] = item.get("install_date", "Unknown")
+                    break
+    except Exception:
+        pass
+
+    # SIP (System Integrity Protection)
+    try:
+        sip = subprocess.run(["csrutil", "status"], capture_output=True, text=True)
+        if "enabled" in sip.stdout.lower():
+            result["SIP"] = "Enabled"
+        elif "disabled" in sip.stdout.lower():
+            result["SIP"] = "Disabled"
+            result["Status"] = "WARNING"
+        else:
+            result["SIP"] = sip.stdout.strip()
+    except Exception:
+        pass
+
+    return result
+
+
+# ============================================================================
+# LOG ERRORS MODULE
+# ============================================================================
+def run_log_errors(hours=24):
+    """Check unified logs for critical/error entries."""
+    logger.info("Checking system logs for errors...")
+    result = {"Status": "PASS", "HoursChecked": hours, "TotalEvents": 0, "Events": []}
+
+    try:
+        # macOS unified logging is complex. We'll look for kernel panics, crash reports,
+        # and specific subsystem errors using log show with a predicate
+        since = (datetime.now() - __import__('datetime').timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+
+        cmd = [
+            "log", "show",
+            "--predicate", '(eventType == logEvent) && (messageType == error)',
+            "--since", since,
+            "--style", "json"
+        ]
+        log_out = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if log_out.returncode == 0 and log_out.stdout.strip():
+            try:
+                log_data = json.loads(log_out.stdout)
+                for entry in log_data.get("predicate", {}).get("events", []):
+                    msg = entry.get("eventMessage", "")
+                    subsys = entry.get("subsystem", "")
+                    ts = entry.get("timestamp", "")
+                    result["Events"].append({
+                        "Time": ts,
+                        "Subsystem": subsys,
+                        "Message": msg[:200]
+                    })
+            except json.JSONDecodeError:
+                # Fall back to text parsing
+                lines = log_out.stdout.split('\n')
+                for line in lines:
+                    if line.strip():
+                        result["Events"].append({"Time": "?", "Subsystem": "?", "Message": line[:200]})
+
+        result["TotalEvents"] = len(result["Events"])
+        if result["TotalEvents"] > 0:
+            result["Status"] = "WARNING"
+
+        # Also check for crash reports
+        crash_reports_dir = Path("~/Library/Logs/DiagnosticReports").expanduser()
+        if crash_reports_dir.exists():
+            recent_crashes = []
+            for f in crash_reports_dir.iterdir():
+                if f.is_file() and f.stat().st_mtime > time.time() - (hours * 3600):
+                    recent_crashes.append(f.name)
+            if recent_crashes:
+                result["CrashReports"] = recent_crashes[:5]
+                if result["Status"] != "ERROR":
+                    result["Status"] = "WARNING"
+
+    except Exception as e:
+        result["Status"] = "ERROR"
+        result["Error"] = str(e)
+        result["Note"] = "Unified logging requires macOS 10.12+ and may fail on older systems."
+
+    return result
+
+
+# ============================================================================
+# PENDING REBOOT MODULE
+# ============================================================================
+def run_pending_reboot():
+    """Check if a reboot is pending (e.g. from pending software updates)."""
+    logger.info("Checking for pending reboot...")
+    result = {"Status": "PASS", "RebootRequired": False, "UptimeDays": 0, "UptimeWarning": False}
+
+    try:
+        boot_time = int(subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True, text=True, check=True).stdout.strip().split("{")[1].split("}")[0].split("sec = ")[1].split(",")[0].strip())
+        uptime_seconds = int(time.time()) - boot_time
+        uptime_days = round(uptime_seconds / 86400, 1)
+        result["UptimeDays"] = uptime_days
+        if uptime_days > 30:
+            result["UptimeWarning"] = True
+            result["Status"] = "WARNING"
+
+        # Check for pending update reboot
+        try:
+            pending = subprocess.run(["defaults", "read", "/Library/Preferences/com.apple.SoftwareUpdate", "RecommendedUpdates"], capture_output=True, text=True)
+            if pending.returncode == 0 and pending.stdout.strip():
+                result["RebootRequired"] = result.get("RebootRequired", False) or True
+        except Exception:
+            pass
+
+        # Check for flag file indicating reboot needed
+        for flag in ["/var/db/.AppleSetupDone", "/var/db/receipts/.pkg.rebootRequired"]:
+            if os.path.exists(flag):
+                result["RebootRequired"] = True
+
+    except Exception as e:
+        result["Status"] = "ERROR"
+        result["Error"] = str(e)
+
+    return result
+
+
+# ============================================================================
+# FIREWALL MODULE
+# ============================================================================
+def run_firewall_check():
+    """Check macOS application firewall status."""
+    logger.info("Checking firewall status...")
+    result = {"Status": "PASS", "Enabled": False}
+
+    try:
+        fw = subprocess.run(["defaults", "read", "/Library/Preferences/com.apple.alf", "globalstate"], capture_output=True, text=True)
+        if fw.returncode == 0:
+            state = fw.stdout.strip()
+            if state == "1":
+                result["Enabled"] = True
+                result["Mode"] = "Allow essential services"
+            elif state == "2":
+                result["Enabled"] = True
+                result["Mode"] = "Block all incoming connections"
+            elif state == "0":
+                result["Enabled"] = False
+                result["Status"] = "WARNING"
+            else:
+                result["Enabled"] = state
+        else:
+            result["Status"] = "ERROR"
+    except Exception as e:
+        result["Status"] = "ERROR"
+        result["Error"] = str(e)
+
+    return result
+
+
+# ============================================================================
+# USER ACCOUNTS MODULE
+# ============================================================================
+def run_user_accounts():
+    """Audit user accounts."""
+    logger.info("Auditing user accounts...")
+    result = {"Status": "PASS", "Accounts": [], "AdminCount": 0, "EnabledCount": 0, "FlaggedCount": 0, "FlaggedAccounts": []}
+
+    try:
+        # Get list of local users
+        users = subprocess.run(["dscl", ".", "list", "/Users"], capture_output=True, text=True, check=True).stdout.strip().split('\n')
+        
+        for user in users:
+            user = user.strip()
+            if user.startswith('_') or user in ('daemon', 'nobody', 'root', 'Guest'):
+                continue  # System accounts
+            
+            try:
+                user_info = subprocess.run(["dscl", ".", "read", f"/Users/{user}"], capture_output=True, text=True)
+                info = user_info.stdout
+                
+                is_admin = "admin" in info.lower()
+                if is_admin:
+                    result["AdminCount"] += 1
+                result["EnabledCount"] += 1
+                
+                acct = {"Name": user, "IsAdmin": is_admin, "UID": "?"}
+                
+                # Check last login (requires last command)
+                try:
+                    last = subprocess.run(["last", user], capture_output=True, text=True)
+                    if last.stdout.strip():
+                        lines = last.stdout.strip().split('\n')
+                        first = lines[0]
+                        acct["LastLogin"] = first[:50]
+                except Exception:
+                    acct["LastLogin"] = "?"
+                
+                result["Accounts"].append(acct)
+                
+                # Flag if admin and no last login info (suspicious but not actionable)
+                if is_admin and acct.get("LastLogin", "?") == "?":
+                    pass  # Not necessarily a concern for Mac
+
+            except Exception:
+                pass
+
+    except Exception as e:
+        result["Status"] = "ERROR"
+        result["Error"] = str(e)
+
+    return result
+
+
+# ============================================================================
+# TEMP FILES MODULE
+# ============================================================================
+def run_temp_files():
+    """Check temp and cache directories."""
+    logger.info("Checking temp and cache files...")
+    result = {"Status": "PASS", "Directories": []}
+
+    dirs_to_check = [
+        ("/tmp", "System temp"),
+        ("/var/tmp", "Var temp"),
+        (str(Path.home() / "Library/Caches"), "User caches"),
+    ]
+
+    # Browser caches
+    for browser in ["Google/Chrome", "Safari", "Firefox"]:
+        cache_dir = Path.home() / "Library/Caches" / browser
+        if cache_dir.exists():
+            dirs_to_check.append((str(cache_dir), f"{browser} cache"))
+
+    for dpath, label in dirs_to_check:
+        try:
+            if os.path.exists(dpath):
+                total_size = 0
+                file_count = 0
+                for root, dirs, files in os.walk(dpath):
+                    for f in files:
+                        try:
+                            fp = os.path.join(root, f)
+                            total_size += os.path.getsize(fp)
+                            file_count += 1
+                        except OSError:
+                            pass
+                size_mb = round(total_size / (1024 * 1024), 1)
+                warning = size_mb > 1024  # > 1 GB
+                result["Directories"].append({
+                    "Path": dpath,
+                    "Label": label,
+                    "SizeMB": size_mb,
+                    "FileCount": file_count,
+                    "Warning": warning
+                })
+                if warning and result["Status"] != "ERROR":
+                    result["Status"] = "WARNING"
+        except Exception:
+            pass
+
+    return result
+
+
+# ============================================================================
+# STARTUP / LOGIN ITEMS MODULE
+# ============================================================================
+def run_startup_check():
+    """Check login items and LaunchAgents."""
+    logger.info("Checking startup/login items...")
+    result = {"Status": "PASS", "LoginItems": [], "LaunchAgents": [], "LaunchDaemons": []}
+
+    # Login items (modern macOS)
+    try:
+        # Use osascript to query login items (macOS 13+)
+        script = 'tell application "System Events" to get the name of every login item'
+        login = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+        if login.returncode == 0 and login.stdout.strip():
+            for item in login.stdout.strip().split(', '):
+                result["LoginItems"].append({"Name": item.strip()})
+    except Exception:
+        pass
+
+    # LaunchAgents (user)
+    user_agents = Path.home() / "Library/LaunchAgents"
+    if user_agents.exists():
+        for f in user_agents.iterdir():
+            if f.suffix == ".plist":
+                result["LaunchAgents"].append({"Name": f.name, "Path": str(f)})
+
+    # LaunchDaemons (system)
+    sys_daemons = Path("/Library/LaunchDaemons")
+    if sys_daemons.exists():
+        for f in sys_daemons.iterdir():
+            if f.suffix == ".plist":
+                result["LaunchDaemons"].append({"Name": f.name, "Path": str(f)})
+
+    return result
+
+
+# ============================================================================
+# SCHEDULED TASKS MODULE
+# ============================================================================
+def run_scheduled_tasks():
+    """Check LaunchAgent/LaunchDaemon schedules."""
+    logger.info("Checking scheduled tasks...")
+    result = {"Status": "PASS", "Tasks": []}
+
+    # Only check known plist directories – much faster than `launchctl list`
+    # which enumerates hundreds of system services
+    search_dirs = [
+        Path.home() / "Library/LaunchAgents",
+        Path("/Library/LaunchAgents"),
+        Path("/Library/LaunchDaemons"),
+    ]
+
+    seen = set()
+    for d in search_dirs:
+        if d.is_dir():
+            for plist in d.glob("*.plist"):
+                try:
+                    label = plist.stem
+                    if label in seen:
+                        continue
+                    seen.add(label)
+                    # Quick check: is this our maintenance agent?
+                    is_ours = "pcmasterclass" in label.lower()
+                    result["Tasks"].append({
+                        "Label": label,
+                        "Status": "External" if not is_ours else "Ours",
+                        "Path": str(plist)
+                    })
+                except Exception:
+                    pass
+
+    # Also verify our agent is actually loaded
+    ours_found = any("pcmasterclass" in t["Label"].lower() for t in result["Tasks"])
+    if not ours_found:
+        result["Tasks"].append({
+            "Label": "com.pcmasterclass.maintenance.agent (not found in search dirs)",
+            "Status": "NOT_INSTALLED",
+            "Path": ""
+        })
+
+    return result
+
+
+# ============================================================================
+# BROWSER EXTENSIONS MODULE
+# ============================================================================
+def run_browser_extensions():
+    """Check Chrome extensions. Safari extensions are harder to list programmatically."""
+    logger.info("Checking browser extensions...")
+    result = {"Status": "PASS", "ChromeExtensions": [], "SafariExtensions": []}
+
+    # Chrome extensions
+    chrome_ext_dir = Path.home() / "Library/Application Support/Google/Chrome/Default/Extensions"
+    if chrome_ext_dir.exists():
+        for ext_id in chrome_ext_dir.iterdir():
+            if ext_id.is_dir():
+                try:
+                    # Find version folder
+                    versions = [v for v in ext_id.iterdir() if v.is_dir()]
+                    if versions:
+                        latest = sorted(versions)[-1]
+                        manifest = latest / "manifest.json"
+                        if manifest.exists():
+                            data = json.loads(manifest.read_text())
+                            name = data.get("name", ext_id.name)
+                            result["ChromeExtensions"].append({"ID": ext_id.name, "Name": name})
+                except json.JSONDecodeError:
+                    pass
+                except Exception:
+                    pass
+
+    return result
+
+
+# ============================================================================
+# SERVICE STATUS MODULE
+# ============================================================================
+def run_service_status():
+    """Check key macOS services via launchctl."""
+    logger.info("Checking service status...")
+    result = {"Status": "PASS", "Services": []}
+
+    key_services = [
+        "com.apple.WindowServer",
+        "com.apple.metadata.mds",
+        "com.apple.systempreferences",
+        "com.apple.audio.coreaudiod",
+        "com.apple.blued",  # Bluetooth
+    ]
+
+    for svc in key_services:
+        try:
+            status = subprocess.run(["launchctl", "list", svc], capture_output=True, text=True)
+            if status.returncode == 0:
+                result["Services"].append({"Name": svc, "Running": True})
+            else:
+                result["Services"].append({"Name": svc, "Running": False})
+        except Exception:
+            result["Services"].append({"Name": svc, "Running": False})
+
+    return result
+
+
+# ============================================================================
+# NETWORK CONFIG MODULE
+# ============================================================================
+def run_network_config():
+    """Check network configuration."""
+    logger.info("Checking network configuration...")
+    result = {"Status": "PASS", "Interfaces": [], "WiFi": "", "DNS": []}
+
+    try:
+        # Get active interfaces
+        route = subprocess.run(["netstat", "-rn"], capture_output=True, text=True, check=True).stdout
+        for line in route.split('\n'):
+            if line.startswith('default') :
+                parts = line.split()
+                if len(parts) >= 2:
+                    result["DefaultGateway"] = parts[1]
+                    break
+
+        # DNS
+        dns = subprocess.run(["scutil", "--dns"], capture_output=True, text=True, check=True).stdout
+        for line in dns.split('\n'):
+            if "nameserver" in line:
+                ip = line.split()[-1].strip()
+                if ip not in result["DNS"]:
+                    result["DNS"].append(ip)
+
+        # WiFi
+        try:
+            wifi = subprocess.run(["/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport", "-I"], capture_output=True, text=True)
+            if wifi.returncode == 0:
+                for line in wifi.stdout.split('\n'):
+                    if " SSID" in line:
+                        result["WiFi"] = line.split(":")[-1].strip()
+        except Exception:
+            pass
+
+    except Exception as e:
+        result["Status"] = "WARNING"
+        result["Error"] = str(e)
+
+    return result
+
+
+# ============================================================================
+# HTML REPORT GENERATOR
+# ============================================================================
+def generate_html_report(results, client_name="", script_version=SCRIPT_VERSION):
+    """Generate a branded HTML maintenance report matching the PC version style."""
+    
+    hostname = platform.node()
+    os_ver = platform.mac_ver()[0]
+    now = datetime.now().strftime("%A, %d %B %Y %I:%M %p")
+    
+    # Count warnings and errors
+    warning_count = sum(1 for r in results.values() if isinstance(r, dict) and r.get("Status") == "WARNING")
+    error_count = sum(1 for r in results.values() if isinstance(r, dict) and r.get("Status") == "ERROR")
+    
+    if error_count > 0:
+        overall_status = "Errors Found"
+        overall_color = "#dc2626"
+    elif warning_count > 0:
+        overall_status = "Warnings Found"
+        overall_color = "#d97706"
+    else:
+        overall_status = "All Clear"
+        overall_color = "#16a34a"
+    overall_badge = f'<span style="background:{overall_color};color:white;padding:4px 12px;border-radius:4px;font-weight:bold;font-size:0.9em;">{overall_status}</span>'
+    
+    def status_badge(status):
+        colors = {"PASS": "#16a34a", "CLEAN": "#16a34a", "UP TO DATE": "#16a34a", "REPAIRED": "#16a34a",
+                  "WARNING": "#d97706", "INFO": "#3b82f6", "ERROR": "#dc2626", "SKIPPED": "#94a3b8"}
+        color = colors.get(status, "#94a3b8")
+        return f'<span style="background:{color};color:white;padding:2px 8px;border-radius:4px;font-size:0.8em;font-weight:bold;">{status}</span>'
+    
+    def heading_class(status):
+        classes = {"PASS": "heading-ok", "CLEAN": "heading-ok", "UP TO DATE": "heading-ok",
+                   "WARNING": "heading-warn", "ERROR": "heading-error"}
+        return classes.get(status, "heading-info")
+    
+    # Build summary items
+    summary_items = [
+        ("disk", "Disk Health", results.get("DiskHealth", {}).get("Status", "INFO")),
+        ("updates", "Software Updates", results.get("SoftwareUpdates", {}).get("Status", "INFO")),
+        ("backup", "Backup Status", results.get("Backup", {}).get("Status", "INFO")),
+        ("malwarebytes", "Malwarebytes", results.get("Malwarebytes", {}).get("Status", "INFO")),
+        ("security", "macOS Security", results.get("Security", {}).get("Status", "INFO")),
+        ("logs", "System Log Errors", results.get("LogErrors", {}).get("Status", "INFO")),
+        ("reboot", "Pending Reboot", results.get("PendingReboot", {}).get("Status", "INFO")),
+        ("firewall", "Firewall", results.get("Firewall", {}).get("Status", "INFO")),
+        ("users", "User Accounts", results.get("UserAccounts", {}).get("Status", "INFO")),
+        ("temp", "Temp/Cache Files", results.get("TempFiles", {}).get("Status", "INFO")),
+        ("startup", "Startup/Login Items", results.get("Startup", {}).get("Status", "INFO")),
+        ("tasks", "Scheduled Tasks", results.get("ScheduledTasks", {}).get("Status", "INFO")),
+        ("extensions", "Browser Extensions", results.get("BrowserExtensions", {}).get("Status", "INFO")),
+        ("services", "Service Status", results.get("ServiceStatus", {}).get("Status", "INFO")),
+        ("network", "Network Config", results.get("NetworkConfig", {}).get("Status", "INFO")),
+    ]
+    
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Maintenance Report — {hostname}</title>
+<style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f1f5f9; color: #1e293b; line-height: 1.5; padding: 20px; }}
+    .container {{ max-width: 900px; margin: 0 auto; }}
+    .header {{ background: linear-gradient(135deg, #1e3a5f 0%, #2d5a87 100%); color: white; padding: 30px; border-radius: 12px 12px 0 0; }}
+    .header h1 {{ font-size: 1.5em; margin-bottom: 5px; }}
+    .header .subtitle {{ opacity: 0.8; font-size: 0.9em; }}
+    .header .overall {{ margin-top: 15px; font-size: 1.1em; }}
+    .section {{ background: white; border: 1px solid #e2e8f0; margin-bottom: 2px; padding: 20px 25px; }}
+    .section:last-child {{ border-radius: 0 0 12px 12px; margin-bottom: 20px; }}
+    .section h2 {{ font-size: 1.1em; color: #334155; margin-bottom: 10px; display: flex; align-items: center; gap: 10px; }}
+    .section h2 .icon {{ font-size: 1.3em; }}
+    table {{ width: 100%; border-collapse: collapse; margin: 10px 0; font-size: 0.9em; }}
+    th {{ background: #f8fafc; text-align: left; padding: 8px 12px; border-bottom: 2px solid #e2e8f0; color: #64748b; font-weight: 600; }}
+    td {{ padding: 8px 12px; border-bottom: 1px solid #f1f5f9; }}
+    tr:hover td {{ background: #f8fafc; }}
+    .flagged {{ background: #fef2f2 !important; }}
+    .detail {{ color: #64748b; font-size: 0.85em; }}
+    .warning-text {{ color: #d97706; font-weight: 600; }}
+    .error-text {{ color: #dc2626; font-weight: 600; }}
+    .footer {{ text-align: center; color: #94a3b8; font-size: 0.8em; padding: 15px; }}
+    html {{ scroll-behavior: smooth; }}
+    .heading-ok {{ color: #16a34a; }}
+    .heading-warn {{ color: #d97706; }}
+    .heading-error {{ color: #dc2626; }}
+    .heading-info {{ color: #334155; }}
+    details summary {{ cursor: pointer; list-style: none; display: flex; align-items: center; gap: 10px; font-size: 1.1em; color: #334155; font-weight: bold; padding: 2px 0; }}
+    details summary::-webkit-details-marker {{ display: none; }}
+    details summary::before {{ content: '\\25B6'; font-size: 0.7em; transition: transform 0.2s ease; display: inline-block; min-width: 14px; }}
+    details[open] summary::before {{ transform: rotate(90deg); }}
+    details .section-body {{ padding-top: 10px; }}
+</style>
+</head>
+<body>
+<div class="container">
+
+<div class="header">
+    <h1>PC Master Class — Maintenance Report</h1>
+    <div class="subtitle">{client_name + ' • ' if client_name else ''}{hostname} • macOS {os_ver} • {now}</div>
+    <div class="overall">Overall Status: {overall_badge} &nbsp; ({warning_count} warning(s), {error_count} error(s))</div>
+</div>
+
+<!-- CHECK RESULTS SUMMARY -->
+<div class="section" style="padding:15px 25px;">
+    <h2 style="margin-bottom:8px;"><span class="icon">&#x1F4CB;</span> Check Results Summary</h2>
+    <table style="font-size:0.88em;">
+"""
+    
+    col = 0
+    for anchor, label, status in summary_items:
+        if col % 2 == 0:
+            html += "<tr>"
+        html += f"<td style='padding:4px 10px;width:50%;'><a href='#{anchor}' style='text-decoration:none;color:#1e40af;'>{label}</a></td><td style='padding:4px 6px;'>{status_badge(status)}</td>"
+        if col % 2 == 1:
+            html += "</tr>"
+        col += 1
+    if col % 2 == 1:
+        html += "<td></td><td></td></tr>"
+    html += "</table></div>"
+    
+    # SYSTEM INFO
+    sys = results.get("SystemInfo", {})
+    html += f"""
+<div class="section">
+    <h2><span class="icon">&#x1F4BB;</span> System Information</h2>
+    <table>
+        {"<tr><td><strong>Client</strong></td><td><strong style='font-size:1.1em;'>" + client_name + "</strong></td></tr>" if client_name else ""}
+        <tr><td><strong>Computer</strong></td><td>{sys.get("Hostname", hostname)}</td></tr>
+        <tr><td><strong>Make / Model</strong></td><td>{sys.get("Manufacturer", "Apple")} {sys.get("ModelName", "Unknown")} ({sys.get("Model", "")})</td></tr>
+        <tr><td><strong>Serial Number</strong></td><td>{sys.get("SerialNumber", "Unknown")}</td></tr>
+        <tr><td><strong>macOS</strong></td><td>{sys.get("OS", os_ver)} ({sys.get("Build", "")})</td></tr>
+        <tr><td><strong>CPU</strong></td><td>{sys.get("CPU", "Unknown")}</td></tr>
+        <tr><td><strong>RAM</strong></td><td>{sys.get("RAM_GB", "?")} GB</td></tr>
+        <tr><td><strong>FileVault</strong></td><td>{sys.get("FileVault", "Unknown")}</td></tr>
+        <tr><td><strong>Last Boot</strong></td><td>{sys.get("LastBoot", "?")} (Uptime: {sys.get("UptimeDays", "?")} days)</td></tr>
+        <tr><td><strong>Script Version</strong></td><td>v{script_version}</td></tr>
+    </table>
+</div>
+"""
+    
+    # DISK HEALTH
+    disk = results.get("DiskHealth", {})
+    disk_open = "" if disk.get("Status") in ("PASS", "CLEAN") else " open"
+    disk_class = heading_class(disk.get("Status", "INFO"))
+    html += f"""
+<div class="section" id="disk">
+<details{disk_open}><summary class="{disk_class}"><span class="icon">&#x1F4BE;</span> Disk Health {status_badge(disk.get("Status", "INFO"))}</summary>
+<div class="section-body">
+{"<p class='error-text'>Error: " + disk.get("Error", "") + "</p>" if disk.get("Status") == "ERROR" else ""}
+<table><tr><th>Disk</th><th>Type</th><th>Size</th><th>Health</th></tr>
+"""
+    for d in disk.get("Disks", []):
+        html += f"<tr><td>{d.get('Name', '')}</td><td>{d.get('Type', '')}</td><td>{d.get('SizeGB', '')} GB</td><td>{d.get(' SMART', 'N/A')}</td></tr>"
+    html += "</table>"
+    
+    if disk.get("Volumes"):
+        html += '<table><tr><th>Filesystem</th><th>Mount</th><th>Size</th><th>Used</th><th>Avail</th><th>Used %</th></tr>'
+        for v in disk["Volumes"]:
+            cls = " class='flagged'" if v.get("Warning") else ""
+            pct_text = f"<span class='warning-text'>{v.get('UsedPercent', 0)}% WARNING</span>" if v.get("Warning") else f"{v.get('UsedPercent', 0)}%"
+            html += f"<tr{cls}><td>{v.get('Filesystem', '')}</td><td>{v.get('Mount', '')}</td><td>{v.get('Size', '')}</td><td>{v.get('Used', '')}</td><td>{v.get('Avail', '')}</td><td>{pct_text}</td></tr>"
+        html += "</table>"
+    if disk.get("SMARTNote"):
+        html += f"<p class='detail'>{disk['SMARTNote']}</p>"
+    html += "</div></details></div>"
+
+    # SOFTWARE UPDATES
+    upd = results.get("SoftwareUpdates", {})
+    upd_open = "" if upd.get("Status") in ("PASS", "CLEAN") else " open"
+    upd_class = heading_class(upd.get("Status", "INFO"))
+    html += f"""
+<div class="section" id="updates">
+<details{upd_open}><summary class="{upd_class}"><span class="icon">&#x1F504;</span> Software Updates {status_badge(upd.get("Status", "INFO"))}</summary>
+<div class="section-body">
+"""
+    if upd.get("Status") == "SKIPPED":
+        html += "<p class='detail'>Skipped by configuration.</p>"
+    elif upd.get("PendingCount", 0) == 0:
+        html += "<p>No pending updates. System is up to date.</p>"
+    else:
+        html += f"<p>{upd.get('PendingCount', 0)} macOS update(s) available.</p><table><tr><th>Update</th></tr>"
+        for u in upd.get("Updates", []):
+            html += f"<tr><td>{u.get('Title', '')}</td></tr>"
+        html += "</table>"
+    if upd.get("HomebrewUpdates"):
+        html += f"<p class='detail'>{upd['HomebrewUpdates']} Homebrew package(s) outdated.</p>"
+    if upd.get("RebootRequired"):
+        html += "<p class='warning-text'>A restart is required to complete pending updates.</p>"
+    html += "</div></details></div>"
+
+    # BACKUP
+    bak = results.get("Backup", {})
+    bak_open = "" if bak.get("Status") in ("PASS", "CLEAN") else " open"
+    bak_class = heading_class(bak.get("Status", "INFO"))
+    html += f"""
+<div class="section" id="backup">
+<details{bak_open}><summary class="{bak_class}"><span class="icon">&#x2601;</span> Backup Status {status_badge(bak.get("Status", "INFO"))}</summary>
+<div class="section-body">
+"""
+    if bak.get("iDrive", {}).get("Installed"):
+        idr = bak["iDrive"]
+        html += f"""
+    <h3>iDrive</h3>
+    <table>
+        <tr><td><strong>Running</strong></td><td>{'Yes' if idr.get('Running') else '<span class="warning-text">No</span>'}</td></tr>
+        {"<tr><td><strong>Last Log</strong></td><td>" + idr.get('LastLog', '?') + "</td></tr>" if idr.get('LastLog') else ""}
+    </table>
+"""
+    else:
+        html += "<p class='detail'>iDrive not installed.</p>"
+
+    if bak.get("TimeMachine", {}).get("Configured"):
+        tm = bak["TimeMachine"]
+        html += f"""
+    <h3>Time Machine</h3>
+    <table>
+        <tr><td><strong>Last Backup</strong></td><td>{tm.get('LastBackupDate', 'Unknown')}</td></tr>
+        {"<tr><td><strong>Days Since</strong></td><td><span class='warning-text'>" + str(tm.get('DaysSince', '?')) + " days</span></td></tr>" if tm.get('DaysSince') else ""}
+        <tr><td><strong>Destinations</strong></td><td><pre>{tm.get('Destinations', 'N/A')}</pre></td></tr>
+    </table>
+"""
+    else:
+        html += "<p class='detail'>Time Machine not configured.</p>"
+
+    if bak.get("Status") == "WARNING":
+        html += "<p class='warning-text'>No backup solution detected or backup is stale.</p>"
+    html += "</div></details></div>"
+
+    # MALWAREBYTES
+    mb = results.get("Malwarebytes", {})
+    mb_open = "" if mb.get("Status") in ("PASS", "CLEAN") else " open"
+    mb_class = heading_class(mb.get("Status", "INFO"))
+    html += f"""
+<div class="section" id="malwarebytes">
+<details{mb_open}><summary class="{mb_class}"><span class="icon">&#x1F6E1;</span> Malwarebytes Endpoint Protection {status_badge(mb.get("Status", "INFO"))}</summary>
+<div class="section-body">
+"""
+    if mb.get("Installed"):
+        html += f"""
+    <table>
+        <tr><td><strong>Product</strong></td><td>{mb.get('ProductType', 'Unknown')}</td></tr>
+        <tr><td><strong>Service Running</strong></td><td>{'Yes' if mb.get('ServiceRunning') else '<span class="warning-text">No</span>'}</td></tr>
+    </table>
+"""
+    else:
+        html += f"<p class='detail'>{mb.get('Note', 'Malwarebytes not installed.')}</p>"
+    html += "</div></details></div>"
+
+    # MACOS SECURITY (replaces Windows Defender)
+    sec = results.get("Security", {})
+    sec_open = "" if sec.get("Status") in ("PASS", "CLEAN") else " open"
+    sec_class = heading_class(sec.get("Status", "INFO"))
+    html += f"""
+<div class="section" id="security">
+<details{sec_open}><summary class="{sec_class}"><span class="icon">&#x1F6E1;</span> macOS Security {status_badge(sec.get("Status", "INFO"))}</summary>
+<div class="section-body">
+    <table>
+        <tr><td><strong>Gatekeeper</strong></td><td>{sec.get('Gatekeeper', 'Unknown')}</td></tr>
+        <tr><td><strong>XProtect</strong></td><td>{sec.get('XProtect', 'Unknown')}</td></tr>
+        {"<tr><td><strong>XProtect Install Date</strong></td><td>" + str(sec.get('XProtectInstallDate', '')) + "</td></tr>" if sec.get('XProtectInstallDate') else ""}
+        <tr><td><strong>System Integrity Protection</strong></td><td>{sec.get('SIP', 'Unknown')}</td></tr>
+    </table>
+</div></details></div>
+"""
+
+    # LOG ERRORS
+    ev = results.get("LogErrors", {})
+    ev_open = "" if ev.get("Status") in ("PASS", "CLEAN") else " open"
+    ev_class = heading_class(ev.get("Status", "INFO"))
+    html += f"""
+<div class="section" id="logs">
+<details{ev_open}><summary class="{ev_class}"><span class="icon">&#x1F4CB;</span> System Log Errors (Last {ev.get('HoursChecked', 24)}h) {status_badge(ev.get('Status', 'INFO'))}</summary>
+<div class="section-body">
+"""
+    if ev.get("TotalEvents", 0) == 0:
+        html += f"<p>No critical or error events in the last {ev.get('HoursChecked', 24)} hours. All clear.</p>"
+    else:
+        html += f"<p>{ev.get('TotalEvents')} event(s) found.</p><table><tr><th>Time</th><th>Subsystem</th><th>Message</th></tr>"
+        for e in ev.get("Events", [])[:20]:
+            html += f"<tr><td style='white-space:nowrap'>{e.get('Time', '?')}</td><td>{e.get('Subsystem', '?')}</td><td>{e.get('Message', '')[:100]}</td></tr>"
+        html += "</table>"
+
+    if ev.get("CrashReports"):
+        html += f"<h3 style='color:#d97706;margin:10px 0 5px;font-size:0.95em;'>Recent Crash Reports</h3><ul>"
+        for c in ev["CrashReports"]:
+            html += f"<li>{c}</li>"
+        html += "</ul>"
+    html += "</div></details></div>"
+
+    # PENDING REBOOT
+    reb = results.get("PendingReboot", {})
+    reb_open = "" if reb.get("Status") in ("PASS", "CLEAN") else " open"
+    reb_class = heading_class(reb.get("Status", "INFO"))
+    html += f"""
+<div class="section" id="reboot">
+<details{reb_open}><summary class="{reb_class}"><span class="icon">&#x1F504;</span> Pending Reboot {status_badge(reb.get("Status", "INFO"))}</summary>
+<div class="section-body">
+"""
+    if reb.get("RebootRequired"):
+        html += "<p class='warning-text'>A restart is required to complete pending updates.</p>"
+    elif reb.get("UptimeWarning"):
+        html += f"<p class='warning-text'>System has been running for {reb.get('UptimeDays', '?')} days without a restart. Consider scheduling a restart.</p>"
+    else:
+        html += f"<p>No reboot pending. Uptime: {reb.get('UptimeDays', '?')} days.</p>"
+    html += "</div></details></div>"
+
+    # FIREWALL
+    fw = results.get("Firewall", {})
+    fw_open = "" if fw.get("Status") in ("PASS", "CLEAN") else " open"
+    fw_class = heading_class(fw.get("Status", "INFO"))
+    html += f"""
+<div class="section" id="firewall">
+<details{fw_open}><summary class="{fw_class}"><span class="icon">&#x1F6E1;</span> Firewall {status_badge(fw.get("Status", "INFO"))}</summary>
+<div class="section-body">
+    <table>
+        <tr><td><strong>Enabled</strong></td><td>{'Yes' if fw.get('Enabled') else '<span class="error-text">NO</span>'}</td></tr>
+        {"<tr><td><strong>Mode</strong></td><td>" + fw.get('Mode', '') + "</td></tr>" if fw.get('Mode') else ""}
+    </table>
+</div></details></div>
+"""
+
+    # USER ACCOUNTS
+    ua = results.get("UserAccounts", {})
+    ua_open = "" if ua.get("Status") in ("PASS", "CLEAN") else " open"
+    ua_class = heading_class(ua.get("Status", "INFO"))
+    html += f"""
+<div class="section" id="users">
+<details{ua_open}><summary class="{ua_class}"><span class="icon">&#x1F464;</span> User Accounts {status_badge(ua.get("Status", "INFO"))}</summary>
+<div class="section-body">
+    <p>{ua.get('EnabledCount', '?')} local account(s), {ua.get('AdminCount', '?')} with admin rights.</p>
+    <table><tr><th>Account</th><th>Admin</th><th>Last Login</th></tr>
+"""
+    for acct in ua.get("Accounts", []):
+        html += f"<tr><td>{acct.get('Name', '')}</td><td>{'Yes' if acct.get('IsAdmin') else 'No'}</td><td>{acct.get('LastLogin', '?')}</td></tr>"
+    html += "</table></div></details></div>"
+
+    # TEMP FILES
+    tf = results.get("TempFiles", {})
+    tf_open = "" if tf.get("Status") in ("PASS", "CLEAN") else " open"
+    tf_class = heading_class(tf.get("Status", "INFO"))
+    html += f"""
+<div class="section" id="temp">
+<details{tf_open}><summary class="{tf_class}"><span class="icon">&#x1F4C1;</span> Temp/Cache Files {status_badge(tf.get("Status", "INFO"))}</summary>
+<div class="section-body">
+    <table><tr><th>Directory</th><th>Label</th><th>Size</th><th>Files</th></tr>
+"""
+    for d in tf.get("Directories", []):
+        cls = " class='flagged'" if d.get("Warning") else ""
+        sz = f"<span class='warning-text'>{d.get('SizeMB', 0)} MB</span>" if d.get("Warning") else f"{d.get('SizeMB', 0)} MB"
+        html += f"<tr{cls}><td>{d.get('Path', '')}</td><td>{d.get('Label', '')}</td><td>{sz}</td><td>{d.get('FileCount', 0)}</td></tr>"
+    html += "</table></div></details></div>"
+
+    # STARTUP / LOGIN ITEMS
+    st = results.get("Startup", {})
+    st_open = "" if st.get("Status") in ("PASS", "CLEAN") else " open"
+    st_class = heading_class(st.get("Status", "INFO"))
+    html += f"""
+<div class="section" id="startup">
+<details{st_open}><summary class="{st_class}"><span class="icon">&#x1F504;</span> Startup/Login Items {status_badge(st.get("Status", "INFO"))}</summary>
+<div class="section-body">
+    <h3 style="margin:10px 0 5px;font-size:0.95em;">Login Items</h3>
+    <ul>
+"""
+    if st.get("LoginItems"):
+        for li in st["LoginItems"]:
+            html += f"<li>{li.get('Name', '')}</li>"
+    else:
+        html += "<li class='detail'>None found</li>"
+    html += "</ul>"
+    
+    html += "<h3 style='margin:10px 0 5px;font-size:0.95em;'>LaunchAgents</h3><ul>"
+    if st.get("LaunchAgents"):
+        for la in st["LaunchAgents"][:10]:
+            html += f"<li>{la.get('Name', '')}</li>"
+        if len(st["LaunchAgents"]) > 10:
+            html += f"<li class='detail'>... and {len(st['LaunchAgents']) - 10} more</li>"
+    else:
+        html += "<li class='detail'>None found</li>"
+    html += "</ul></div></details></div>"
+
+    # SCHEDULED TASKS
+    sch = results.get("ScheduledTasks", {})
+    sch_open = "" if sch.get("Status") in ("PASS", "CLEAN") else " open"
+    sch_class = heading_class(sch.get("Status", "INFO"))
+    html += f"""
+<div class="section" id="tasks">
+<details{sch_open}><summary class="{sch_class}"><span class="icon">&#x23F0;</span> Scheduled Tasks {status_badge(sch.get("Status", "INFO"))}</summary>
+<div class="section-body">
+    <table><tr><th>Label</th><th>PID</th><th>Status</th></tr>
+"""
+    for t in sch.get("Tasks", [])[:20]:
+        html += f"<tr><td>{t.get('Label', '')}</td><td>{t.get('PID', '')}</td><td>{t.get('Status', '')}</td></tr>"
+    html += "</table></div></details></div>"
+
+    # BROWSER EXTENSIONS
+    be = results.get("BrowserExtensions", {})
+    be_open = "" if be.get("Status") in ("PASS", "CLEAN") else " open"
+    be_class = heading_class(be.get("Status", "INFO"))
+    html += f"""
+<div class="section" id="extensions">
+<details{be_open}><summary class="{be_class}"><span class="icon">&#x1F527;</span> Browser Extensions {status_badge(be.get("Status", "INFO"))}</summary>
+<div class="section-body">
+    <h3 style="margin:10px 0 5px;font-size:0.95em;">Chrome Extensions</h3>
+    <table><tr><th>Name</th><th>ID</th></tr>
+"""
+    if be.get("ChromeExtensions"):
+        for ext in be["ChromeExtensions"][:15]:
+            html += f"<tr><td>{ext.get('Name', '')}</td><td><code>{ext.get('ID', '')}</code></td></tr>"
+    else:
+        html += "<tr><td class='detail' colspan='2'>No Chrome extensions found or Chrome not installed.</td></tr>"
+    html += "</table></div></details></div>"
+
+    # SERVICE STATUS
+    sv = results.get("ServiceStatus", {})
+    sv_open = "" if sv.get("Status") in ("PASS", "CLEAN") else " open"
+    sv_class = heading_class(sv.get("Status", "INFO"))
+    html += f"""
+<div class="section" id="services">
+<details{sv_open}><summary class="{sv_class}"><span class="icon">&#x2699;</span> Service Status {status_badge(sv.get("Status", "INFO"))}</summary>
+<div class="section-body">
+    <table><tr><th>Service</th><th>Running</th></tr>
+"""
+    for s in sv.get("Services", []):
+        running = "Yes" if s.get("Running") else '<span class="warning-text">No</span>'
+        html += f"<tr><td>{s.get('Name', '')}</td><td>{running}</td></tr>"
+    html += "</table></div></details></div>"
+
+    # NETWORK CONFIG
+    net = results.get("NetworkConfig", {})
+    net_open = "" if net.get("Status") in ("PASS", "CLEAN") else " open"
+    net_class = heading_class(net.get("Status", "INFO"))
+    html += f"""
+<div class="section" id="network">
+<details{net_open}><summary class="{net_class}"><span class="icon">&#x1F310;</span> Network Configuration {status_badge(net.get("Status", "INFO"))}</summary>
+<div class="section-body">
+    <table>
+        {"<tr><td><strong>Wi-Fi Network</strong></td><td>" + net.get('WiFi', 'Not connected') + "</td></tr>" if net.get('WiFi') else ""}
+        {"<tr><td><strong>Default Gateway</strong></td><td>" + net.get('DefaultGateway', 'Unknown') + "</td></tr>" if net.get('DefaultGateway') else ""}
+        <tr><td><strong>DNS Servers</strong></td><td>{', '.join(net.get('DNS', ['Unknown']))}</td></tr>
+    </table>
+</div></details></div>
+"""
+
+    # Footer and closing
+    html += f"""
+<div class="footer">
+    Report generated by PC Master Class macOS Maintenance Script v{script_version}<br>
+    &copy; {datetime.now().year} PC Master Class — pc-masterclass.com.au
+</div>
+
+</div>
+</body>
+</html>
+"""
+    
+    return html
+
+
+# ============================================================================
+# EMAIL MODULE
+# ============================================================================
+def send_email(report_html, to_addr, smtp_config, log_file=None):
+    """Send the HTML report via SMTP."""
+    try:
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = f"Maintenance Report — {platform.node()}" if "test" not in sys.argv else f"[TEST] Maintenance Report — {platform.node()}"
+        msg['From'] = smtp_config.get("email_from", smtp_config["smtp_user"])
+        msg['To'] = to_addr
+
+        # Attach HTML
+        msg.attach(MIMEText(report_html, 'html', 'utf-8'))
+
+        with smtplib.SMTP(smtp_config["smtp_server"], smtp_config["smtp_port"]) as server:
+            server.starttls(context=ssl.create_default_context())
+            server.login(smtp_config["smtp_user"], smtp_config["smtp_password"])
+            server.send_message(msg)
+
+        return {"Status": "Sent", "To": to_addr, "Server": smtp_config["smtp_server"]}
+    except Exception as e:
+        return {"Status": "ERROR", "Error": str(e)}
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+def main():
+    global logger
+    
+    parser = argparse.ArgumentParser(description="PC Master Class macOS Maintenance Script")
+    parser.add_argument("--skip-updates", action="store_true", help="Skip software update check")
+    parser.add_argument("--skip-smart", action="store_true", help="Skip SMART disk health check")
+    parser.add_argument("--client-name", default="", help="Client name for report header")
+    parser.add_argument("--report-path", default=str(Path.home() / "Library/PCMasterClass/Reports"), help="Report output directory")
+    parser.add_argument("--email-to", default="", help="Send report via email")
+    parser.add_argument("--smtp-user", default="", help="SMTP username")
+    parser.add_argument("--smtp-password", default="", help="SMTP password (App Password)")
+    parser.add_argument("--smtp-server", default="smtp.gmail.com", help="SMTP server")
+    parser.add_argument("--smtp-port", type=int, default=587, help="SMTP port")
+    parser.add_argument("--email-from", default="", help="Sender email address")
+    parser.add_argument("--save-credential", action="store_true", help="Store credentials in macOS Keychain")
+    parser.add_argument("--skip-update-check", action="store_true", help="Skip auto-update from GitHub")
+    args = parser.parse_args()
+
+    # Ensure report directory exists
+    report_path = Path(args.report_path)
+    report_path.mkdir(parents=True, exist_ok=True)
+
+    # Setup logger
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_file = report_path / f"{platform.node()}_Maintenance_{timestamp}.log"
+    logger = Logger(str(log_file))
+
+    logger.info("=" * 50)
+    logger.info(f"PC Master Class macOS Maintenance v{SCRIPT_VERSION}")
+    logger.info(f"Computer: {platform.node()}")
+    logger.info("=" * 50)
+
+    # Auto-update check
+    if not args.skip_update_check:
+        check_and_update()
+
+    # Credential management
+    smtp_config = None
+    if args.save_credential:
+        if not args.smtp_user or not args.smtp_password:
+            logger.error("--smtp-user and --smtp-password are required when saving credentials.")
+            sys.exit(1)
+        try:
+            keychain_store(
+                args.smtp_user, args.smtp_password,
+                args.smtp_server, args.smtp_port,
+                args.email_from or args.smtp_user
+            )
+            logger.info("Credentials saved to macOS Keychain successfully.")
+            print("Credentials saved. You can now run without --smtp-user/--smtp-password.")
+            sys.exit(0)
+        except Exception as e:
+            logger.error(f"Failed to save credentials: {e}")
+            sys.exit(1)
+
+    if args.email_to:
+        if args.smtp_user and args.smtp_password:
+            smtp_config = {
+                "smtp_user": args.smtp_user,
+                "smtp_password": args.smtp_password,
+                "smtp_server": args.smtp_server,
+                "smtp_port": args.smtp_port,
+                "email_from": args.email_from or args.smtp_user,
+            }
+        else:
+            # Try loading from Keychain
+            loaded = keychain_load(args.email_to)
+            if not loaded:
+                # Try common sending account
+                loaded = keychain_load("reports@pcmasterclass.com.au")
+            if loaded:
+                smtp_config = loaded
+                logger.info(f"Loaded SMTP credentials from Keychain for {loaded['smtp_user']}")
+            else:
+                logger.error("No SMTP credentials found. Run with --save-credential first.")
+
+    # Run all modules
+    results = {}
+    results["SystemInfo"] = run_system_info()
+    results["DiskHealth"] = run_disk_health()
+    if not args.skip_updates:
+        results["SoftwareUpdates"] = run_software_updates()
+    else:
+        results["SoftwareUpdates"] = {"Status": "SKIPPED"}
+    results["Backup"] = run_backup_check()
+    results["Malwarebytes"] = run_malwarebytes_check()
+    results["Security"] = run_security_check()
+    results["LogErrors"] = run_log_errors()
+    results["PendingReboot"] = run_pending_reboot()
+    results["Firewall"] = run_firewall_check()
+    results["UserAccounts"] = run_user_accounts()
+    results["TempFiles"] = run_temp_files()
+    results["Startup"] = run_startup_check()
+    results["ScheduledTasks"] = run_scheduled_tasks()
+    results["BrowserExtensions"] = run_browser_extensions()
+    results["ServiceStatus"] = run_service_status()
+    results["NetworkConfig"] = run_network_config()
+
+    # Generate report
+    report_html = generate_html_report(results, args.client_name, SCRIPT_VERSION)
+    report_file = report_path / f"{platform.node()}_Maintenance_{timestamp}.html"
+    report_file.write_text(report_html, encoding='utf-8')
+    logger.info(f"Report saved to: {report_file}")
+
+    # Send email
+    email_result = {"Status": "Not configured"}
+    if args.email_to and smtp_config:
+        logger.info("Sending report via email...")
+        email_result = send_email(report_html, args.email_to, smtp_config, str(log_file))
+        logger.info(f"Email result: {email_result['Status']}")
+
+    # Print summary
+    warnings = sum(1 for r in results.values() if isinstance(r, dict) and r.get("Status") == "WARNING")
+    errors = sum(1 for r in results.values() if isinstance(r, dict) and r.get("Status") == "ERROR")
+    logger.info("=" * 50)
+    logger.info(f"Maintenance complete. Warnings: {warnings}, Errors: {errors}")
+    logger.info(f"Report: {report_file}")
+    if email_result.get("Status") == "Sent":
+        logger.info(f"Email sent to {args.email_to}")
+    logger.info("=" * 50)
+
+    # Return overall status code (non-zero if errors)
+    sys.exit(1 if errors > 0 else 0)
+
+
+if __name__ == "__main__":
+    main()
