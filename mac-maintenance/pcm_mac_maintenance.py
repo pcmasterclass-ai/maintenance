@@ -40,6 +40,7 @@ import hashlib
 import json
 import os
 import platform
+import plistlib
 import re
 import shutil
 import smtplib
@@ -59,7 +60,7 @@ from pathlib import Path
 # CONFIGURATION
 # ============================================================================
 SCRIPT_VERSION = "1.0.0"
-UPDATE_URL = "https://raw.githubusercontent.com/pcmasterclass-ai/maintenance/main/pcm_mac_maintenance.py"
+UPDATE_URL = "https://raw.githubusercontent.com/pcmasterclass-ai/maintenance/main/mac-maintenance/pcm_mac_maintenance.py"
 UPDATE_TOKEN = ""  # Leave empty for public repos
 
 # macOS Keychain service name for stored credentials
@@ -311,7 +312,7 @@ def run_system_info():
         result["UptimeDays"] = "Unknown"
         result["LastBoot"] = "Unknown"
 
-    # Battery (if applicable)
+    # Battery health (if applicable)
     try:
         bat = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True)
         if bat.returncode == 0 and "Battery" in bat.stdout:
@@ -321,6 +322,15 @@ def run_system_info():
                     pct = line.split("%;")[0].split()[-1] + "%"
                     result["Battery"] = pct
                     break
+
+        battery_info = subprocess.run(["system_profiler", "SPPowerDataType", "-json"], capture_output=True, text=True, timeout=30)
+        if battery_info.returncode == 0 and battery_info.stdout.strip():
+            power = json.loads(battery_info.stdout)
+            batteries = power.get("SPPowerDataType", [{}])[0].get("sppower_battery_health_info", [])
+            if batteries:
+                binfo = batteries[0]
+                result["BatteryCycleCount"] = binfo.get("sppower_battery_cycle_count", "Unknown")
+                result["BatteryCondition"] = binfo.get("sppower_battery_condition", "Unknown")
     except Exception:
         pass
 
@@ -384,10 +394,10 @@ def run_disk_health():
                     "Type": di.get("SolidState", False) and "SSD" or "HDD",
                     "SizeGB": size_gb,
                     "Protocol": di.get("Protocol", "Unknown"),
-                    " SMART": "N/A"
+                    "SMART": "N/A"
                 })
             except Exception:
-                result["Disks"].append({"Name": disk_id, "Type": "?", "SizeGB": size_gb, "Protocol": "?", " SMART": "N/A"})
+                result["Disks"].append({"Name": disk_id, "Type": "?", "SizeGB": size_gb, "Protocol": "?", "SMART": "N/A"})
     except Exception as e:
         result["Status"] = "WARNING"
         result["Error"] = str(e)
@@ -553,25 +563,41 @@ def run_backup_check():
 
     # Time Machine check
     try:
+        # Destination info is the best signal that Time Machine is configured, even when no backup is mounted.
+        dest = subprocess.run(["tmutil", "destinationinfo"], capture_output=True, text=True)
+        if dest.returncode == 0 and dest.stdout.strip():
+            result["TimeMachine"]["Configured"] = True
+            result["TimeMachine"]["Destinations"] = dest.stdout.strip()
+
+        tm_status = subprocess.run(["tmutil", "status"], capture_output=True, text=True)
+        if tm_status.returncode == 0 and tm_status.stdout.strip():
+            result["TimeMachine"]["StatusText"] = tm_status.stdout.strip()
+            result["TimeMachine"]["Running"] = "Running = 1" in tm_status.stdout
+
         tm = subprocess.run(["tmutil", "latestbackup"], capture_output=True, text=True)
         if tm.returncode == 0 and tm.stdout.strip():
             result["TimeMachine"]["Configured"] = True
             path = tm.stdout.strip()
             result["TimeMachine"]["LastBackupPath"] = path
             # Extract date from path (e.g., /Volumes/.../2026-05-01-123456/Macintosh HD)
-            match = re.search(r'(\\d{4}-\\d{2}-\\d{2}-\\d{6})', path)
+            match = re.search(r'(\\d{4}-\\d{2}-\\d{2}-\\d{2,6})', path)
             if match:
                 dt_str = match.group(1)
-                result["TimeMachine"]["LastBackupDate"] = datetime.strptime(dt_str, "%Y-%m-%d-%H%M%S").strftime("%Y-%m-%d %H:%M:%S")
+                for fmt in ("%Y-%m-%d-%H%M%S", "%Y-%m-%d-%H"):
+                    try:
+                        result["TimeMachine"]["LastBackupDate"] = datetime.strptime(dt_str, fmt).strftime("%Y-%m-%d %H:%M:%S")
+                        break
+                    except ValueError:
+                        pass
+                else:
+                    result["TimeMachine"]["LastBackupDate"] = "Unknown"
             else:
                 result["TimeMachine"]["LastBackupDate"] = "Unknown"
 
-            # Check destination
-            dest = subprocess.run(["tmutil", "destinationinfo"], capture_output=True, text=True)
-            if dest.returncode == 0:
-                result["TimeMachine"]["Destinations"] = dest.stdout.strip()
-        else:
-            result["TimeMachine"]["Configured"] = False
+        snapshots = subprocess.run(["tmutil", "listlocalsnapshots", "/"], capture_output=True, text=True)
+        if snapshots.returncode == 0:
+            snaps = [line.strip() for line in snapshots.stdout.splitlines() if line.strip()]
+            result["TimeMachine"]["LocalSnapshotCount"] = len(snaps)
     except Exception as e:
         result["TimeMachine"]["Configured"] = False
         result["TimeMachine"]["Error"] = str(e)
@@ -682,57 +708,53 @@ def run_security_check():
 # LOG ERRORS MODULE
 # ============================================================================
 def run_log_errors(hours=24):
-    """Check unified logs for critical/error entries."""
-    logger.info("Checking system logs for errors...")
-    result = {"Status": "PASS", "HoursChecked": hours, "TotalEvents": 0, "Events": []}
+    """Check for actionable crash reports and high-signal system errors."""
+    logger.info("Checking system logs for actionable errors...")
+    result = {"Status": "PASS", "HoursChecked": hours, "TotalEvents": 0, "Events": [], "CrashReports": [], "KernelPanics": []}
 
     try:
-        # macOS unified logging is complex. We'll look for kernel panics, crash reports,
-        # and specific subsystem errors using log show with a predicate
-        since = (datetime.now() - __import__('datetime').timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
-
-        cmd = [
-            "log", "show",
-            "--predicate", '(eventType == logEvent) && (messageType == error)',
-            "--since", since,
-            "--style", "json"
+        cutoff = time.time() - (hours * 3600)
+        diagnostic_dirs = [
+            Path("~/Library/Logs/DiagnosticReports").expanduser(),
+            Path("/Library/Logs/DiagnosticReports"),
         ]
-        log_out = subprocess.run(cmd, capture_output=True, text=True)
-        
+
+        for crash_reports_dir in diagnostic_dirs:
+            if crash_reports_dir.exists():
+                for f in crash_reports_dir.iterdir():
+                    try:
+                        if not f.is_file() or f.stat().st_mtime <= cutoff:
+                            continue
+                        name = f.name
+                        lower = name.lower()
+                        if "panic" in lower or name.endswith(".panic"):
+                            result["KernelPanics"].append(name)
+                        elif name.endswith(".crash"):
+                            result["CrashReports"].append(name)
+                    except Exception:
+                        pass
+
+        # Unified logs are very noisy on macOS. Only search for a few high-signal disk/APFS/kernel messages.
+        since = (datetime.now() - __import__('datetime').timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+        predicate = '(eventType == logEvent) && (messageType == error) && (eventMessage CONTAINS[c] "I/O error" || eventMessage CONTAINS[c] "APFS" || eventMessage CONTAINS[c] "disk" || eventMessage CONTAINS[c] "panic")'
+        cmd = ["log", "show", "--predicate", predicate, "--since", since, "--style", "json"]
+        log_out = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
         if log_out.returncode == 0 and log_out.stdout.strip():
             try:
                 log_data = json.loads(log_out.stdout)
-                for entry in log_data.get("predicate", {}).get("events", []):
-                    msg = entry.get("eventMessage", "")
-                    subsys = entry.get("subsystem", "")
-                    ts = entry.get("timestamp", "")
+                events = log_data.get("predicate", {}).get("events", []) if isinstance(log_data, dict) else []
+                for entry in events[:20]:
                     result["Events"].append({
-                        "Time": ts,
-                        "Subsystem": subsys,
-                        "Message": msg[:200]
+                        "Time": entry.get("timestamp", ""),
+                        "Subsystem": entry.get("subsystem", ""),
+                        "Message": entry.get("eventMessage", "")[:200]
                     })
             except json.JSONDecodeError:
-                # Fall back to text parsing
-                lines = log_out.stdout.split('\n')
-                for line in lines:
-                    if line.strip():
-                        result["Events"].append({"Time": "?", "Subsystem": "?", "Message": line[:200]})
+                pass
 
-        result["TotalEvents"] = len(result["Events"])
-        if result["TotalEvents"] > 0:
+        result["TotalEvents"] = len(result["Events"]) + len(result["CrashReports"]) + len(result["KernelPanics"])
+        if result["KernelPanics"] or result["CrashReports"] or result["Events"]:
             result["Status"] = "WARNING"
-
-        # Also check for crash reports
-        crash_reports_dir = Path("~/Library/Logs/DiagnosticReports").expanduser()
-        if crash_reports_dir.exists():
-            recent_crashes = []
-            for f in crash_reports_dir.iterdir():
-                if f.is_file() and f.stat().st_mtime > time.time() - (hours * 3600):
-                    recent_crashes.append(f.name)
-            if recent_crashes:
-                result["CrashReports"] = recent_crashes[:5]
-                if result["Status"] != "ERROR":
-                    result["Status"] = "WARNING"
 
     except Exception as e:
         result["Status"] = "ERROR"
@@ -740,7 +762,6 @@ def run_log_errors(hours=24):
         result["Note"] = "Unified logging requires macOS 10.12+ and may fail on older systems."
 
     return result
-
 
 # ============================================================================
 # PENDING REBOOT MODULE
@@ -767,10 +788,12 @@ def run_pending_reboot():
         except Exception:
             pass
 
-        # Check for flag file indicating reboot needed
-        for flag in ["/var/db/.AppleSetupDone", "/var/db/receipts/.pkg.rebootRequired"]:
+        # Check for flag files indicating reboot needed.
+        # Note: /var/db/.AppleSetupDone is normal on configured Macs and is NOT a reboot flag.
+        for flag in ["/var/db/receipts/.pkg.rebootRequired"]:
             if os.path.exists(flag):
                 result["RebootRequired"] = True
+                result.setdefault("RebootReasons", []).append(flag)
 
     except Exception as e:
         result["Status"] = "ERROR"
@@ -788,28 +811,43 @@ def run_firewall_check():
     result = {"Status": "PASS", "Enabled": False}
 
     try:
-        fw = subprocess.run(["defaults", "read", "/Library/Preferences/com.apple.alf", "globalstate"], capture_output=True, text=True)
-        if fw.returncode == 0:
-            state = fw.stdout.strip()
-            if state == "1":
+        # Prefer the supported socketfilterfw helper; fall back to preferences for older systems.
+        sfw = subprocess.run(["/usr/libexec/ApplicationFirewall/socketfilterfw", "--getglobalstate"], capture_output=True, text=True)
+        sfw_out = (sfw.stdout + sfw.stderr).strip()
+        if sfw.returncode == 0 and sfw_out:
+            result["RawState"] = sfw_out
+            if "enabled" in sfw_out.lower():
                 result["Enabled"] = True
-                result["Mode"] = "Allow essential services"
-            elif state == "2":
-                result["Enabled"] = True
-                result["Mode"] = "Block all incoming connections"
-            elif state == "0":
+            elif "disabled" in sfw_out.lower():
                 result["Enabled"] = False
                 result["Status"] = "WARNING"
-            else:
-                result["Enabled"] = state
         else:
-            result["Status"] = "ERROR"
+            fw = subprocess.run(["defaults", "read", "/Library/Preferences/com.apple.alf", "globalstate"], capture_output=True, text=True)
+            if fw.returncode == 0:
+                state = fw.stdout.strip()
+                if state == "1":
+                    result["Enabled"] = True
+                    result["Mode"] = "Allow essential services"
+                elif state == "2":
+                    result["Enabled"] = True
+                    result["Mode"] = "Block all incoming connections"
+                elif state == "0":
+                    result["Enabled"] = False
+                    result["Status"] = "WARNING"
+                else:
+                    result["Enabled"] = state
+            else:
+                result["Status"] = "WARNING"
+                result["Note"] = "Could not determine firewall status without elevated access."
+
+        stealth = subprocess.run(["/usr/libexec/ApplicationFirewall/socketfilterfw", "--getstealthmode"], capture_output=True, text=True)
+        if stealth.returncode == 0 and stealth.stdout.strip():
+            result["StealthMode"] = stealth.stdout.strip()
     except Exception as e:
-        result["Status"] = "ERROR"
+        result["Status"] = "WARNING"
         result["Error"] = str(e)
 
     return result
-
 
 # ============================================================================
 # USER ACCOUNTS MODULE
@@ -832,12 +870,18 @@ def run_user_accounts():
                 user_info = subprocess.run(["dscl", ".", "read", f"/Users/{user}"], capture_output=True, text=True)
                 info = user_info.stdout
                 
-                is_admin = "admin" in info.lower()
+                is_admin = False
+                try:
+                    admin_check = subprocess.run(["dseditgroup", "-o", "checkmember", "-m", user, "admin"], capture_output=True, text=True)
+                    is_admin = admin_check.returncode == 0 and "yes" in (admin_check.stdout + admin_check.stderr).lower()
+                except Exception:
+                    is_admin = "admin" in info.lower()
                 if is_admin:
                     result["AdminCount"] += 1
                 result["EnabledCount"] += 1
-                
-                acct = {"Name": user, "IsAdmin": is_admin, "UID": "?"}
+
+                uid_match = re.search(r"UniqueID:\s*(\d+)", info)
+                acct = {"Name": user, "IsAdmin": is_admin, "UID": uid_match.group(1) if uid_match else "?"}
                 
                 # Check last login (requires last command)
                 try:
@@ -861,6 +905,23 @@ def run_user_accounts():
     except Exception as e:
         result["Status"] = "ERROR"
         result["Error"] = str(e)
+
+    try:
+        guest = subprocess.run(["defaults", "read", "/Library/Preferences/com.apple.loginwindow", "GuestEnabled"], capture_output=True, text=True)
+        result["GuestEnabled"] = guest.returncode == 0 and guest.stdout.strip() == "1"
+        if result["GuestEnabled"] and result.get("Status") != "ERROR":
+            result["Status"] = "WARNING"
+    except Exception:
+        pass
+
+    try:
+        auto = subprocess.run(["defaults", "read", "/Library/Preferences/com.apple.loginwindow", "autoLoginUser"], capture_output=True, text=True)
+        if auto.returncode == 0 and auto.stdout.strip():
+            result["AutoLoginUser"] = auto.stdout.strip()
+            if result.get("Status") != "ERROR":
+                result["Status"] = "WARNING"
+    except Exception:
+        pass
 
     return result
 
@@ -1002,61 +1063,104 @@ def run_scheduled_tasks():
 # BROWSER EXTENSIONS MODULE
 # ============================================================================
 def run_browser_extensions():
-    """Check Chrome extensions. Safari extensions are harder to list programmatically."""
+    """Check common Chromium and Firefox browser extensions across all profiles."""
     logger.info("Checking browser extensions...")
-    result = {"Status": "PASS", "ChromeExtensions": [], "SafariExtensions": []}
+    result = {"Status": "PASS", "Extensions": [], "ChromeExtensions": [], "SafariExtensions": []}
 
-    # Chrome extensions
-    chrome_ext_dir = Path.home() / "Library/Application Support/Google/Chrome/Default/Extensions"
-    if chrome_ext_dir.exists():
-        for ext_id in chrome_ext_dir.iterdir():
-            if ext_id.is_dir():
+    chromium_browsers = [
+        ("Chrome", Path.home() / "Library/Application Support/Google/Chrome"),
+        ("Edge", Path.home() / "Library/Application Support/Microsoft Edge"),
+        ("Brave", Path.home() / "Library/Application Support/BraveSoftware/Brave-Browser"),
+    ]
+
+    def add_extension(browser, profile, ext_id, name, version=""):
+        item = {"Browser": browser, "Profile": profile, "ID": ext_id, "Name": name, "Version": version}
+        result["Extensions"].append(item)
+        if browser == "Chrome":
+            result["ChromeExtensions"].append(item)
+
+    for browser, base in chromium_browsers:
+        if not base.exists():
+            continue
+        for profile in base.iterdir():
+            ext_dir = profile / "Extensions"
+            if not ext_dir.is_dir():
+                continue
+            for ext_id in ext_dir.iterdir():
+                if not ext_id.is_dir():
+                    continue
                 try:
-                    # Find version folder
                     versions = [v for v in ext_id.iterdir() if v.is_dir()]
-                    if versions:
-                        latest = sorted(versions)[-1]
-                        manifest = latest / "manifest.json"
-                        if manifest.exists():
-                            data = json.loads(manifest.read_text())
-                            name = data.get("name", ext_id.name)
-                            result["ChromeExtensions"].append({"ID": ext_id.name, "Name": name})
-                except json.JSONDecodeError:
-                    pass
+                    if not versions:
+                        continue
+                    latest = sorted(versions)[-1]
+                    manifest = latest / "manifest.json"
+                    if manifest.exists():
+                        data = json.loads(manifest.read_text(errors="ignore"))
+                        name = data.get("name", ext_id.name)
+                        version = data.get("version", latest.name)
+                        add_extension(browser, profile.name, ext_id.name, name, version)
                 except Exception:
                     pass
 
-    return result
+    firefox_base = Path.home() / "Library/Application Support/Firefox/Profiles"
+    if firefox_base.exists():
+        for profile in firefox_base.iterdir():
+            ext_json = profile / "extensions.json"
+            if not ext_json.exists():
+                continue
+            try:
+                data = json.loads(ext_json.read_text(errors="ignore"))
+                for addon in data.get("addons", []):
+                    if addon.get("type") == "extension":
+                        add_extension("Firefox", profile.name, addon.get("id", ""), addon.get("defaultLocale", {}).get("name", addon.get("id", "")), addon.get("version", ""))
+            except Exception:
+                pass
 
+    safari_dirs = [Path.home() / "Library/Safari/Extensions", Path.home() / "Library/Containers/com.apple.Safari/Data/Library/Safari/Extensions"]
+    for sdir in safari_dirs:
+        if sdir.exists():
+            for item in sdir.iterdir():
+                if item.is_file() or item.is_dir():
+                    result["SafariExtensions"].append({"Name": item.name, "Path": str(item)})
+
+    return result
 
 # ============================================================================
 # SERVICE STATUS MODULE
 # ============================================================================
 def run_service_status():
-    """Check key macOS services via launchctl."""
+    """Check support-relevant third-party agents and key macOS services."""
     logger.info("Checking service status...")
     result = {"Status": "PASS", "Services": []}
 
-    key_services = [
-        "com.apple.WindowServer",
-        "com.apple.metadata.mds",
-        "com.apple.systempreferences",
-        "com.apple.audio.coreaudiod",
-        "com.apple.blued",  # Bluetooth
+    service_patterns = [
+        ("TeamViewer", ["TeamViewer"]),
+        ("Malwarebytes", ["Malwarebytes", "MBAM"]),
+        ("iDrive", ["iDrive", "IDrive"]),
+        ("Dropbox", ["Dropbox"]),
+        ("OneDrive", ["OneDrive"]),
+        ("Google Drive", ["Google Drive", "DriveFS"]),
+        ("Tailscale", ["Tailscale"]),
+        ("WireGuard", ["WireGuard"]),
+        ("OpenVPN", ["OpenVPN"]),
+        ("Cisco AnyConnect", ["AnyConnect", "Cisco Secure Client"]),
+        ("FortiClient", ["FortiClient"]),
+        ("CoreAudio", ["coreaudiod"]),
+        ("Spotlight", ["mds"]),
     ]
 
-    for svc in key_services:
-        try:
-            status = subprocess.run(["launchctl", "list", svc], capture_output=True, text=True)
-            if status.returncode == 0:
-                result["Services"].append({"Name": svc, "Running": True})
-            else:
-                result["Services"].append({"Name": svc, "Running": False})
-        except Exception:
-            result["Services"].append({"Name": svc, "Running": False})
+    ps = subprocess.run(["ps", "-axo", "pid=,comm="], capture_output=True, text=True)
+    processes = ps.stdout if ps.returncode == 0 else ""
+    lower_processes = processes.lower()
+
+    for name, patterns in service_patterns:
+        running = any(pattern.lower() in lower_processes for pattern in patterns)
+        app_paths = [Path("/Applications") / f"{name}.app", Path.home() / "Applications" / f"{name}.app"]
+        installed = any(path.exists() for path in app_paths) or running
+        result["Services"].append({"Name": name, "Installed": installed, "Running": running})
 
     return result
-
 
 # ============================================================================
 # NETWORK CONFIG MODULE
@@ -1100,6 +1204,60 @@ def run_network_config():
 
     return result
 
+
+
+# ============================================================================
+# MAINTENANCE AGENT HEALTH MODULE
+# ============================================================================
+def run_agent_health(email_to=""):
+    """Verify the PC Master Class maintenance agent installation and update path."""
+    logger.info("Checking PC Master Class maintenance agent health...")
+    result = {"Status": "PASS", "Checks": []}
+
+    def add_check(name, ok, detail=""):
+        result["Checks"].append({"Name": name, "OK": bool(ok), "Detail": detail})
+        if not ok and result["Status"] != "ERROR":
+            result["Status"] = "WARNING"
+
+    script_path = Path(sys.argv[0]).expanduser().resolve()
+    expected_script = Path.home() / "Library/PCMasterClass/pcm_mac_maintenance.py"
+    plist_path = Path.home() / "Library/LaunchAgents/com.pcmasterclass.maintenance.agent.plist"
+    report_dir = Path.home() / "Library/PCMasterClass/Reports"
+
+    add_check("Script exists", script_path.exists(), str(script_path))
+    add_check("Installed in expected location", script_path == expected_script or expected_script.exists(), str(expected_script))
+    add_check("Reports directory exists", report_dir.exists(), str(report_dir))
+    add_check("LaunchAgent plist exists", plist_path.exists(), str(plist_path))
+
+    if plist_path.exists():
+        try:
+            with plist_path.open("rb") as f:
+                plist = plistlib.load(f)
+            result["LaunchAgentLabel"] = plist.get("Label", "")
+            result["LaunchAgentSchedule"] = plist.get("StartCalendarInterval", "")
+            args = plist.get("ProgramArguments", [])
+            add_check("LaunchAgent points at maintenance script", any("pcm_mac_maintenance.py" in str(a) for a in args), " ".join(map(str, args)))
+        except Exception as e:
+            add_check("LaunchAgent plist readable", False, str(e))
+
+    loaded = subprocess.run(["launchctl", "list", "com.pcmasterclass.maintenance.agent"], capture_output=True, text=True)
+    add_check("LaunchAgent loaded", loaded.returncode == 0, loaded.stdout.strip() or loaded.stderr.strip())
+
+    if email_to:
+        cred = keychain_load(email_to) or keychain_load("reports@pcmasterclass.com.au")
+        add_check("SMTP credential available", bool(cred), email_to or "reports@pcmasterclass.com.au")
+
+    try:
+        req = urllib.request.Request(UPDATE_URL, headers={})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            remote_content = response.read().decode("utf-8")
+        match = re.search(r'SCRIPT_VERSION\s*=\s*"([^"]+)"', remote_content)
+        result["RemoteVersion"] = match.group(1) if match else "Unknown"
+        add_check("Self-update URL reachable", True, UPDATE_URL)
+    except Exception as e:
+        add_check("Self-update URL reachable", False, f"{UPDATE_URL} — {e}")
+
+    return result
 
 # ============================================================================
 # HTML REPORT GENERATOR
@@ -1154,6 +1312,7 @@ def generate_html_report(results, client_name="", script_version=SCRIPT_VERSION)
         ("extensions", "Browser Extensions", results.get("BrowserExtensions", {}).get("Status", "INFO")),
         ("services", "Service Status", results.get("ServiceStatus", {}).get("Status", "INFO")),
         ("network", "Network Config", results.get("NetworkConfig", {}).get("Status", "INFO")),
+        ("agent", "Maintenance Agent", results.get("AgentHealth", {}).get("Status", "INFO")),
     ]
     
     html = f"""<!DOCTYPE html>
@@ -1236,6 +1395,8 @@ def generate_html_report(results, client_name="", script_version=SCRIPT_VERSION)
         <tr><td><strong>CPU</strong></td><td>{sys.get("CPU", "Unknown")}</td></tr>
         <tr><td><strong>RAM</strong></td><td>{sys.get("RAM_GB", "?")} GB</td></tr>
         <tr><td><strong>FileVault</strong></td><td>{sys.get("FileVault", "Unknown")}</td></tr>
+        {"<tr><td><strong>Battery</strong></td><td>" + str(sys.get("Battery", "")) + "</td></tr>" if sys.get("Battery") else ""}
+        {"<tr><td><strong>Battery Health</strong></td><td>" + str(sys.get("BatteryCondition", "Unknown")) + " — " + str(sys.get("BatteryCycleCount", "?")) + " cycles</td></tr>" if sys.get("BatteryCondition") or sys.get("BatteryCycleCount") else ""}
         <tr><td><strong>Last Boot</strong></td><td>{sys.get("LastBoot", "?")} (Uptime: {sys.get("UptimeDays", "?")} days)</td></tr>
         <tr><td><strong>Script Version</strong></td><td>v{script_version}</td></tr>
     </table>
@@ -1254,7 +1415,7 @@ def generate_html_report(results, client_name="", script_version=SCRIPT_VERSION)
 <table><tr><th>Disk</th><th>Type</th><th>Size</th><th>Health</th></tr>
 """
     for d in disk.get("Disks", []):
-        html += f"<tr><td>{d.get('Name', '')}</td><td>{d.get('Type', '')}</td><td>{d.get('SizeGB', '')} GB</td><td>{d.get(' SMART', 'N/A')}</td></tr>"
+        html += f"<tr><td>{d.get('Name', '')}</td><td>{d.get('Type', '')}</td><td>{d.get('SizeGB', '')} GB</td><td>{d.get('SMART', 'N/A')}</td></tr>"
     html += "</table>"
     
     if disk.get("Volumes"):
@@ -1319,6 +1480,8 @@ def generate_html_report(results, client_name="", script_version=SCRIPT_VERSION)
     <h3>Time Machine</h3>
     <table>
         <tr><td><strong>Last Backup</strong></td><td>{tm.get('LastBackupDate', 'Unknown')}</td></tr>
+        {"<tr><td><strong>Running Now</strong></td><td>" + ("Yes" if tm.get("Running") else "No") + "</td></tr>" if "Running" in tm else ""}
+        {"<tr><td><strong>Local Snapshots</strong></td><td>" + str(tm.get("LocalSnapshotCount")) + "</td></tr>" if "LocalSnapshotCount" in tm else ""}
         {"<tr><td><strong>Days Since</strong></td><td><span class='warning-text'>" + str(tm.get('DaysSince', '?')) + " days</span></td></tr>" if tm.get('DaysSince') else ""}
         <tr><td><strong>Destinations</strong></td><td><pre>{tm.get('Destinations', 'N/A')}</pre></td></tr>
     </table>
@@ -1373,7 +1536,7 @@ def generate_html_report(results, client_name="", script_version=SCRIPT_VERSION)
     ev_class = heading_class(ev.get("Status", "INFO"))
     html += f"""
 <div class="section" id="logs">
-<details{ev_open}><summary class="{ev_class}"><span class="icon">&#x1F4CB;</span> System Log Errors (Last {ev.get('HoursChecked', 24)}h) {status_badge(ev.get('Status', 'INFO'))}</summary>
+<details{ev_open}><summary class="{ev_class}"><span class="icon">&#x1F4CB;</span> Actionable Logs / Crashes (Last {ev.get('HoursChecked', 24)}h) {status_badge(ev.get('Status', 'INFO'))}</summary>
 <div class="section-body">
 """
     if ev.get("TotalEvents", 0) == 0:
@@ -1419,6 +1582,8 @@ def generate_html_report(results, client_name="", script_version=SCRIPT_VERSION)
     <table>
         <tr><td><strong>Enabled</strong></td><td>{'Yes' if fw.get('Enabled') else '<span class="error-text">NO</span>'}</td></tr>
         {"<tr><td><strong>Mode</strong></td><td>" + fw.get('Mode', '') + "</td></tr>" if fw.get('Mode') else ""}
+        {"<tr><td><strong>Stealth Mode</strong></td><td>" + fw.get('StealthMode', '') + "</td></tr>" if fw.get('StealthMode') else ""}
+        {"<tr><td><strong>Note</strong></td><td>" + fw.get('Note', '') + "</td></tr>" if fw.get('Note') else ""}
     </table>
 </div></details></div>
 """
@@ -1432,6 +1597,8 @@ def generate_html_report(results, client_name="", script_version=SCRIPT_VERSION)
 <details{ua_open}><summary class="{ua_class}"><span class="icon">&#x1F464;</span> User Accounts {status_badge(ua.get("Status", "INFO"))}</summary>
 <div class="section-body">
     <p>{ua.get('EnabledCount', '?')} local account(s), {ua.get('AdminCount', '?')} with admin rights.</p>
+    {"<p class='warning-text'>Guest account is enabled.</p>" if ua.get("GuestEnabled") else ""}
+    {"<p class='warning-text'>Automatic login enabled for: " + str(ua.get("AutoLoginUser")) + "</p>" if ua.get("AutoLoginUser") else ""}
     <table><tr><th>Account</th><th>Admin</th><th>Last Login</th></tr>
 """
     for acct in ua.get("Accounts", []):
@@ -1504,14 +1671,18 @@ def generate_html_report(results, client_name="", script_version=SCRIPT_VERSION)
 <div class="section" id="extensions">
 <details{be_open}><summary class="{be_class}"><span class="icon">&#x1F527;</span> Browser Extensions {status_badge(be.get("Status", "INFO"))}</summary>
 <div class="section-body">
-    <h3 style="margin:10px 0 5px;font-size:0.95em;">Chrome Extensions</h3>
-    <table><tr><th>Name</th><th>ID</th></tr>
+    <h3 style="margin:10px 0 5px;font-size:0.95em;">Browser Extensions</h3>
+    <table><tr><th>Browser</th><th>Profile</th><th>Name</th><th>ID</th></tr>
 """
-    if be.get("ChromeExtensions"):
-        for ext in be["ChromeExtensions"][:15]:
-            html += f"<tr><td>{ext.get('Name', '')}</td><td><code>{ext.get('ID', '')}</code></td></tr>"
+    if be.get("Extensions"):
+        for ext in be["Extensions"][:30]:
+            html += f"<tr><td>{ext.get('Browser', '')}</td><td>{ext.get('Profile', '')}</td><td>{ext.get('Name', '')}</td><td><code>{ext.get('ID', '')}</code></td></tr>"
+        if len(be.get("Extensions", [])) > 30:
+            html += f"<tr><td class='detail' colspan='4'>... and {len(be.get('Extensions', [])) - 30} more</td></tr>"
     else:
-        html += "<tr><td class='detail' colspan='2'>No Chrome extensions found or Chrome not installed.</td></tr>"
+        html += "<tr><td class='detail' colspan='4'>No supported browser extensions found or browser data inaccessible.</td></tr>"
+    if be.get("SafariExtensions"):
+        html += f"<tr><td class='detail' colspan='4'>{len(be.get('SafariExtensions', []))} Safari extension item(s) detected.</td></tr>"
     html += "</table></div></details></div>"
 
     # SERVICE STATUS
@@ -1522,11 +1693,12 @@ def generate_html_report(results, client_name="", script_version=SCRIPT_VERSION)
 <div class="section" id="services">
 <details{sv_open}><summary class="{sv_class}"><span class="icon">&#x2699;</span> Service Status {status_badge(sv.get("Status", "INFO"))}</summary>
 <div class="section-body">
-    <table><tr><th>Service</th><th>Running</th></tr>
+    <table><tr><th>Service</th><th>Installed/Detected</th><th>Running</th></tr>
 """
     for s in sv.get("Services", []):
-        running = "Yes" if s.get("Running") else '<span class="warning-text">No</span>'
-        html += f"<tr><td>{s.get('Name', '')}</td><td>{running}</td></tr>"
+        running = "Yes" if s.get("Running") else '<span class="detail">No</span>'
+        installed = "Yes" if s.get("Installed") else '<span class="detail">No</span>'
+        html += f"<tr><td>{s.get('Name', '')}</td><td>{installed}</td><td>{running}</td></tr>"
     html += "</table></div></details></div>"
 
     # NETWORK CONFIG
@@ -1544,6 +1716,23 @@ def generate_html_report(results, client_name="", script_version=SCRIPT_VERSION)
     </table>
 </div></details></div>
 """
+
+    # MAINTENANCE AGENT HEALTH
+    ah = results.get("AgentHealth", {})
+    ah_open = "" if ah.get("Status") in ("PASS", "CLEAN") else " open"
+    ah_class = heading_class(ah.get("Status", "INFO"))
+    html += f"""
+<div class="section" id="agent">
+<details{ah_open}><summary class="{ah_class}"><span class="icon">&#x1F527;</span> PC Master Class Maintenance Agent {status_badge(ah.get("Status", "INFO"))}</summary>
+<div class="section-body">
+    <table><tr><th>Check</th><th>Result</th><th>Detail</th></tr>
+"""
+    for c in ah.get("Checks", []):
+        ok = "PASS" if c.get("OK") else "WARNING"
+        html += f"<tr><td>{c.get('Name', '')}</td><td>{status_badge(ok)}</td><td>{c.get('Detail', '')}</td></tr>"
+    if ah.get("RemoteVersion"):
+        html += f"<tr><td>Remote version</td><td colspan='2'>{ah.get('RemoteVersion')}</td></tr>"
+    html += "</table></div></details></div>"
 
     # Footer and closing
     html += f"""
@@ -1684,6 +1873,7 @@ def main():
     results["BrowserExtensions"] = run_browser_extensions()
     results["ServiceStatus"] = run_service_status()
     results["NetworkConfig"] = run_network_config()
+    results["AgentHealth"] = run_agent_health(args.email_to)
 
     # Generate report
     report_html = generate_html_report(results, args.client_name, SCRIPT_VERSION)

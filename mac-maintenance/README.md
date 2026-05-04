@@ -24,7 +24,7 @@ A comprehensive, automated maintenance and health-check system for Apple Mac com
 1. **Via TeamViewer** on target Mac:
    ```bash
    # Open Terminal and run:
-   curl -fsSL https://raw.githubusercontent.com/pcmasterclass-ai/maintenance/main/install.sh | bash
+   curl -fsSL https://raw.githubusercontent.com/pcmasterclass-ai/maintenance/main/mac-maintenance/install.sh | bash
    ```
 
 2. **Follow prompts:**

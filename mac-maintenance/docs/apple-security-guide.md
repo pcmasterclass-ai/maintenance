@@ -121,7 +121,7 @@ During a TeamViewer session:
 - [ ] Open Terminal
 - [ ] Download and run installer:
   ```bash
-  curl -fsSL https://raw.githubusercontent.com/pcmasterclass-ai/maintenance/main/install.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/pcmasterclass-ai/maintenance/main/mac-maintenance/install.sh | bash
   ```
 - [ ] Grant Full Disk Access to Terminal
 - [ ] Enter Gmail App Password when prompted
