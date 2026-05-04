@@ -17,9 +17,9 @@
 
 set -e  # Exit on any error
 
-SCRIPT_URL="https://raw.githubusercontent.com/pcmasterclass-ai/maintenance/main/pcm_mac_maintenance.py"
-UPDATE_URL="https://raw.githubusercontent.com/pcmasterclass-ai/maintenance/main/install.sh"
-LAUNCH_URL="https://raw.githubusercontent.com/pcmasterclass-ai/maintenance/main/com.pcmasterclass.maintenance.plist"
+SCRIPT_URL="https://raw.githubusercontent.com/pcmasterclass-ai/maintenance/main/mac-maintenance/pcm_mac_maintenance.py"
+UPDATE_URL="https://raw.githubusercontent.com/pcmasterclass-ai/maintenance/main/mac-maintenance/install.sh"
+LAUNCH_URL="https://raw.githubusercontent.com/pcmasterclass-ai/maintenance/main/mac-maintenance/com.pcmasterclass.maintenance.agent.plist"
 
 INSTALL_DIR="$HOME/Library/PCMasterClass"
 REPORT_DIR="$HOME/Library/PCMasterClass/Reports"
@@ -144,7 +144,6 @@ else
     echo "[+] Credentials saved to macOS Keychain securely."
 fi
 
-# ---------------------------------------------------------------------------
 # Install LaunchAgent
 # ---------------------------------------------------------------------------
 echo ""
@@ -153,7 +152,7 @@ echo "[+] Installing LaunchAgent for quarterly execution..."
 # Get the user name for the plist
 CURRENT_USER=$(whoami)
 
-# Create the plist file
+# Create the plist file with quarterly schedule (Jan 15, Apr 15, Jul 15, Oct 15)
 cat > "$LAUNCHAGENTS_DIR/$PLIST_NAME" << PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -171,16 +170,52 @@ cat > "$LAUNCHAGENTS_DIR/$PLIST_NAME" << PLIST
         <string>$CURRENT_USER</string>
     </array>
     <key>StartCalendarInterval</key>
-    <dict>
-        <key>Month</key>
-        <integer>1</integer>
-        <key>Day</key>
-        <integer>15</integer>
-        <key>Hour</key>
-        <integer>1</integer>
-        <key>Minute</key>
-        <integer>0</integer>
-    </dict>
+    <array>
+        <!-- Q1: January 15 -->
+        <dict>
+            <key>Month</key>
+            <integer>1</integer>
+            <key>Day</key>
+            <integer>15</integer>
+            <key>Hour</key>
+            <integer>1</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <!-- Q2: April 15 -->
+        <dict>
+            <key>Month</key>
+            <integer>4</integer>
+            <key>Day</key>
+            <integer>15</integer>
+            <key>Hour</key>
+            <integer>1</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <!-- Q3: July 15 -->
+        <dict>
+            <key>Month</key>
+            <integer>7</integer>
+            <key>Day</key>
+            <integer>15</integer>
+            <key>Hour</key>
+            <integer>1</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <!-- Q4: October 15 -->
+        <dict>
+            <key>Month</key>
+            <integer>10</integer>
+            <key>Day</key>
+            <integer>15</integer>
+            <key>Hour</key>
+            <integer>1</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+    </array>
     <key>StandardOutPath</key>
     <string>$LOG_DIR/maintenance.out.log</string>
     <key>StandardErrorPath</key>
@@ -194,6 +229,14 @@ launchctl load "$LAUNCHAGENTS_DIR/$PLIST_NAME" 2>/dev/null || true
 
 echo "[+] LaunchAgent installed: $LAUNCHAGENTS_DIR/$PLIST_NAME"
 echo "[+] Quarterly schedule: Jan 15, Apr 15, Jul 15, Oct 15 at 1:00 AM"
+
+# ---------------------------------------------------------------------------
+# Placeholder for the separate LaunchAgent plist (kept in repo for reference)
+# ---------------------------------------------------------------------------
+# The file at mac-maintenance/com.pcmasterclass.maintenance.agent.plist
+# is the canonical version.  This heredoc duplicates its behaviour for
+# convenience during one-shot install.
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Initial test run
