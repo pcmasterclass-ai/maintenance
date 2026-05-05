@@ -60,7 +60,7 @@ from pathlib import Path
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-SCRIPT_VERSION = "1.0.1"
+SCRIPT_VERSION = "1.0.2"
 UPDATE_URL = "https://raw.githubusercontent.com/pcmasterclass-ai/maintenance/main/mac-maintenance/pcm_mac_maintenance.py"
 UPDATE_TOKEN = ""  # Leave empty for public repos
 
@@ -179,6 +179,26 @@ def keychain_load(account):
         "smtp_port": int(config.get("smtp_port", "587")),
         "email_from": config.get("email_from", account),
     }
+
+
+def load_smtp_credentials(email_to=""):
+    """Load SMTP credentials, preferring Paul's mailbox login for the reports@ alias."""
+    accounts = []
+    if email_to and email_to.lower() != "reports@pcmasterclass.com.au":
+        accounts.append(email_to)
+    # reports@ is an alias of Paul's mailbox. Prefer the real SMTP login first.
+    accounts.extend(["paul@pcmasterclass.com.au", "reports@pcmasterclass.com.au"])
+
+    seen = set()
+    for account in accounts:
+        key = account.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        loaded = keychain_load(account)
+        if loaded:
+            return loaded
+    return None
 
 
 def keychain_list_accounts():
@@ -1245,7 +1265,7 @@ def run_agent_health(email_to=""):
     add_check("LaunchAgent loaded", loaded.returncode == 0, loaded.stdout.strip() or loaded.stderr.strip())
 
     if email_to:
-        cred = keychain_load(email_to) or keychain_load("reports@pcmasterclass.com.au") or keychain_load("paul@pcmasterclass.com.au")
+        cred = load_smtp_credentials(email_to)
         add_check("SMTP credential available", bool(cred), email_to or "reports@pcmasterclass.com.au")
 
     try:
@@ -1842,12 +1862,9 @@ def main():
                 "email_from": args.email_from or args.smtp_user,
             }
         else:
-            # Try loading from Keychain
-            loaded = keychain_load(args.email_to)
-            if not loaded:
-                # Try common sending accounts. reports@ is an alias of Paul's mailbox,
-                # so the SMTP login credential is normally stored under paul@.
-                loaded = keychain_load("reports@pcmasterclass.com.au") or keychain_load("paul@pcmasterclass.com.au")
+            # Try loading from Keychain. reports@ is an alias of Paul's mailbox,
+            # so prefer the real SMTP login credential stored under paul@.
+            loaded = load_smtp_credentials(args.email_to)
             if loaded:
                 smtp_config = loaded
                 logger.info(f"Loaded SMTP credentials from Keychain for {loaded['smtp_user']}")
