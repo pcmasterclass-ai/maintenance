@@ -30,7 +30,7 @@ A comprehensive, automated maintenance and health-check system for Apple Mac com
 2. **Follow prompts:**
    - Grant Full Disk Access (explained in installer)
    - Enter Gmail App Password
-   - Enter recipient email (paul@pcmasterclass.com.au)
+   - Enter recipient email (reports@pcmasterclass.com.au)
 
 3. **Done.** The script runs its first test scan immediately, then quarterly forever.
 
@@ -38,7 +38,7 @@ A comprehensive, automated maintenance and health-check system for Apple Mac com
 
 ```bash
 python3 ~/Library/PCMasterClass/pcm_mac_maintenance.py \
-    --email-to paul@pcmasterclass.com.au \
+    --email-to reports@pcmasterclass.com.au \
     --client-name "Client Surname"
 ```
 

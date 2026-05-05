@@ -43,9 +43,9 @@ During installation:
 
 - [ ] Confirm Terminal opens normally through TeamViewer.
 - [ ] Grant Full Disk Access to Terminal when prompted.
-- [ ] Save SMTP credential into Keychain using the reports Gmail App Password.
+- [ ] Save SMTP credential into Keychain using Paul’s Gmail App Password, with `reports@pcmasterclass.com.au` as the sender alias and recipient.
 - [ ] Confirm first test scan completes.
-- [ ] Confirm report email arrives at `paul@pcmasterclass.com.au`.
+- [ ] Confirm report email arrives at `reports@pcmasterclass.com.au`.
 - [ ] Confirm LaunchAgent is loaded:
   ```bash
   launchctl list | grep pcmasterclass
@@ -54,7 +54,7 @@ During installation:
   ```bash
   python3 ~/Library/PCMasterClass/pcm_mac_maintenance.py \
     --skip-update-check \
-    --email-to paul@pcmasterclass.com.au \
+    --email-to reports@pcmasterclass.com.au \
     --client-name "Paul Test Mac"
   ```
 - [ ] Review the HTML report for false positives/noise.

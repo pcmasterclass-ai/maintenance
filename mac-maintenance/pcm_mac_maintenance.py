@@ -13,12 +13,13 @@ installed via a simple shell script and run periodically via LaunchAgent.
 USAGE:
   First-time credential setup (interactive):
     python3 pcm_mac_maintenance.py --save-credential \
-        --smtp-user reports@pcmasterclass.com.au \
+        --smtp-user paul@pcmasterclass.com.au \
         --smtp-password YOUR_APP_PASSWORD \
-        --email-to paul@pcmasterclass.com.au
+        --email-from reports@pcmasterclass.com.au \
+        --email-to reports@pcmasterclass.com.au
 
   Normal run (pulls credential from macOS Keychain):
-    python3 pcm_mac_maintenance.py --email-to paul@pcmasterclass.com.au
+    python3 pcm_mac_maintenance.py --email-to reports@pcmasterclass.com.au
 
   Options:
     --skip-updates      Skip Apple software update check
@@ -1244,7 +1245,7 @@ def run_agent_health(email_to=""):
     add_check("LaunchAgent loaded", loaded.returncode == 0, loaded.stdout.strip() or loaded.stderr.strip())
 
     if email_to:
-        cred = keychain_load(email_to) or keychain_load("reports@pcmasterclass.com.au")
+        cred = keychain_load(email_to) or keychain_load("reports@pcmasterclass.com.au") or keychain_load("paul@pcmasterclass.com.au")
         add_check("SMTP credential available", bool(cred), email_to or "reports@pcmasterclass.com.au")
 
     try:
@@ -1844,8 +1845,9 @@ def main():
             # Try loading from Keychain
             loaded = keychain_load(args.email_to)
             if not loaded:
-                # Try common sending account
-                loaded = keychain_load("reports@pcmasterclass.com.au")
+                # Try common sending accounts. reports@ is an alias of Paul's mailbox,
+                # so the SMTP login credential is normally stored under paul@.
+                loaded = keychain_load("reports@pcmasterclass.com.au") or keychain_load("paul@pcmasterclass.com.au")
             if loaded:
                 smtp_config = loaded
                 logger.info(f"Loaded SMTP credentials from Keychain for {loaded['smtp_user']}")

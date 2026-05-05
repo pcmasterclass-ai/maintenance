@@ -106,7 +106,7 @@ xattr -cr ~/Library/PCMasterClass/Scripts/pcm_mac_maintenance.py
 
 # 4. Run with test flag (adds [TEST] to email subject)
 python3 ~/Library/PCMasterClass/Scripts/pcm_mac_maintenance.py \
-    --email-to paul@pcmasterclass.com.au \
+    --email-to reports@pcmasterclass.com.au \
     --client-name "TEST Mac" \
     --report-path ~/Library/PCMasterClass/Reports
 

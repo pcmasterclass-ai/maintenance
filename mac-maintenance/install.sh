@@ -127,10 +127,14 @@ echo "  3. Copy the 16-character password (e.g. abcd efgh ijkl mnop)"
 echo "  4. Paste it below when prompted"
 echo ""
 
-read -p "Email address (e.g. reports@pcmasterclass.com.au): " SMTP_USER
+read -p "SMTP login email [paul@pcmasterclass.com.au]: " SMTP_USER
+SMTP_USER=${SMTP_USER:-paul@pcmasterclass.com.au}
 read -s -p "App Password: " SMTP_PASS
 echo ""
-read -p "Recipient email (e.g. paul@pcmasterclass.com.au): " EMAIL_TO
+read -p "From email alias [reports@pcmasterclass.com.au]: " EMAIL_FROM
+EMAIL_FROM=${EMAIL_FROM:-reports@pcmasterclass.com.au}
+read -p "Recipient email [reports@pcmasterclass.com.au]: " EMAIL_TO
+EMAIL_TO=${EMAIL_TO:-reports@pcmasterclass.com.au}
 
 if [ -z "$SMTP_USER" ] || [ -z "$SMTP_PASS" ]; then
     echo "WARNING: No credentials provided. You'll need to run credential setup manually:"
@@ -140,6 +144,7 @@ else
     python3 "$INSTALL_DIR/$SCRIPT_NAME" --save-credential \
         --smtp-user "$SMTP_USER" \
         --smtp-password "$SMTP_PASS" \
+        --email-from "$EMAIL_FROM" \
         --email-to "$EMAIL_TO"
     echo "[+] Credentials saved to macOS Keychain securely."
 fi
