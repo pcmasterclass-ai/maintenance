@@ -60,7 +60,7 @@ from pathlib import Path
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.0.1"
 UPDATE_URL = "https://raw.githubusercontent.com/pcmasterclass-ai/maintenance/main/mac-maintenance/pcm_mac_maintenance.py"
 UPDATE_TOKEN = ""  # Leave empty for public repos
 
