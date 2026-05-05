@@ -1887,6 +1887,8 @@ def main():
         logger.info("Sending report via email...")
         email_result = send_email(report_html, args.email_to, smtp_config, str(log_file))
         logger.info(f"Email result: {email_result['Status']}")
+        if email_result.get("Status") == "ERROR":
+            logger.error(f"Email error detail: {email_result.get('Error', 'Unknown email error')}")
 
     # Print summary
     warnings = sum(1 for r in results.values() if isinstance(r, dict) and r.get("Status") == "WARNING")
