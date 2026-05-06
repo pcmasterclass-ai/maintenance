@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 PC Master Class - macOS Maintenance Script
-Version: 1.0.0
+Version: 1.0.4
 Author: Paul Benjamin
 License: Proprietary
 
@@ -25,6 +25,7 @@ USAGE:
     --skip-updates      Skip Apple software update check
     --skip-smart        Skip disk health/SMART check (requires smartmontools)
     --client-name       Client name for report header
+    --computer-name     Optional friendly computer/device name override
     --report-path       Custom path for report output
     --email-to          Send report via email
     --smtp-user         SMTP username
@@ -37,6 +38,7 @@ USAGE:
 """
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -60,8 +62,9 @@ from pathlib import Path
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-SCRIPT_VERSION = "1.0.3"
+SCRIPT_VERSION = "1.0.4"
 UPDATE_URL = "https://raw.githubusercontent.com/pcmasterclass-ai/maintenance/main/mac-maintenance/pcm_mac_maintenance.py"
+UPDATE_API_URL = "https://api.github.com/repos/pcmasterclass-ai/maintenance/contents/mac-maintenance/pcm_mac_maintenance.py?ref=main"
 UPDATE_TOKEN = ""  # Leave empty for public repos
 
 # macOS Keychain service name for stored credentials
@@ -230,10 +233,25 @@ def check_and_update():
         if UPDATE_TOKEN:
             headers["Authorization"] = f"token {UPDATE_TOKEN}"
 
-        req = urllib.request.Request(UPDATE_URL, headers=headers)
         context = ssl.create_default_context()
-        with urllib.request.urlopen(req, context=context, timeout=15) as response:
-            remote_content = response.read().decode('utf-8')
+        remote_content = ""
+
+        # Prefer GitHub's Contents API because raw.githubusercontent.com can be
+        # stale behind CDN caches after a push. Fall back to the raw URL if the
+        # API is unavailable.
+        try:
+            api_req = urllib.request.Request(UPDATE_API_URL, headers=headers)
+            with urllib.request.urlopen(api_req, context=context, timeout=15) as response:
+                payload = json.loads(response.read().decode('utf-8'))
+            if payload.get("encoding") == "base64" and payload.get("content"):
+                remote_content = base64.b64decode(payload["content"]).decode('utf-8')
+        except Exception:
+            remote_content = ""
+
+        if not remote_content:
+            req = urllib.request.Request(UPDATE_URL, headers=headers)
+            with urllib.request.urlopen(req, context=context, timeout=15) as response:
+                remote_content = response.read().decode('utf-8')
 
         # Extract remote version
         match = re.search(r'SCRIPT_VERSION\s*=\s*"([^"]+)"', remote_content)
@@ -274,6 +292,93 @@ def check_and_update():
 
 
 # ============================================================================
+# MAC HARDWARE DISPLAY NAME HELPERS
+# ============================================================================
+def _normalize_chip_name(value):
+    """Return a readable Apple/Intel processor label from system_profiler/sysctl values."""
+    if not value or value == "Unknown":
+        return "Unknown"
+    value = re.sub(r"\s+", " ", str(value)).strip()
+    if value.startswith("Apple "):
+        return value
+    # system_profiler normally reports Apple Silicon as "Apple Mx...". For Intel,
+    # keep the CPU brand but trim noisy clock-speed suffixes where practical.
+    return value.replace("(R)", "").replace("(TM)", "").strip()
+
+
+# High-value Apple Silicon model identifier mappings for report display names.
+# Fallbacks still work if an unknown future identifier appears; the report will show
+# the system_profiler model name plus processor rather than a guessed size/year.
+MODEL_IDENTIFIER_DETAILS = {
+    # MacBook Air
+    "Mac14,2": {"friendly_model": "13-inch MacBook Air", "release_year": "2022"},
+    "Mac14,15": {"friendly_model": "15-inch MacBook Air", "release_year": "2023"},
+    "Mac15,12": {"friendly_model": "13-inch MacBook Air", "release_year": "2024"},
+    "Mac15,13": {"friendly_model": "15-inch MacBook Air", "release_year": "2024"},
+    "Mac16,12": {"friendly_model": "13-inch MacBook Air", "release_year": "2025"},
+    "Mac16,13": {"friendly_model": "15-inch MacBook Air", "release_year": "2025"},
+
+    # MacBook Pro — Apple Silicon generations where model identifier differentiates size in practice.
+    "MacBookPro17,1": {"friendly_model": "13-inch MacBook Pro", "release_year": "2020"},
+    "MacBookPro18,3": {"friendly_model": "14-inch MacBook Pro", "release_year": "2021"},
+    "MacBookPro18,4": {"friendly_model": "14-inch MacBook Pro", "release_year": "2021"},
+    "MacBookPro18,1": {"friendly_model": "16-inch MacBook Pro", "release_year": "2021"},
+    "MacBookPro18,2": {"friendly_model": "16-inch MacBook Pro", "release_year": "2021"},
+    "Mac14,5": {"friendly_model": "14-inch MacBook Pro", "release_year": "2023"},
+    "Mac14,9": {"friendly_model": "14-inch MacBook Pro", "release_year": "2023"},
+    "Mac14,6": {"friendly_model": "16-inch MacBook Pro", "release_year": "2023"},
+    "Mac14,10": {"friendly_model": "16-inch MacBook Pro", "release_year": "2023"},
+    "Mac15,3": {"friendly_model": "14-inch MacBook Pro", "release_year": "2023"},
+    "Mac15,6": {"friendly_model": "14-inch MacBook Pro", "release_year": "2023"},
+    "Mac15,8": {"friendly_model": "14-inch MacBook Pro", "release_year": "2023"},
+    "Mac15,10": {"friendly_model": "14-inch MacBook Pro", "release_year": "2023"},
+    "Mac15,7": {"friendly_model": "16-inch MacBook Pro", "release_year": "2023"},
+    "Mac15,9": {"friendly_model": "16-inch MacBook Pro", "release_year": "2023"},
+    "Mac15,11": {"friendly_model": "16-inch MacBook Pro", "release_year": "2023"},
+    "Mac16,1": {"friendly_model": "14-inch MacBook Pro", "release_year": "2024"},
+    "Mac16,6": {"friendly_model": "14-inch MacBook Pro", "release_year": "2024"},
+    "Mac16,8": {"friendly_model": "16-inch MacBook Pro", "release_year": "2024"},
+    "Mac16,10": {"friendly_model": "16-inch MacBook Pro", "release_year": "2024"},
+
+    # iMac
+    "iMac21,1": {"friendly_model": "24-inch iMac", "release_year": "2021"},
+    "iMac21,2": {"friendly_model": "24-inch iMac", "release_year": "2021"},
+    "Mac15,4": {"friendly_model": "24-inch iMac", "release_year": "2023"},
+    "Mac15,5": {"friendly_model": "24-inch iMac", "release_year": "2023"},
+    "Mac16,2": {"friendly_model": "24-inch iMac", "release_year": "2024"},
+    "Mac16,3": {"friendly_model": "24-inch iMac", "release_year": "2024"},
+
+    # Mac mini / Studio / Pro
+    "Macmini9,1": {"friendly_model": "Mac mini", "release_year": "2020"},
+    "Mac14,3": {"friendly_model": "Mac mini", "release_year": "2023"},
+    "Mac14,12": {"friendly_model": "Mac mini", "release_year": "2023"},
+    "Mac16,11": {"friendly_model": "Mac mini", "release_year": "2024"},
+    "Mac16,15": {"friendly_model": "Mac mini", "release_year": "2024"},
+    "Mac13,1": {"friendly_model": "Mac Studio", "release_year": "2022"},
+    "Mac13,2": {"friendly_model": "Mac Studio", "release_year": "2022"},
+    "Mac14,13": {"friendly_model": "Mac Studio", "release_year": "2023"},
+    "Mac14,14": {"friendly_model": "Mac Studio", "release_year": "2023"},
+    "Mac16,9": {"friendly_model": "Mac Studio", "release_year": "2025"},
+    "Mac14,8": {"friendly_model": "Mac Pro", "release_year": "2023"},
+}
+
+
+def build_hardware_display_name(system_info, computer_name_override=""):
+    """Build a report-friendly computer label from Apple hardware details."""
+    if computer_name_override:
+        return computer_name_override
+
+    model_id = system_info.get("Model") or system_info.get("ModelName") or ""
+    details = MODEL_IDENTIFIER_DETAILS.get(model_id, {})
+    friendly_model = details.get("friendly_model") or system_info.get("MachineName") or system_info.get("ModelName") or "Mac"
+    processor = _normalize_chip_name(system_info.get("ProcessorName") or system_info.get("Chip") or system_info.get("CPU") or "")
+    release_year = details.get("release_year", "")
+
+    extra = ", ".join(part for part in (processor if processor != "Unknown" else "", release_year) if part)
+    return f"{friendly_model} ({extra})" if extra else friendly_model
+
+
+# ============================================================================
 # SYSTEM INFO MODULE
 # ============================================================================
 def run_system_info():
@@ -302,6 +407,9 @@ def run_system_info():
     except Exception:
         result["CPU"] = "Unknown"
 
+    if result.get("ProcessorName") in (None, "", "Unknown") and result.get("CPU"):
+        result["ProcessorName"] = _normalize_chip_name(result.get("CPU", "Unknown").split("(")[0].strip())
+
     # RAM
     try:
         mem_bytes = int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, check=True).stdout.strip())
@@ -316,11 +424,18 @@ def run_system_info():
         sp = data.get("SPHardwareDataType", [{}])[0]
         result["SerialNumber"] = sp.get("serial_number", "Unknown")
         result["Manufacturer"] = "Apple"
-        result["ModelName"] = sp.get("machine_model", "Unknown")
+        # system_profiler uses different keys across macOS/CPU generations.
+        result["MachineName"] = sp.get("machine_name", "")
+        result["ModelName"] = sp.get("machine_name", sp.get("machine_model", "Unknown"))
+        result["ModelIdentifier"] = sp.get("machine_model", result.get("Model", "Unknown"))
+        result["ProcessorName"] = _normalize_chip_name(sp.get("chip_type") or sp.get("current_processor_speed") or sp.get("cpu_type", "Unknown"))
     except Exception:
         result["SerialNumber"] = "Unknown"
         result["Manufacturer"] = "Apple"
+        result["MachineName"] = "Unknown"
         result["ModelName"] = "Unknown"
+        result["ModelIdentifier"] = result.get("Model", "Unknown")
+        result["ProcessorName"] = "Unknown"
 
     # Boot time / uptime
     try:
@@ -1283,11 +1398,13 @@ def run_agent_health(email_to=""):
 # ============================================================================
 # HTML REPORT GENERATOR
 # ============================================================================
-def generate_html_report(results, client_name="", script_version=SCRIPT_VERSION):
+def generate_html_report(results, client_name="", computer_name="", script_version=SCRIPT_VERSION):
     """Generate a branded HTML maintenance report matching the PC version style."""
     
     hostname = platform.node()
     os_ver = platform.mac_ver()[0]
+    sys_info = results.get("SystemInfo", {})
+    display_computer_name = build_hardware_display_name(sys_info, computer_name)
     now = datetime.now().strftime("%A, %d %B %Y %I:%M %p")
     
     # Count warnings and errors
@@ -1341,7 +1458,7 @@ def generate_html_report(results, client_name="", script_version=SCRIPT_VERSION)
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Maintenance Report — {hostname}</title>
+<title>Maintenance Report — {display_computer_name}</title>
 <style>
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
     body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f1f5f9; color: #1e293b; line-height: 1.5; padding: 20px; }}
@@ -1380,7 +1497,7 @@ def generate_html_report(results, client_name="", script_version=SCRIPT_VERSION)
 
 <div class="header">
     <h1>PC Master Class — Maintenance Report</h1>
-    <div class="subtitle">{client_name + ' • ' if client_name else ''}{hostname} • macOS {os_ver} • {now}</div>
+    <div class="subtitle">{client_name + ' • ' if client_name else ''}{display_computer_name} • macOS {os_ver} • {now}</div>
     <div class="overall">Overall Status: {overall_badge} &nbsp; ({warning_count} warning(s), {error_count} error(s))</div>
 </div>
 
@@ -1409,11 +1526,13 @@ def generate_html_report(results, client_name="", script_version=SCRIPT_VERSION)
     <h2><span class="icon">&#x1F4BB;</span> System Information</h2>
     <table>
         {"<tr><td><strong>Client</strong></td><td><strong style='font-size:1.1em;'>" + client_name + "</strong></td></tr>" if client_name else ""}
-        <tr><td><strong>Computer</strong></td><td>{sys.get("Hostname", hostname)}</td></tr>
-        <tr><td><strong>Make / Model</strong></td><td>{sys.get("Manufacturer", "Apple")} {sys.get("ModelName", "Unknown")} ({sys.get("Model", "")})</td></tr>
+        <tr><td><strong>Computer</strong></td><td><strong style='font-size:1.1em;'>{display_computer_name}</strong></td></tr>
+        <tr><td><strong>Hostname</strong></td><td>{sys.get("Hostname", hostname)}</td></tr>
+        <tr><td><strong>Make / Model</strong></td><td>{sys.get("Manufacturer", "Apple")} {sys.get("ModelName", "Unknown")} ({sys.get("ModelIdentifier", sys.get("Model", ""))})</td></tr>
+        <tr><td><strong>Processor</strong></td><td>{sys.get("ProcessorName", sys.get("CPU", "Unknown"))}</td></tr>
         <tr><td><strong>Serial Number</strong></td><td>{sys.get("SerialNumber", "Unknown")}</td></tr>
         <tr><td><strong>macOS</strong></td><td>{sys.get("OS", os_ver)} ({sys.get("Build", "")})</td></tr>
-        <tr><td><strong>CPU</strong></td><td>{sys.get("CPU", "Unknown")}</td></tr>
+        <tr><td><strong>CPU Detail</strong></td><td>{sys.get("CPU", "Unknown")}</td></tr>
         <tr><td><strong>RAM</strong></td><td>{sys.get("RAM_GB", "?")} GB</td></tr>
         <tr><td><strong>FileVault</strong></td><td>{sys.get("FileVault", "Unknown")}</td></tr>
         {"<tr><td><strong>Battery</strong></td><td>" + str(sys.get("Battery", "")) + "</td></tr>" if sys.get("Battery") else ""}
@@ -1773,11 +1892,12 @@ def generate_html_report(results, client_name="", script_version=SCRIPT_VERSION)
 # ============================================================================
 # EMAIL MODULE
 # ============================================================================
-def send_email(report_html, to_addr, smtp_config, log_file=None):
+def send_email(report_html, to_addr, smtp_config, log_file=None, subject_computer_name=""):
     """Send the HTML report via SMTP."""
     try:
         msg = MIMEMultipart('alternative')
-        msg['Subject'] = f"Maintenance Report — {platform.node()}" if "test" not in sys.argv else f"[TEST] Maintenance Report — {platform.node()}"
+        subject_name = subject_computer_name or platform.node()
+        msg['Subject'] = f"Maintenance Report — {subject_name}" if "test" not in sys.argv else f"[TEST] Maintenance Report — {subject_name}"
         msg['From'] = smtp_config.get("email_from", smtp_config["smtp_user"])
         msg['To'] = to_addr
 
@@ -1812,6 +1932,7 @@ def main():
     parser.add_argument("--skip-updates", action="store_true", help="Skip software update check")
     parser.add_argument("--skip-smart", action="store_true", help="Skip SMART disk health check")
     parser.add_argument("--client-name", default="", help="Client name for report header")
+    parser.add_argument("--computer-name", default="", help="Optional friendly computer/device name override for report header")
     parser.add_argument("--report-path", default=str(Path.home() / "Library/PCMasterClass/Reports"), help="Report output directory")
     parser.add_argument("--email-to", default="", help="Send report via email")
     parser.add_argument("--smtp-user", default="", help="SMTP username")
@@ -1903,7 +2024,9 @@ def main():
     results["AgentHealth"] = run_agent_health(args.email_to)
 
     # Generate report
-    report_html = generate_html_report(results, args.client_name, SCRIPT_VERSION)
+    display_computer_name = build_hardware_display_name(results.get("SystemInfo", {}), args.computer_name)
+    logger.info(f"Report display computer: {display_computer_name}")
+    report_html = generate_html_report(results, args.client_name, args.computer_name, SCRIPT_VERSION)
     report_file = report_path / f"{platform.node()}_Maintenance_{timestamp}.html"
     report_file.write_text(report_html, encoding='utf-8')
     logger.info(f"Report saved to: {report_file}")
@@ -1912,7 +2035,7 @@ def main():
     email_result = {"Status": "Not configured"}
     if args.email_to and smtp_config:
         logger.info("Sending report via email...")
-        email_result = send_email(report_html, args.email_to, smtp_config, str(log_file))
+        email_result = send_email(report_html, args.email_to, smtp_config, str(log_file), display_computer_name)
         logger.info(f"Email result: {email_result['Status']}")
         if email_result.get("Status") == "ERROR":
             logger.error(f"Email error detail: {email_result.get('Error', 'Unknown email error')}")
