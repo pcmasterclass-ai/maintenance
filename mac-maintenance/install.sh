@@ -89,7 +89,14 @@ echo ""
 echo "If you skip this step, the script will still run but some checks"
 echo "(e.g. browser extensions) will return limited results."
 echo ""
-read -p "Press Enter once you've granted Full Disk Access (or to skip)..."
+# When this installer is run via `curl ... | bash`, stdin is the downloaded
+# script rather than the user's keyboard. Read interactive answers from the
+# controlling terminal so prompts still work correctly.
+TTY_INPUT="/dev/tty"
+if [ ! -r "$TTY_INPUT" ]; then
+    TTY_INPUT="/dev/stdin"
+fi
+read -r -p "Press Enter once you've granted Full Disk Access (or to skip)..." < "$TTY_INPUT"
 
 # ---------------------------------------------------------------------------
 # Gatekeeper check
@@ -127,13 +134,13 @@ echo "  3. Copy the 16-character password (e.g. abcd efgh ijkl mnop)"
 echo "  4. Paste it below when prompted"
 echo ""
 
-read -p "SMTP login email [paul@pcmasterclass.com.au]: " SMTP_USER
+read -r -p "SMTP login email [paul@pcmasterclass.com.au]: " SMTP_USER < "$TTY_INPUT"
 SMTP_USER=${SMTP_USER:-paul@pcmasterclass.com.au}
-read -s -p "App Password: " SMTP_PASS
+read -r -s -p "App Password: " SMTP_PASS < "$TTY_INPUT"
 echo ""
-read -p "From email alias [reports@pcmasterclass.com.au]: " EMAIL_FROM
+read -r -p "From email alias [reports@pcmasterclass.com.au]: " EMAIL_FROM < "$TTY_INPUT"
 EMAIL_FROM=${EMAIL_FROM:-reports@pcmasterclass.com.au}
-read -p "Recipient email [reports@pcmasterclass.com.au]: " EMAIL_TO
+read -r -p "Recipient email [reports@pcmasterclass.com.au]: " EMAIL_TO < "$TTY_INPUT"
 EMAIL_TO=${EMAIL_TO:-reports@pcmasterclass.com.au}
 
 if [ -z "$SMTP_USER" ] || [ -z "$SMTP_PASS" ]; then
@@ -253,7 +260,7 @@ echo "========================================"
 echo ""
 echo "Running a test scan now. This will generate a report and email it to you."
 echo ""
-read -p "Press Enter to run the test scan..."
+read -r -p "Press Enter to run the test scan..." < "$TTY_INPUT"
 
 TEST_REPORT="$REPORT_DIR/$(hostname)_Maintenance_$(date +%Y-%m-%d_%H-%M-%S).html"
 python3 "$INSTALL_DIR/$SCRIPT_NAME" \
