@@ -60,7 +60,7 @@ from pathlib import Path
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-SCRIPT_VERSION = "1.0.2"
+SCRIPT_VERSION = "1.0.3"
 UPDATE_URL = "https://raw.githubusercontent.com/pcmasterclass-ai/maintenance/main/mac-maintenance/pcm_mac_maintenance.py"
 UPDATE_TOKEN = ""  # Leave empty for public repos
 
@@ -1781,15 +1781,23 @@ def send_email(report_html, to_addr, smtp_config, log_file=None):
         msg['From'] = smtp_config.get("email_from", smtp_config["smtp_user"])
         msg['To'] = to_addr
 
+        envelope_recipients = [to_addr]
+        if to_addr.lower() == "reports@pcmasterclass.com.au":
+            # reports@ is an alias of Paul's own mailbox. Gmail accepts the SMTP
+            # send, but self-sent alias mail can land only in All Mail/Sent and
+            # not surface in Inbox. Bcc Paul's real mailbox so the report is
+            # visible while keeping the report addressed to reports@.
+            envelope_recipients.append("paul@pcmasterclass.com.au")
+
         # Attach HTML
         msg.attach(MIMEText(report_html, 'html', 'utf-8'))
 
         with smtplib.SMTP(smtp_config["smtp_server"], smtp_config["smtp_port"]) as server:
             server.starttls(context=ssl.create_default_context())
             server.login(smtp_config["smtp_user"], smtp_config["smtp_password"])
-            server.send_message(msg)
+            server.sendmail(msg['From'], envelope_recipients, msg.as_string())
 
-        return {"Status": "Sent", "To": to_addr, "Server": smtp_config["smtp_server"]}
+        return {"Status": "Sent", "To": to_addr, "EnvelopeRecipients": ", ".join(envelope_recipients), "Server": smtp_config["smtp_server"]}
     except Exception as e:
         return {"Status": "ERROR", "Error": str(e)}
 
