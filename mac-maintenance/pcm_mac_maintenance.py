@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 PC Master Class - macOS Maintenance Script
-Version: 1.0.4
+Version: 1.0.5
 Author: Paul Benjamin
 License: Proprietary
 
@@ -62,7 +62,7 @@ from pathlib import Path
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-SCRIPT_VERSION = "1.0.4"
+SCRIPT_VERSION = "1.0.5"
 UPDATE_URL = "https://raw.githubusercontent.com/pcmasterclass-ai/maintenance/main/mac-maintenance/pcm_mac_maintenance.py"
 UPDATE_API_URL = "https://api.github.com/repos/pcmasterclass-ai/maintenance/contents/mac-maintenance/pcm_mac_maintenance.py?ref=main"
 UPDATE_TOKEN = ""  # Leave empty for public repos
@@ -295,15 +295,24 @@ def check_and_update():
 # MAC HARDWARE DISPLAY NAME HELPERS
 # ============================================================================
 def _normalize_chip_name(value):
-    """Return a readable Apple/Intel processor label from system_profiler/sysctl values."""
+    """Return a readable processor label from system_profiler/sysctl values."""
     if not value or value == "Unknown":
         return "Unknown"
     value = re.sub(r"\s+", " ", str(value)).strip()
+    # Keep report display names concise: "M4 Max" rather than "Apple M4 Max".
     if value.startswith("Apple "):
+        return value.removeprefix("Apple ").strip()
+    # For Intel, keep the CPU brand but trim noisy trademark markers/clock suffixes.
+    value = value.replace("(R)", "").replace("(TM)", "").strip()
+    value = re.sub(r"\s+CPU\s+@\s+.*$", "", value).strip()
+    return value
+
+
+def _shorten_model_name(value):
+    """Use compact report wording: 16" MacBook Pro, 24" iMac, etc."""
+    if not value:
         return value
-    # system_profiler normally reports Apple Silicon as "Apple Mx...". For Intel,
-    # keep the CPU brand but trim noisy clock-speed suffixes where practical.
-    return value.replace("(R)", "").replace("(TM)", "").strip()
+    return re.sub(r"(\d+(?:\.\d+)?)\s*-?inch", r'\1"', value, flags=re.IGNORECASE)
 
 
 # High-value Apple Silicon model identifier mappings for report display names.
@@ -370,7 +379,7 @@ def build_hardware_display_name(system_info, computer_name_override=""):
 
     model_id = system_info.get("Model") or system_info.get("ModelName") or ""
     details = MODEL_IDENTIFIER_DETAILS.get(model_id, {})
-    friendly_model = details.get("friendly_model") or system_info.get("MachineName") or system_info.get("ModelName") or "Mac"
+    friendly_model = _shorten_model_name(details.get("friendly_model") or system_info.get("MachineName") or system_info.get("ModelName") or "Mac")
     processor = _normalize_chip_name(system_info.get("ProcessorName") or system_info.get("Chip") or system_info.get("CPU") or "")
     release_year = details.get("release_year", "")
 
