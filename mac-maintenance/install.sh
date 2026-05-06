@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================================
 # PC Master Class — macOS Maintenance Script Installer
-# Version: 1.0.0
+# Version: 1.0.1
 # ============================================================================
 # Usage:
 #   chmod +x install.sh
@@ -30,7 +30,7 @@ SCRIPT_NAME="pcm_mac_maintenance.py"
 
 echo "=========================================="
 echo "PC Master Class macOS Maintenance"
-echo "Installer v1.0.0"
+echo "Installer v1.0.1"
 echo "=========================================="
 echo ""
 
@@ -136,8 +136,16 @@ echo ""
 
 read -r -p "SMTP login email [paul@pcmasterclass.com.au]: " SMTP_USER < "$TTY_INPUT"
 SMTP_USER=${SMTP_USER:-paul@pcmasterclass.com.au}
-read -r -s -p "App Password: " SMTP_PASS < "$TTY_INPUT"
-echo ""
+
+SMTP_PASS=""
+while [ -z "$SMTP_PASS" ]; do
+    read -r -s -p "App Password: " SMTP_PASS < "$TTY_INPUT"
+    echo ""
+    if [ -z "$SMTP_PASS" ]; then
+        echo "App Password cannot be blank. Please paste the Gmail App Password from 1Password."
+    fi
+done
+
 read -r -p "From email alias [reports@pcmasterclass.com.au]: " EMAIL_FROM < "$TTY_INPUT"
 EMAIL_FROM=${EMAIL_FROM:-reports@pcmasterclass.com.au}
 read -r -p "Recipient email [reports@pcmasterclass.com.au]: " EMAIL_TO < "$TTY_INPUT"
