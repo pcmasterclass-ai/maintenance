@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 PC Master Class - macOS Maintenance Script
-Version: 1.0.5
+Version: 1.0.6
 Author: Paul Benjamin
 License: Proprietary
 
@@ -13,9 +13,9 @@ installed via a simple shell script and run periodically via LaunchAgent.
 USAGE:
   First-time credential setup (interactive):
     python3 pcm_mac_maintenance.py --save-credential \
-        --smtp-user paul@pcmasterclass.com.au \
+        --smtp-user maintenance-reports@pcmasterclass.com.au \
         --smtp-password YOUR_APP_PASSWORD \
-        --email-from reports@pcmasterclass.com.au \
+        --email-from maintenance-reports@pcmasterclass.com.au \
         --email-to reports@pcmasterclass.com.au
 
   Normal run (pulls credential from macOS Keychain):
@@ -62,7 +62,7 @@ from pathlib import Path
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-SCRIPT_VERSION = "1.0.5"
+SCRIPT_VERSION = "1.0.6"
 UPDATE_URL = "https://raw.githubusercontent.com/pcmasterclass-ai/maintenance/main/mac-maintenance/pcm_mac_maintenance.py"
 UPDATE_API_URL = "https://api.github.com/repos/pcmasterclass-ai/maintenance/contents/mac-maintenance/pcm_mac_maintenance.py?ref=main"
 UPDATE_TOKEN = ""  # Leave empty for public repos
@@ -185,12 +185,20 @@ def keychain_load(account):
 
 
 def load_smtp_credentials(email_to=""):
-    """Load SMTP credentials, preferring Paul's mailbox login for the reports@ alias."""
+    """Load SMTP credentials, preferring the dedicated maintenance mailbox.
+
+    `reports@pcmasterclass.com.au` remains the intake alias during transition;
+    new Macs should authenticate as `maintenance-reports@pcmasterclass.com.au`.
+    Paul's mailbox is retained only as a legacy fallback for already-configured pilots.
+    """
     accounts = []
-    if email_to and email_to.lower() != "reports@pcmasterclass.com.au":
+    if email_to and email_to.lower() not in ("reports@pcmasterclass.com.au", "maintenance-reports@pcmasterclass.com.au"):
         accounts.append(email_to)
-    # reports@ is an alias of Paul's mailbox. Prefer the real SMTP login first.
-    accounts.extend(["paul@pcmasterclass.com.au", "reports@pcmasterclass.com.au"])
+    accounts.extend([
+        "maintenance-reports@pcmasterclass.com.au",
+        "paul@pcmasterclass.com.au",       # legacy fallback only
+        "reports@pcmasterclass.com.au",    # stale alias fallback only
+    ])
 
     seen = set()
     for account in accounts:
@@ -1911,11 +1919,14 @@ def send_email(report_html, to_addr, smtp_config, log_file=None, subject_compute
         msg['To'] = to_addr
 
         envelope_recipients = [to_addr]
-        if to_addr.lower() == "reports@pcmasterclass.com.au":
-            # reports@ is an alias of Paul's own mailbox. Gmail accepts the SMTP
-            # send, but self-sent alias mail can land only in All Mail/Sent and
-            # not surface in Inbox. Bcc Paul's real mailbox so the report is
-            # visible while keeping the report addressed to reports@.
+        if (
+            to_addr.lower() == "reports@pcmasterclass.com.au"
+            and smtp_config.get("smtp_user", "").lower() == "paul@pcmasterclass.com.au"
+        ):
+            # Legacy pilot mode only: when authenticating as Paul's mailbox and
+            # sending to the reports@ alias, Gmail may keep self-sent alias mail
+            # in All Mail/Sent only. New installs authenticate as the dedicated
+            # maintenance-reports mailbox and do not need this Bcc fallback.
             envelope_recipients.append("paul@pcmasterclass.com.au")
 
         # Attach HTML
@@ -2000,8 +2011,8 @@ def main():
                 "email_from": args.email_from or args.smtp_user,
             }
         else:
-            # Try loading from Keychain. reports@ is an alias of Paul's mailbox,
-            # so prefer the real SMTP login credential stored under paul@.
+            # Try loading from Keychain, preferring the dedicated maintenance mailbox.
+            # Paul's mailbox remains a legacy fallback only.
             loaded = load_smtp_credentials(args.email_to)
             if loaded:
                 smtp_config = loaded
