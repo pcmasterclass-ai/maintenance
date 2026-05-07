@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 PC Master Class - macOS Maintenance Script
-Version: 1.0.6
+Version: 1.0.7
 Author: Paul Benjamin
 License: Proprietary
 
@@ -62,7 +62,7 @@ from pathlib import Path
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-SCRIPT_VERSION = "1.0.6"
+SCRIPT_VERSION = "1.0.7"
 UPDATE_URL = "https://raw.githubusercontent.com/pcmasterclass-ai/maintenance/main/mac-maintenance/pcm_mac_maintenance.py"
 UPDATE_API_URL = "https://api.github.com/repos/pcmasterclass-ai/maintenance/contents/mac-maintenance/pcm_mac_maintenance.py?ref=main"
 UPDATE_TOKEN = ""  # Leave empty for public repos
@@ -1909,12 +1909,40 @@ def generate_html_report(results, client_name="", computer_name="", script_versi
 # ============================================================================
 # EMAIL MODULE
 # ============================================================================
-def send_email(report_html, to_addr, smtp_config, log_file=None, subject_computer_name=""):
+def format_client_name_for_subject(client_name):
+    """Return client name for email subject with surname in caps.
+
+    Tactical client names are normally stored as `Surname, Firstname`. If the
+    name is not comma-separated, keep it unchanged rather than guessing.
+    """
+    client_name = (client_name or "").strip()
+    if "," not in client_name:
+        return client_name
+    surname, rest = client_name.split(",", 1)
+    return f"{surname.strip().upper()}, {rest.strip()}" if rest.strip() else surname.strip().upper()
+
+
+def format_report_date_for_subject(dt=None):
+    """Return date as `7 May 2026` without a leading zero on the day."""
+    dt = dt or datetime.now()
+    return f"{dt.day} {dt.strftime('%B %Y')}"
+
+
+def build_email_subject(client_name="", site_name="", dt=None):
+    """Build report subject: `SURNAME, Firstname - Site - Maintenance Report - Date`."""
+    subject_client = format_client_name_for_subject(client_name)
+    subject_site = (site_name or platform.node()).strip()
+    subject_date = format_report_date_for_subject(dt)
+    parts = [p for p in [subject_client, subject_site, "Maintenance Report", subject_date] if p]
+    subject = " - ".join(parts)
+    return f"[TEST] {subject}" if "test" in sys.argv else subject
+
+
+def send_email(report_html, to_addr, smtp_config, log_file=None, subject_computer_name="", client_name=""):
     """Send the HTML report via SMTP."""
     try:
         msg = MIMEMultipart('alternative')
-        subject_name = subject_computer_name or platform.node()
-        msg['Subject'] = f"Maintenance Report — {subject_name}" if "test" not in sys.argv else f"[TEST] Maintenance Report — {subject_name}"
+        msg['Subject'] = build_email_subject(client_name, subject_computer_name)
         msg['From'] = smtp_config.get("email_from", smtp_config["smtp_user"])
         msg['To'] = to_addr
 
@@ -2055,7 +2083,7 @@ def main():
     email_result = {"Status": "Not configured"}
     if args.email_to and smtp_config:
         logger.info("Sending report via email...")
-        email_result = send_email(report_html, args.email_to, smtp_config, str(log_file), display_computer_name)
+        email_result = send_email(report_html, args.email_to, smtp_config, str(log_file), display_computer_name, args.client_name)
         logger.info(f"Email result: {email_result['Status']}")
         if email_result.get("Status") == "ERROR":
             logger.error(f"Email error detail: {email_result.get('Error', 'Unknown email error')}")
