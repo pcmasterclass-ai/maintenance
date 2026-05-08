@@ -1275,10 +1275,18 @@ def run_browser_extensions():
 
     safari_dirs = [Path.home() / "Library/Safari/Extensions", Path.home() / "Library/Containers/com.apple.Safari/Data/Library/Safari/Extensions"]
     for sdir in safari_dirs:
-        if sdir.exists():
-            for item in sdir.iterdir():
-                if item.is_file() or item.is_dir():
-                    result["SafariExtensions"].append({"Name": item.name, "Path": str(item)})
+        try:
+            if sdir.exists():
+                for item in sdir.iterdir():
+                    if item.is_file() or item.is_dir():
+                        result["SafariExtensions"].append({"Name": item.name, "Path": str(item)})
+        except PermissionError:
+            result["Status"] = "WARNING"
+            result.setdefault("Warnings", []).append(f"Safari extensions inaccessible due to macOS privacy permissions: {sdir}")
+        except Exception:
+            # Browser extension inventory should never prevent report generation/email.
+            result["Status"] = "WARNING"
+            result.setdefault("Warnings", []).append(f"Unable to inspect Safari extensions: {sdir}")
 
     return result
 

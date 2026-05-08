@@ -38,6 +38,10 @@ class MacRuntimeInstallerTests(unittest.TestCase):
         self.assertIn('password = "".join(str(password).split())', SCRIPT)
         self.assertIn('args.smtp_password = "".join(args.smtp_password.split())', SCRIPT)
         self.assertIn('SMTP_PASS="${SMTP_PASS//[[:space:]]/}"', INSTALL)
+    def test_browser_extension_inventory_handles_safari_permission_errors(self):
+        self.assertIn('except PermissionError:', SCRIPT)
+        self.assertIn('Browser extension inventory should never prevent report generation/email', SCRIPT)
+        self.assertIn('Safari extensions inaccessible due to macOS privacy permissions', SCRIPT)
 
 
 if __name__ == "__main__":
