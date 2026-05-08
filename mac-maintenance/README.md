@@ -4,7 +4,7 @@ A comprehensive, automated maintenance and health-check system for Apple Mac com
 
 ## Overview
 
-- **Languages:** Python 3 (built into macOS 11+)
+- **Language/runtime:** Python 3 via a lightweight bundled runtime from `python-build-standalone` (avoids Apple Command Line Developer Tools / Xcode downloads)
 - **Scheduling:** macOS LaunchAgent (native alternative to Task Scheduler)
 - **Reporting:** Branded HTML reports with collapsible sections, emailed via Gmail SMTP
 - **Updates:** Auto-pulls latest script from GitHub before each run
@@ -37,7 +37,8 @@ A comprehensive, automated maintenance and health-check system for Apple Mac com
 ## Manual Run
 
 ```bash
-python3 ~/Library/PCMasterClass/pcm_mac_maintenance.py \
+~/Library/PCMasterClass/python-runtime/python/bin/python3 \
+    ~/Library/PCMasterClass/pcm_mac_maintenance.py \
     --email-to reports@pcmasterclass.com.au \
     --client-name "Client Surname"
 ```

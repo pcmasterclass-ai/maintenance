@@ -27,7 +27,7 @@ The script itself auto-updates from GitHub before each run.
     <!-- Program to execute -->
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/python3</string>
+        <string>/Users/REPLACEME/Library/PCMasterClass/python-runtime/python/bin/python3</string>
         <!-- Path to the maintenance script (set during installation) -->
         <string>/Users/REPLACEME/Library/PCMasterClass/pcm_mac_maintenance.py</string>
         <string>--email-to</string>

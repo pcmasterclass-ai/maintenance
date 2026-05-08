@@ -44,7 +44,7 @@ If the script runs without FDA, you'll get empty results for:
 3. Add **Terminal** (if running via Terminal) or **Python** (if running as binary)
 4. Restart Terminal / the script runner
 
-**Note for LaunchAgent:** Since the LaunchAgent runs as the user, and `python3` is located at `/usr/bin/python3` (part of macOS), it generally inherits the user's permissions. However, some directories (e.g. Safari extensions) may still be inaccessible without FDA.
+**Note for LaunchAgent:** The installer writes the LaunchAgent to use the bundled runtime at `~/Library/PCMasterClass/python-runtime/python/bin/python3`, not Apple’s `/usr/bin/python3` stub. This avoids triggering the large Command Line Developer Tools/Xcode install on client Macs. It still runs as the logged-in user, so Full Disk Access behaviour is the same user-scoped TCC model.
 
 ## 3. Notarization & Code Signing
 
@@ -105,7 +105,8 @@ cp pcm_mac_maintenance.py ~/Library/PCMasterClass/Scripts/
 xattr -cr ~/Library/PCMasterClass/Scripts/pcm_mac_maintenance.py
 
 # 4. Run with test flag (adds [TEST] to email subject)
-python3 ~/Library/PCMasterClass/Scripts/pcm_mac_maintenance.py \
+~/Library/PCMasterClass/python-runtime/python/bin/python3 \
+    ~/Library/PCMasterClass/Scripts/pcm_mac_maintenance.py \
     --email-to reports@pcmasterclass.com.au \
     --client-name "TEST Mac" \
     --report-path ~/Library/PCMasterClass/Reports

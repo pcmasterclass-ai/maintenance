@@ -1,137 +1,159 @@
 #!/bin/bash
 # ============================================================================
 # PC Master Class — macOS Maintenance Script Installer
-# Version: 1.0.2
+# Version: 1.1.0
 # ============================================================================
-# Usage:
-#   chmod +x install.sh
-#   ./install.sh
-#
-# This script:
-#   1. Creates the directory structure in ~/Library/PCMasterClass/
-#   2. Installs the main Python maintenance script
-#   3. Installs a LaunchAgent for quarterly execution
-#   4. Prompts for SMTP credential setup
-#   5. Runs an initial test scan
+# Installs a lightweight bundled Python runtime from python-build-standalone so
+# client Macs do NOT need Apple Command Line Developer Tools / Xcode.
 # ============================================================================
 
-set -e  # Exit on any error
+set -euo pipefail
 
 SCRIPT_URL="https://raw.githubusercontent.com/pcmasterclass-ai/maintenance/main/mac-maintenance/pcm_mac_maintenance.py"
-UPDATE_URL="https://raw.githubusercontent.com/pcmasterclass-ai/maintenance/main/mac-maintenance/install.sh"
-LAUNCH_URL="https://raw.githubusercontent.com/pcmasterclass-ai/maintenance/main/mac-maintenance/com.pcmasterclass.maintenance.agent.plist"
-
 INSTALL_DIR="$HOME/Library/PCMasterClass"
-REPORT_DIR="$HOME/Library/PCMasterClass/Reports"
-LOG_DIR="$HOME/Library/PCMasterClass/Logs"
+REPORT_DIR="$INSTALL_DIR/Reports"
+LOG_DIR="$INSTALL_DIR/Logs"
+RUNTIME_DIR="$INSTALL_DIR/python-runtime"
+PYTHON_RUNTIME_DIR="$RUNTIME_DIR/python"
+PYTHON_BIN="$PYTHON_RUNTIME_DIR/bin/python3"
 LAUNCHAGENTS_DIR="$HOME/Library/LaunchAgents"
 PLIST_NAME="com.pcmasterclass.maintenance.agent.plist"
 SCRIPT_NAME="pcm_mac_maintenance.py"
+SCRIPT_PATH="$INSTALL_DIR/$SCRIPT_NAME"
 
-echo "=========================================="
-echo "PC Master Class macOS Maintenance"
-echo "Installer v1.0.2"
-echo "=========================================="
-echo ""
+# python-build-standalone, stripped install-only builds. These are ~27 MB
+# downloads and avoid the 10-20+ GB Apple Developer Tools/Xcode prompt triggered
+# by /usr/bin/python3 on Macs where Python is only an Apple stub.
+PYTHON_VERSION="3.11.15"
+PYTHON_BUILD_TAG="20260504"
+PYTHON_ARM64_URL="https://github.com/astral-sh/python-build-standalone/releases/download/20260504/cpython-3.11.15%2B20260504-aarch64-apple-darwin-install_only_stripped.tar.gz"
+PYTHON_X86_64_URL="https://github.com/astral-sh/python-build-standalone/releases/download/20260504/cpython-3.11.15%2B20260504-x86_64-apple-darwin-install_only_stripped.tar.gz"
 
-# Check macOS version
-OS_MAJOR=$(sw_vers -productVersion | cut -d. -f1)
-if [ "$OS_MAJOR" -lt 11 ]; then
-    echo "WARNING: macOS 11 (Big Sur) or later is strongly recommended."
-    echo "Some features may not work correctly on macOS 10.x."
-    echo "Press Enter to continue or Ctrl-C to abort."
-    read
-fi
+printf '%s\n' "=========================================="
+printf '%s\n' "PC Master Class macOS Maintenance"
+printf '%s\n' "Installer v1.1.0"
+printf '%s\n' "=========================================="
+printf '\n'
 
-# Create directories
-echo "[+] Creating directories..."
-mkdir -p "$INSTALL_DIR" "$REPORT_DIR" "$LOG_DIR" "$LAUNCHAGENTS_DIR"
-
-# Download the main script
-echo "[+] Downloading maintenance script..."
-if command -v curl &> /dev/null; then
-    curl -fsSL "$SCRIPT_URL" -o "$INSTALL_DIR/$SCRIPT_NAME"
-elif command -v wget &> /dev/null; then
-    wget -q "$SCRIPT_URL" -O "$INSTALL_DIR/$SCRIPT_NAME"
-else
-    echo "ERROR: curl or wget is required."
-    exit 1
-fi
-chmod +x "$INSTALL_DIR/$SCRIPT_NAME"
-
-# Verify download
-if [ ! -s "$INSTALL_DIR/$SCRIPT_NAME" ]; then
-    echo "ERROR: Failed to download the maintenance script."
-    exit 1
-fi
-
-echo "[+] Script installed to: $INSTALL_DIR/$SCRIPT_NAME"
-
-# ---------------------------------------------------------------------------
-# Apple Security — Full Disk Access Check
-# ---------------------------------------------------------------------------
-echo ""
-echo "========================================"
-echo "APPLE SECURITY SETUP REQUIRED"
-echo "========================================"
-echo ""
-echo "The maintenance script needs access to system information, user caches,"
-echo "browser extensions, and network settings. macOS requires you to grant"
-echo "Terminal (or the script runner) Full Disk Access."
-echo ""
-echo "Steps to grant access:"
-echo "  1. Open System Settings (or System Preferences on older macOS)"
-echo "  2. Go to Privacy & Security -> Full Disk Access"
-echo "  3. Click the lock icon to make changes (authenticate)"
-echo "  4. Click the '+' button and add 'Terminal' (or 'Python')"
-echo "  5. Restart Terminal for the change to take effect"
-echo ""
-echo "If you skip this step, the script will still run but some checks"
-echo "(e.g. browser extensions) will return limited results."
-echo ""
-# When this installer is run via `curl ... | bash`, stdin is the downloaded
-# script rather than the user's keyboard. Read interactive answers from the
-# controlling terminal so prompts still work correctly.
+# When this installer is run via curl ... | bash, stdin is the downloaded script
+# stream rather than the keyboard. Read prompts from the controlling terminal.
 TTY_INPUT="/dev/tty"
 if [ ! -r "$TTY_INPUT" ]; then
     TTY_INPUT="/dev/stdin"
 fi
-read -r -p "Press Enter once you've granted Full Disk Access (or to skip)..." < "$TTY_INPUT"
 
-# ---------------------------------------------------------------------------
-# Gatekeeper check
-# ---------------------------------------------------------------------------
+need_cmd() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        echo "ERROR: Required command not found: $1"
+        exit 1
+    fi
+}
+
+need_cmd curl
+need_cmd tar
+need_cmd uname
+need_cmd df
+
+OS_MAJOR=$(sw_vers -productVersion | cut -d. -f1)
+if [ "$OS_MAJOR" -lt 11 ]; then
+    echo "WARNING: macOS 11 (Big Sur) or later is strongly recommended."
+    read -r -p "Press Enter to continue or Ctrl-C to abort..." < "$TTY_INPUT"
+fi
+
+mkdir -p "$INSTALL_DIR" "$REPORT_DIR" "$LOG_DIR" "$LAUNCHAGENTS_DIR" "$RUNTIME_DIR"
+
+install_python_runtime() {
+    if [ -x "$PYTHON_BIN" ]; then
+        if "$PYTHON_BIN" - <<'PY' >/dev/null 2>&1
+import sys
+raise SystemExit(0 if sys.version_info[:2] == (3, 11) else 1)
+PY
+        then
+            echo "[+] Bundled Python already installed: $($PYTHON_BIN --version 2>&1)"
+            return
+        fi
+        echo "[!] Existing bundled Python is not the expected version; reinstalling."
+        rm -rf "$PYTHON_RUNTIME_DIR"
+    fi
+
+    ARCH="$(uname -m)"
+    case "$ARCH" in
+        arm64)
+            RUNTIME_URL="$PYTHON_ARM64_URL"
+            ;;
+        x86_64)
+            RUNTIME_URL="$PYTHON_X86_64_URL"
+            ;;
+        *)
+            echo "ERROR: Unsupported Mac architecture: $ARCH"
+            exit 1
+            ;;
+    esac
+
+    # Keep a conservative floor; the runtime is about 27 MB compressed and
+    # typically well under 200 MB installed, but extraction needs temporary room.
+    AVAILABLE_KB=$(df -Pk "$HOME" | awk 'NR==2 {print $4}')
+    REQUIRED_KB=512000
+    if [ "${AVAILABLE_KB:-0}" -lt "$REQUIRED_KB" ]; then
+        echo "ERROR: Not enough free disk space for lightweight Python runtime."
+        echo "Available: $((AVAILABLE_KB / 1024)) MB; required: $((REQUIRED_KB / 1024)) MB."
+        exit 1
+    fi
+
+    TMP_TGZ="$(mktemp /tmp/pcm-python-runtime.XXXXXX.tgz)"
+    TMP_DIR="$(mktemp -d /tmp/pcm-python-runtime.XXXXXX)"
+    cleanup_runtime_tmp() {
+        rm -f "$TMP_TGZ"
+        rm -rf "$TMP_DIR"
+    }
+    trap cleanup_runtime_tmp EXIT
+
+    echo "[+] Downloading lightweight Python runtime ($PYTHON_VERSION, $ARCH, ~27 MB)..."
+    curl -fL --retry 3 --connect-timeout 20 --max-time 600 "$RUNTIME_URL" -o "$TMP_TGZ"
+
+    echo "[+] Extracting bundled Python runtime..."
+    tar -xzf "$TMP_TGZ" -C "$TMP_DIR"
+    rm -rf "$PYTHON_RUNTIME_DIR"
+    mv "$TMP_DIR/python" "$PYTHON_RUNTIME_DIR"
+    chmod -R u+rwX,go+rX "$PYTHON_RUNTIME_DIR"
+    xattr -cr "$PYTHON_RUNTIME_DIR" 2>/dev/null || true
+
+    if [ ! -x "$PYTHON_BIN" ]; then
+        echo "ERROR: Bundled Python did not install correctly: $PYTHON_BIN missing."
+        exit 1
+    fi
+    echo "[+] Bundled Python ready: $($PYTHON_BIN --version 2>&1)"
+}
+
+install_maintenance_script() {
+    echo "[+] Downloading maintenance script..."
+    curl -fsSL "$SCRIPT_URL?cachebust=$(date +%s)" -o "$SCRIPT_PATH"
+    chmod +x "$SCRIPT_PATH"
+    xattr -cr "$SCRIPT_PATH" 2>/dev/null || true
+    if [ ! -s "$SCRIPT_PATH" ]; then
+        echo "ERROR: Failed to download the maintenance script."
+        exit 1
+    fi
+    "$PYTHON_BIN" -m py_compile "$SCRIPT_PATH"
+    echo "[+] Script installed to: $SCRIPT_PATH"
+}
+
+install_python_runtime
+install_maintenance_script
+
 echo ""
 echo "========================================"
-echo "GATEKEEPER NOTE"
+echo "APPLE SECURITY SETUP REQUIRED"
 echo "========================================"
-echo ""
-echo "Since this script is downloaded from the internet, macOS may warn you"
-echo "the first time you run it. If you see a Gatekeeper warning:"
-echo ""
-echo "  Option 1 (easiest): Right-click the script in Finder and select 'Open'"
-echo "  Option 2: System Settings -> Privacy & Security -> Security -> Open Anyway"
-echo ""
-echo "The script itself is a plain text Python file — no code signing is needed."
-echo "The warning only appears because it was downloaded (quarantine flag)."
-echo ""
+echo "The maintenance script needs Full Disk Access for complete results."
+echo "If you have already granted Terminal Full Disk Access and relaunched Terminal, press Enter."
+read -r -p "Press Enter once Full Disk Access is ready (or to continue with limited results)..." < "$TTY_INPUT"
 
-# ---------------------------------------------------------------------------
-# SMTP Credentials Setup
-# ---------------------------------------------------------------------------
 echo ""
 echo "========================================"
 echo "SMTP CREDENTIAL SETUP"
 echo "========================================"
-echo ""
-echo "The script sends maintenance reports via email."
-echo "For Gmail, you MUST use an App Password (not your regular password)."
-echo ""
-echo "To create a Gmail App Password:"
-echo "  1. Go to https://myaccount.google.com/apppasswords"
-echo "  2. Sign in, select 'Mail', select 'Other (Custom name) = Mac Maintenance'"
-echo "  3. Copy the 16-character password (e.g. abcd efgh ijkl mnop)"
-echo "  4. Paste it below when prompted"
+echo "Use the Gmail App Password from 1Password; do not use the regular account password."
 echo ""
 
 read -r -p "SMTP login email [maintenance-reports@pcmasterclass.com.au]: " SMTP_USER < "$TTY_INPUT"
@@ -151,28 +173,20 @@ EMAIL_FROM=${EMAIL_FROM:-maintenance-reports@pcmasterclass.com.au}
 read -r -p "Recipient email [reports@pcmasterclass.com.au]: " EMAIL_TO < "$TTY_INPUT"
 EMAIL_TO=${EMAIL_TO:-reports@pcmasterclass.com.au}
 
-if [ -z "$SMTP_USER" ] || [ -z "$SMTP_PASS" ]; then
-    echo "WARNING: No credentials provided. You'll need to run credential setup manually:"
-    echo "  python3 $INSTALL_DIR/$SCRIPT_NAME --save-credential --smtp-user YOUR_EMAIL --smtp-password YOUR_APP_PASSWORD"
-else
-    echo "[+] Saving SMTP credentials to macOS Keychain..."
-    python3 "$INSTALL_DIR/$SCRIPT_NAME" --save-credential \
-        --smtp-user "$SMTP_USER" \
-        --smtp-password "$SMTP_PASS" \
-        --email-from "$EMAIL_FROM" \
-        --email-to "$EMAIL_TO"
-    echo "[+] Credentials saved to macOS Keychain securely."
-fi
-
-# Install LaunchAgent
-# ---------------------------------------------------------------------------
-echo ""
-echo "[+] Installing LaunchAgent for quarterly execution..."
-
-# Get the user name for the plist
 CURRENT_USER=$(whoami)
 
-# Create the plist file with quarterly schedule (Jan 15, Apr 15, Jul 15, Oct 15)
+echo "[+] Saving SMTP credentials to macOS Keychain..."
+"$PYTHON_BIN" "$INSTALL_DIR/$SCRIPT_NAME" --save-credential \
+    --smtp-user "$SMTP_USER" \
+    --smtp-password "$SMTP_PASS" \
+    --email-from "$EMAIL_FROM" \
+    --email-to "$EMAIL_TO"
+echo "[+] Credentials saved to macOS Keychain securely."
+
+# Install fallback LaunchAgent. Tactical RMM is the preferred scheduler after
+# onboarding, and this LaunchAgent may be removed after Tactical task verification.
+echo ""
+echo "[+] Installing fallback LaunchAgent for quarterly execution..."
 cat > "$LAUNCHAGENTS_DIR/$PLIST_NAME" << PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -182,7 +196,7 @@ cat > "$LAUNCHAGENTS_DIR/$PLIST_NAME" << PLIST
     <string>com.pcmasterclass.maintenance.agent</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/python3</string>
+        <string>$PYTHON_BIN</string>
         <string>$INSTALL_DIR/$SCRIPT_NAME</string>
         <string>--email-to</string>
         <string>$EMAIL_TO</string>
@@ -191,50 +205,10 @@ cat > "$LAUNCHAGENTS_DIR/$PLIST_NAME" << PLIST
     </array>
     <key>StartCalendarInterval</key>
     <array>
-        <!-- Q1: January 15 -->
-        <dict>
-            <key>Month</key>
-            <integer>1</integer>
-            <key>Day</key>
-            <integer>15</integer>
-            <key>Hour</key>
-            <integer>1</integer>
-            <key>Minute</key>
-            <integer>0</integer>
-        </dict>
-        <!-- Q2: April 15 -->
-        <dict>
-            <key>Month</key>
-            <integer>4</integer>
-            <key>Day</key>
-            <integer>15</integer>
-            <key>Hour</key>
-            <integer>1</integer>
-            <key>Minute</key>
-            <integer>0</integer>
-        </dict>
-        <!-- Q3: July 15 -->
-        <dict>
-            <key>Month</key>
-            <integer>7</integer>
-            <key>Day</key>
-            <integer>15</integer>
-            <key>Hour</key>
-            <integer>1</integer>
-            <key>Minute</key>
-            <integer>0</integer>
-        </dict>
-        <!-- Q4: October 15 -->
-        <dict>
-            <key>Month</key>
-            <integer>10</integer>
-            <key>Day</key>
-            <integer>15</integer>
-            <key>Hour</key>
-            <integer>1</integer>
-            <key>Minute</key>
-            <integer>0</integer>
-        </dict>
+        <dict><key>Month</key><integer>1</integer><key>Day</key><integer>15</integer><key>Hour</key><integer>1</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Month</key><integer>4</integer><key>Day</key><integer>15</integer><key>Hour</key><integer>1</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Month</key><integer>7</integer><key>Day</key><integer>15</integer><key>Hour</key><integer>1</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Month</key><integer>10</integer><key>Day</key><integer>15</integer><key>Hour</key><integer>1</integer><key>Minute</key><integer>0</integer></dict>
     </array>
     <key>StandardOutPath</key>
     <string>$LOG_DIR/maintenance.out.log</string>
@@ -244,34 +218,20 @@ cat > "$LAUNCHAGENTS_DIR/$PLIST_NAME" << PLIST
 </plist>
 PLIST
 
-# Load the LaunchAgent
+launchctl unload "$LAUNCHAGENTS_DIR/$PLIST_NAME" 2>/dev/null || true
 launchctl load "$LAUNCHAGENTS_DIR/$PLIST_NAME" 2>/dev/null || true
 
 echo "[+] LaunchAgent installed: $LAUNCHAGENTS_DIR/$PLIST_NAME"
-echo "[+] Quarterly schedule: Jan 15, Apr 15, Jul 15, Oct 15 at 1:00 AM"
+echo "[+] Quarterly fallback schedule: Jan/Apr/Jul/Oct 15 at 1:00 AM"
 
-# ---------------------------------------------------------------------------
-# Placeholder for the separate LaunchAgent plist (kept in repo for reference)
-# ---------------------------------------------------------------------------
-# The file at mac-maintenance/com.pcmasterclass.maintenance.agent.plist
-# is the canonical version.  This heredoc duplicates its behaviour for
-# convenience during one-shot install.
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Initial test run
-# ---------------------------------------------------------------------------
 echo ""
 echo "========================================"
 echo "INITIAL TEST RUN"
 echo "========================================"
-echo ""
-echo "Running a test scan now. This will generate a report and email it to you."
-echo ""
+echo "Running a test scan now. This will generate a report and email it."
 read -r -p "Press Enter to run the test scan..." < "$TTY_INPUT"
 
-TEST_REPORT="$REPORT_DIR/$(hostname)_Maintenance_$(date +%Y-%m-%d_%H-%M-%S).html"
-python3 "$INSTALL_DIR/$SCRIPT_NAME" \
+"$PYTHON_BIN" "$INSTALL_DIR/$SCRIPT_NAME" \
     --email-to "$EMAIL_TO" \
     --client-name "$CURRENT_USER" \
     --report-path "$REPORT_DIR"
@@ -280,18 +240,16 @@ echo ""
 echo "========================================"
 echo "INSTALLATION COMPLETE"
 echo "========================================"
+echo "Maintenance script: $SCRIPT_PATH"
+echo "Bundled Python:     $PYTHON_BIN"
+echo "Reports:            $REPORT_DIR"
+echo "LaunchAgent:        $LAUNCHAGENTS_DIR/$PLIST_NAME"
+echo "Logs:               $LOG_DIR"
 echo ""
-echo "Maintenance script: $INSTALL_DIR/$SCRIPT_NAME"
-echo "Reports:           $REPORT_DIR"
-echo "LaunchAgent:       $LAUNCHAGENTS_DIR/$PLIST_NAME"
-echo "Logs:              $LOG_DIR"
-echo ""
-echo "The script will run automatically every 3 months (Jan/Apr/Jul/Oct 15)."
 echo "To run manually:"
-echo "  python3 $INSTALL_DIR/$SCRIPT_NAME --email-to $EMAIL_TO"
+echo "  $PYTHON_BIN $SCRIPT_PATH --email-to $EMAIL_TO"
 echo ""
 echo "To uninstall:"
 echo "  launchctl unload $LAUNCHAGENTS_DIR/$PLIST_NAME"
 echo "  rm $LAUNCHAGENTS_DIR/$PLIST_NAME"
 echo "  rm -rf $INSTALL_DIR"
-echo ""
