@@ -104,6 +104,9 @@ class Logger:
 # ============================================================================
 def keychain_store(account, password, smtp_server="smtp.gmail.com", smtp_port=587, email_from=""):
     """Store SMTP credentials in macOS Keychain."""
+    # Gmail app passwords are often displayed/pasted as four groups separated by
+    # spaces. SMTP AUTH expects the 16-character token without whitespace.
+    password = "".join(str(password).split())
     if not email_from:
         email_from = account
 
@@ -2012,6 +2015,9 @@ def main():
 
     # Credential management
     smtp_config = None
+    if args.smtp_password:
+        # Normalize Gmail app-password grouping spaces for both saved and direct SMTP use.
+        args.smtp_password = "".join(args.smtp_password.split())
     if args.save_credential:
         if not args.smtp_user or not args.smtp_password:
             logger.error("--smtp-user and --smtp-password are required when saving credentials.")

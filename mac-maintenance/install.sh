@@ -167,6 +167,8 @@ while [ -z "$SMTP_PASS" ]; do
         echo "App Password cannot be blank. Please paste the Gmail App Password from 1Password."
     fi
 done
+# Gmail displays app passwords in grouped chunks; store/send without spaces.
+SMTP_PASS="${SMTP_PASS//[[:space:]]/}"
 
 read -r -p "From email [maintenance-reports@pcmasterclass.com.au]: " EMAIL_FROM < "$TTY_INPUT"
 EMAIL_FROM=${EMAIL_FROM:-maintenance-reports@pcmasterclass.com.au}

@@ -4,6 +4,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 INSTALL = (ROOT / "mac-maintenance" / "install.sh").read_text()
 PLIST = (ROOT / "mac-maintenance" / "com.pcmasterclass.maintenance.agent.plist").read_text()
+SCRIPT = (ROOT / "mac-maintenance" / "pcm_mac_maintenance.py").read_text()
 
 
 class MacRuntimeInstallerTests(unittest.TestCase):
@@ -33,6 +34,10 @@ class MacRuntimeInstallerTests(unittest.TestCase):
     def test_static_launchagent_template_uses_bundled_python(self):
         self.assertNotIn('<string>/usr/bin/python3</string>', PLIST)
         self.assertIn('/Library/PCMasterClass/python-runtime/python/bin/python3', PLIST)
+    def test_smtp_app_password_spaces_are_normalized(self):
+        self.assertIn('password = "".join(str(password).split())', SCRIPT)
+        self.assertIn('args.smtp_password = "".join(args.smtp_password.split())', SCRIPT)
+        self.assertIn('SMTP_PASS="${SMTP_PASS//[[:space:]]/}"', INSTALL)
 
 
 if __name__ == "__main__":
