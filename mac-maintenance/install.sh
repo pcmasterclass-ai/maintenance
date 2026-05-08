@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================================
 # PC Master Class — macOS Maintenance Script Installer
-# Version: 1.1.0
+# Version: 1.1.1
 # ============================================================================
 # Installs a lightweight bundled Python runtime from python-build-standalone so
 # client Macs do NOT need Apple Command Line Developer Tools / Xcode.
@@ -176,6 +176,8 @@ read -r -p "Recipient email [reports@pcmasterclass.com.au]: " EMAIL_TO < "$TTY_I
 EMAIL_TO=${EMAIL_TO:-reports@pcmasterclass.com.au}
 
 CURRENT_USER=$(whoami)
+read -r -p "Client name for reports [$CURRENT_USER]: " CLIENT_NAME < "$TTY_INPUT"
+CLIENT_NAME=${CLIENT_NAME:-$CURRENT_USER}
 
 echo "[+] Saving SMTP credentials to macOS Keychain..."
 "$PYTHON_BIN" "$INSTALL_DIR/$SCRIPT_NAME" --save-credential \
@@ -203,7 +205,7 @@ cat > "$LAUNCHAGENTS_DIR/$PLIST_NAME" << PLIST
         <string>--email-to</string>
         <string>$EMAIL_TO</string>
         <string>--client-name</string>
-        <string>$CURRENT_USER</string>
+        <string>$CLIENT_NAME</string>
     </array>
     <key>StartCalendarInterval</key>
     <array>
@@ -235,7 +237,7 @@ read -r -p "Press Enter to run the test scan..." < "$TTY_INPUT"
 
 "$PYTHON_BIN" "$INSTALL_DIR/$SCRIPT_NAME" \
     --email-to "$EMAIL_TO" \
-    --client-name "$CURRENT_USER" \
+    --client-name "$CLIENT_NAME" \
     --report-path "$REPORT_DIR"
 
 echo ""
