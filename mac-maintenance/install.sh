@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================================
 # PC Master Class — macOS Maintenance Script Installer
-# Version: 1.1.1
+# Version: 1.1.2
 # ============================================================================
 # Installs a lightweight bundled Python runtime from python-build-standalone so
 # client Macs do NOT need Apple Command Line Developer Tools / Xcode.
@@ -31,7 +31,7 @@ PYTHON_X86_64_URL="https://github.com/astral-sh/python-build-standalone/releases
 
 printf '%s\n' "=========================================="
 printf '%s\n' "PC Master Class macOS Maintenance"
-printf '%s\n' "Installer v1.1.0"
+printf '%s\n' "Installer v1.1.2"
 printf '%s\n' "=========================================="
 printf '\n'
 
@@ -176,8 +176,34 @@ read -r -p "Recipient email [reports@pcmasterclass.com.au]: " EMAIL_TO < "$TTY_I
 EMAIL_TO=${EMAIL_TO:-reports@pcmasterclass.com.au}
 
 CURRENT_USER=$(whoami)
-read -r -p "Client name for reports [$CURRENT_USER]: " CLIENT_NAME < "$TTY_INPUT"
-CLIENT_NAME=${CLIENT_NAME:-$CURRENT_USER}
+DEFAULT_CLIENT_NAME="$CURRENT_USER"
+REAL_NAME=""
+if command -v id >/dev/null 2>&1; then
+    REAL_NAME="$(id -F "$CURRENT_USER" 2>/dev/null || true)"
+fi
+if [ -z "$REAL_NAME" ] || [ "$REAL_NAME" = "$CURRENT_USER" ]; then
+    if command -v dscl >/dev/null 2>&1; then
+        REAL_NAME="$(dscl . -read "/Users/$CURRENT_USER" RealName 2>/dev/null | sed '1d' | sed 's/^[[:space:]]*//' | awk 'NF {$1=$1; print; exit}' || true)"
+    fi
+fi
+# Prefer report names in Tactical/Xero format: "Surname, Firstname".
+# Example: local account full name "Sue Jowell" -> default "Jowell, Sue".
+if [ -n "$REAL_NAME" ] && [ "$REAL_NAME" != "$CURRENT_USER" ]; then
+    if [[ "$REAL_NAME" == *,* ]]; then
+        DEFAULT_CLIENT_NAME="$REAL_NAME"
+    else
+        WORD_COUNT=$(printf '%s\n' "$REAL_NAME" | awk '{print NF}')
+        if [ "${WORD_COUNT:-0}" -ge 2 ]; then
+            LAST_NAME=$(printf '%s\n' "$REAL_NAME" | awk '{print $NF}')
+            GIVEN_NAMES=$(printf '%s\n' "$REAL_NAME" | awk '{$NF=""; sub(/[[:space:]]+$/, ""); print}')
+            DEFAULT_CLIENT_NAME="$LAST_NAME, $GIVEN_NAMES"
+        else
+            DEFAULT_CLIENT_NAME="$REAL_NAME"
+        fi
+    fi
+fi
+read -r -p "Client name for reports [$DEFAULT_CLIENT_NAME]: " CLIENT_NAME < "$TTY_INPUT"
+CLIENT_NAME=${CLIENT_NAME:-$DEFAULT_CLIENT_NAME}
 
 echo "[+] Saving SMTP credentials to macOS Keychain..."
 "$PYTHON_BIN" "$INSTALL_DIR/$SCRIPT_NAME" --save-credential \
