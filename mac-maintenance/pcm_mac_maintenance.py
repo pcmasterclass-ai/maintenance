@@ -2112,7 +2112,9 @@ def main():
         logger.info(f"Email sent to {args.email_to}")
     logger.info("=" * 50)
 
-    # Return overall status code (non-zero if errors)
+    # Return overall status code (non-zero if module or email errors occurred)
+    if email_result.get("Status") == "ERROR":
+        errors += 1
     sys.exit(1 if errors > 0 else 0)
 
 

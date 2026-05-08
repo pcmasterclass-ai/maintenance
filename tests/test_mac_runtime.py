@@ -42,6 +42,9 @@ class MacRuntimeInstallerTests(unittest.TestCase):
         self.assertIn('except PermissionError:', SCRIPT)
         self.assertIn('Browser extension inventory should never prevent report generation/email', SCRIPT)
         self.assertIn('Safari extensions inaccessible due to macOS privacy permissions', SCRIPT)
+    def test_email_send_failure_causes_nonzero_exit(self):
+        self.assertIn('if email_result.get("Status") == "ERROR":', SCRIPT)
+        self.assertIn('errors += 1', SCRIPT)
 
 
 if __name__ == "__main__":
