@@ -749,10 +749,10 @@ function Set-MaintenanceSchedule {
         }
 
         if ($actualInterval -ne $frequencyDays) {
-            Write-Warn "Windows set interval to $actualInterval day(s) instead of $frequencyDays — fixing via XML..."
+            Write-Warn "Windows set interval to $actualInterval day(s) instead of $frequencyDays - fixing via XML..."
             try {
                 $xml = Export-ScheduledTask -TaskName $TaskName
-                # The XML has <DaysInterval>1</DaysInterval> — replace with the correct value
+                # The XML has <DaysInterval>1</DaysInterval> - replace with the correct value
                 $xml = $xml -replace '<DaysInterval>\d+</DaysInterval>', "<DaysInterval>$frequencyDays</DaysInterval>"
                 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
                 Register-ScheduledTask -TaskName $TaskName -Xml $xml -User "SYSTEM" -Force | Out-Null
