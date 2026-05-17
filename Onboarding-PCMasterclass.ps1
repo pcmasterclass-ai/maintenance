@@ -12,8 +12,8 @@
 
 .NOTES
     Author:  Paul - PC Masterclass
-    Version: 1.4.0
-    Date:    2026-03-18
+    Version: 1.4.1
+    Date:    2026-05-17
 
     USAGE (paste into an elevated PowerShell prompt):
       powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\Downloads\Onboarding-PCMasterclass.ps1"
@@ -27,16 +27,16 @@
       6. Sets up email credentials (DPAPI + AES fallback for SYSTEM)
       7. Sends a test email to verify SMTP is working BEFORE proceeding
       8. Creates a Windows Scheduled Task for unattended maintenance runs
+      9. Runs the first maintenance scan immediately after schedule creation by default
 
     WHAT THIS SCRIPT DOES NOT DO:
-      - It does not run the maintenance script (you decide when to run it)
-      - It does not modify system settings beyond the scheduled task
+      - It does not modify system settings beyond the scheduled task and restore points
 #>
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-$DeployVersion = "1.4.0"
+$DeployVersion = "1.4.1"
 $BaseDir = "C:\Teamviewer"
 $ScriptName = "PCMasterclass-Maintenance.ps1"
 $GitHubRepo = "pcmasterclass-ai/maintenance"
@@ -521,8 +521,8 @@ function Test-EmailSend {
         Send-MailMessage `
             -From $script:smtpUser `
             -To $DefaultEmailTo `
-            -Subject "PC Masterclass - Deployment Test - $computerName" `
-            -Body "Email test successful for $computerName at $(Get-Date). This machine is ready to send maintenance reports." `
+            -Subject "[TEST] Maintenance Report Delivery Test - $computerName" `
+            -Body "Maintenance Report delivery test successful for $computerName at $(Get-Date). This machine is ready to send maintenance reports." `
             -SmtpServer "smtp.gmail.com" `
             -Port 587 `
             -UseSsl `
@@ -594,8 +594,8 @@ function Test-EmailSend {
                     Send-MailMessage `
                         -From $script:smtpUser `
                         -To $DefaultEmailTo `
-                        -Subject "PC Masterclass - Deployment Test - $computerName" `
-                        -Body "Email test successful for $computerName at $(Get-Date). This machine is ready to send maintenance reports." `
+                        -Subject "[TEST] Maintenance Report Delivery Test - $computerName" `
+                        -Body "Maintenance Report delivery test successful for $computerName at $(Get-Date). This machine is ready to send maintenance reports." `
                         -SmtpServer "smtp.gmail.com" `
                         -Port 587 `
                         -UseSsl `
@@ -662,19 +662,19 @@ function Set-MaintenanceSchedule {
         90 { "quarterly (every 90 days)" }
     }
 
-    # Ask for start date (default to tomorrow so the first run fires at the scheduled time)
+    # Ask for start date (default to today so onboarding triggers an immediate first run)
     Write-Host ""
-    $tomorrowStr = (Get-Date).AddDays(1).ToString("dd/MM/yyyy")
-    $dateInput = Read-Host "  Start date dd/MM/yyyy (press Enter for tomorrow, $tomorrowStr)"
+    $todayStr = (Get-Date).ToString("dd/MM/yyyy")
+    $dateInput = Read-Host "  Start date dd/MM/yyyy (press Enter for today, $todayStr)"
     if ($dateInput) {
         try {
             $startDate = [datetime]::ParseExact($dateInput, "dd/MM/yyyy", $null)
         } catch {
-            Write-Warn "Invalid date format - using tomorrow"
-            $startDate = (Get-Date).AddDays(1).Date
+            Write-Warn "Invalid date format - using today"
+            $startDate = (Get-Date).Date
         }
     } else {
-        $startDate = (Get-Date).AddDays(1).Date
+        $startDate = (Get-Date).Date
     }
     # Combine start date with chosen run time
     $startDateTime = $startDate.Add([datetime]::Parse($runTime).TimeOfDay)
