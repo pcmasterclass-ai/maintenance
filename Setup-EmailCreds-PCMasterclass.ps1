@@ -78,6 +78,7 @@ Write-Section "EMAIL CREDENTIAL SETUP"
 Write-Host ""
 Write-Host "  Enter the SMTP credentials for sending maintenance reports." -ForegroundColor White
 Write-Host "  For Gmail, use an App Password (not your regular password)." -ForegroundColor White
+Write-Host "  Retrieve the PC Maintenance app password from 1Password, not Google Sheets." -ForegroundColor White
 Write-Host ""
 Write-Host "  IMPORTANT: Enter the App Password WITHOUT SPACES." -ForegroundColor Yellow
 Write-Host "  Google displays it as 'abcd efgh ijkl mnop' but enter: abcdefghijklmnop" -ForegroundColor Yellow
@@ -214,7 +215,7 @@ try {
         $clientDisplay = $computerName
     }
     Send-MailMessage `
-        -From $smtpUser `
+        -From "reports@pcmasterclass.com.au" `
         -To $DefaultEmailTo `
         -Subject "$clientDisplay - Email credential test of $computerName" `
         -Body "Email credential setup successful for $computerName at $(Get-Date). This machine is ready to send maintenance reports." `

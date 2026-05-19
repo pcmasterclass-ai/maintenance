@@ -33,8 +33,11 @@
         -CredentialPath  Path to stored encrypted credential (default: C:\Teamviewer\Config\smtp-cred.xml)
 
     FIRST-TIME SETUP (run once per client machine, as the user account that will run the script):
+        Retrieve the PC Maintenance Google SMTP app password from 1Password
+        (PCMC Hermes automation vault). Do not store or copy it from Google Sheets.
         powershell -ExecutionPolicy Bypass -File "PCMasterclass-Maintenance.ps1" -SaveCredential `
-            -SmtpUser "reports@pcmasterclass.com.au" -SmtpPassword "your-app-password"
+            -SmtpUser "paul@pcmasterclass.com.au" -EmailFrom "reports@pcmasterclass.com.au" `
+            -SmtpPassword "your-app-password"
 
     SUBSEQUENT RUNS (credentials loaded automatically from encrypted file):
         powershell -ExecutionPolicy Bypass -File "PCMasterclass-Maintenance.ps1" `
