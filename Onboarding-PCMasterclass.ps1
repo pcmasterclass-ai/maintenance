@@ -45,6 +45,8 @@ $GitHubToken = ""  # Not needed - repo is public
 
 # Email & scheduling defaults
 $DefaultEmailTo = "reports@pcmasterclass.com.au"
+$DefaultSmtpUser = "maintenance-reports@pcmasterclass.com.au"
+$DefaultEmailFrom = "maintenance-reports@pcmasterclass.com.au"
 $DefaultRunTime = "1:00AM"
 $DefaultFrequencyDays = 90  # Quarterly (every 90 days)
 $TaskName = "PCMasterclass-Maintenance"
@@ -381,13 +383,12 @@ function Set-EmailCredentials {
     Write-Host "  IMPORTANT: Enter the App Password WITHOUT SPACES." -ForegroundColor Yellow
     Write-Host "  Google displays it as 'abcd efgh ijkl mnop' but enter: abcdefghijklmnop" -ForegroundColor Yellow
     Write-Host ""
-    Write-Host "  NOTE: Use the actual Google account (paul@), NOT the alias (reports@)." -ForegroundColor Yellow
-    Write-Host "  Gmail requires the real account for SMTP authentication." -ForegroundColor Yellow
+    Write-Host "  NOTE: Use the dedicated maintenance Gmail account, not reports@ or paul@." -ForegroundColor Yellow
+    Write-Host "  Default SMTP login: $DefaultSmtpUser" -ForegroundColor Yellow
     Write-Host ""
 
-    $defaultEmail = "paul@pcmasterclass.com.au"
-    $smtpInput = Read-Host "  SMTP login account (press Enter for $defaultEmail)"
-    $smtpUser = if ($smtpInput) { $smtpInput } else { $defaultEmail }
+    $smtpInput = Read-Host "  SMTP login account (press Enter for $DefaultSmtpUser)"
+    $smtpUser = if ($smtpInput) { $smtpInput } else { $DefaultSmtpUser }
     Write-OK "Using: $smtpUser"
 
     $smtpPassword = Read-Host "  App Password (no spaces)" -AsSecureString
@@ -414,7 +415,7 @@ function Set-EmailCredentials {
             SmtpUser   = $smtpUser
             SmtpServer = "smtp.gmail.com"
             SmtpPort   = 587
-            EmailFrom  = "reports@pcmasterclass.com.au"
+            EmailFrom  = $DefaultEmailFrom
             Credential = New-Object System.Management.Automation.PSCredential(
                 $smtpUser,
                 $secPass
@@ -444,7 +445,7 @@ function Set-EmailCredentials {
             SmtpUser      = $smtpUser
             SmtpServer    = "smtp.gmail.com"
             SmtpPort      = 587
-            EmailFrom     = "reports@pcmasterclass.com.au"
+            EmailFrom     = $DefaultEmailFrom
             EncryptedPass = $encPass
         }
         $aesConfig | Export-Clixml -Path $aesConfigPath -Force
@@ -520,7 +521,7 @@ function Test-EmailSend {
 
         $computerName = $env:COMPUTERNAME
         Send-MailMessage `
-            -From "reports@pcmasterclass.com.au" `
+            -From $DefaultEmailFrom `
             -To $DefaultEmailTo `
             -Subject "[TEST] Maintenance Report Delivery Test - $computerName" `
             -Body "Maintenance Report delivery test successful for $computerName at $(Get-Date). This machine is ready to send maintenance reports." `
@@ -564,7 +565,7 @@ function Test-EmailSend {
                     SmtpUser   = $script:smtpUser
                     SmtpServer = "smtp.gmail.com"
                     SmtpPort   = 587
-                    EmailFrom  = "reports@pcmasterclass.com.au"
+                    EmailFrom  = $DefaultEmailFrom
                     Credential = New-Object System.Management.Automation.PSCredential(
                         $script:smtpUser,
                         $secPass2
@@ -581,7 +582,7 @@ function Test-EmailSend {
                     SmtpUser      = $script:smtpUser
                     SmtpServer    = "smtp.gmail.com"
                     SmtpPort      = 587
-                    EmailFrom     = "reports@pcmasterclass.com.au"
+                    EmailFrom     = $DefaultEmailFrom
                     EncryptedPass = $enc2
                 } | Export-Clixml -Path (Join-Path $ConfigDir "smtp-config.xml") -Force
 
