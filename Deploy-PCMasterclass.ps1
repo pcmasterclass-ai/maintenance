@@ -41,7 +41,7 @@ $BaseDir = "C:\Teamviewer"
 $ScriptName = "PCMasterclass-Maintenance.ps1"
 $GitHubRepo = "pcmasterclass-ai/maintenance"
 $GitHubBranch = "main"
-$GitHubToken = "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"
+$GitHubToken = ""  # Not needed - repo is public
 
 # Email & scheduling defaults
 $DefaultEmailTo = "paul@pcmasterclass.com.au"
