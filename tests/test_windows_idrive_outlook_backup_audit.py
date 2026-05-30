@@ -27,6 +27,24 @@ class WindowsIDriveOutlookBackupAuditTests(unittest.TestCase):
         self.assertIn('OUTLOOK PST BACKUP COVERAGE', MAINTENANCE)
         self.assertIn('BackupSetMatched', MAINTENANCE)
 
+    def test_standard_user_backup_folders_are_checked(self):
+        self.assertIn('StandardUserFoldersCoverage', MAINTENANCE)
+        for folder in ['Desktop', 'Documents', 'Downloads', 'Pictures', 'Music', 'Videos']:
+            self.assertIn(f"'{folder}'", MAINTENANCE)
+        self.assertIn('MissingStandardUserFolders', MAINTENANCE)
+        self.assertIn('Standard user folders missing from iDrive backup set', MAINTENANCE)
+
+    def test_outlook_roamcache_is_always_checked_for_outlook_users(self):
+        self.assertIn('RoamCache', MAINTENANCE)
+        self.assertIn('Stream_Autocomplete', MAINTENANCE)
+        self.assertIn('Outlook RoamCache missing from iDrive backup set', MAINTENANCE)
+
+    def test_root_drive_candidate_folders_are_reported_for_review(self):
+        self.assertIn('RootDriveCandidateFolders', MAINTENANCE)
+        self.assertIn('Previous PC backup', MAINTENANCE)
+        self.assertIn('Root-level candidate folders found; consider adding to iDrive backup set', MAINTENANCE)
+        self.assertIn('when in doubt, include due to iDrive generous storage quotas', MAINTENANCE)
+
 
 if __name__ == "__main__":
     unittest.main()

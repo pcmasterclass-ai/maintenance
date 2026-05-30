@@ -71,7 +71,7 @@ param(
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-$ScriptVersion = "2.9.6"
+$ScriptVersion = "2.9.7"
 
 # GitHub raw URL for the latest version of this script
 # To use: create a private GitHub repo, push the script, and set this URL
@@ -474,15 +474,23 @@ function Test-PathCoveredByBackupSet {
 
     foreach ($exclude in @($ExcludePaths)) {
         $normalExclude = Normalize-BackupPath $exclude
-        if ($normalExclude -and ($normalFile -eq $normalExclude -or $normalFile.StartsWith($normalExclude + '\'))) {
-            return $false
+        if ($normalExclude) {
+            if ($normalExclude.Contains('*')) {
+                if ($normalFile -like ($normalExclude + '*')) { return $false }
+            } elseif ($normalFile -eq $normalExclude -or $normalFile.StartsWith($normalExclude + '\')) {
+                return $false
+            }
         }
     }
 
     foreach ($include in @($IncludePaths)) {
         $normalInclude = Normalize-BackupPath $include
-        if ($normalInclude -and ($normalFile -eq $normalInclude -or $normalFile.StartsWith($normalInclude + '\'))) {
-            return $true
+        if ($normalInclude) {
+            if ($normalInclude.Contains('*')) {
+                if ($normalFile -like ($normalInclude + '*')) { return $true }
+            } elseif ($normalFile -eq $normalInclude -or $normalFile.StartsWith($normalInclude + '\')) {
+                return $true
+            }
         }
     }
 
@@ -497,6 +505,12 @@ function Get-OutlookPstBackupCoverage {
     #   OneDrive\Documents\*.pst
     #   AppData\Local\Microsoft\Outlook\*.pst
     $pstFiles = @()
+    $standardUserFolders = @('Desktop', 'Documents', 'Downloads', 'Pictures', 'Music', 'Videos')
+    $standardFolderCoverage = @()
+    $missingStandardFolders = @()
+    $roamCacheCoverage = @()
+    $missingRoamCache = @()
+    $rootDriveCandidateFolders = @()
     $userRoots = @(Get-ChildItem -LiteralPath "C:\Users" -Directory -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -notin @('All Users', 'Default', 'Default User', 'Public') })
 
@@ -557,6 +571,58 @@ function Get-OutlookPstBackupCoverage {
         }
     }
 
+    foreach ($userRoot in $userRoots) {
+        foreach ($folderName in $standardUserFolders) {
+            $folderPath = Join-Path $userRoot.FullName $folderName
+            if (Test-Path -LiteralPath $folderPath) {
+                $matched = Test-PathCoveredByBackupSet -FilePath $folderPath -IncludePaths $includePaths -ExcludePaths $excludePaths
+                $entry = [pscustomobject]@{
+                    User = $userRoot.Name
+                    Folder = $folderName
+                    Path = $folderPath
+                    BackupSetMatched = $matched
+                }
+                $standardFolderCoverage += $entry
+                if (-not $matched) { $missingStandardFolders += $entry }
+            }
+        }
+
+        # For all Outlook users, check RoamCache because Stream_Autocomplete files may be the only contact history.
+        $outlookRoot = Join-Path $userRoot.FullName 'AppData\Local\Microsoft\Outlook'
+        $roamCachePath = Join-Path $outlookRoot 'RoamCache'
+        $hasOutlookData = (Test-Path -LiteralPath $outlookRoot) -or (($pstFiles | Where-Object { $_.User -eq $userRoot.Name }).Count -gt 0)
+        if ($hasOutlookData -and (Test-Path -LiteralPath $roamCachePath)) {
+            $autocompleteFiles = @(Get-ChildItem -LiteralPath $roamCachePath -Filter 'Stream_Autocomplete*' -File -ErrorAction SilentlyContinue)
+            $matched = Test-PathCoveredByBackupSet -FilePath $roamCachePath -IncludePaths $includePaths -ExcludePaths $excludePaths
+            $entry = [pscustomobject]@{
+                User = $userRoot.Name
+                Path = $roamCachePath
+                StreamAutocompleteFiles = $autocompleteFiles.Count
+                BackupSetMatched = $matched
+            }
+            $roamCacheCoverage += $entry
+            if (-not $matched) { $missingRoamCache += $entry }
+        }
+    }
+
+    $knownRootFolderExclusions = @('Windows', 'Program Files', 'Program Files (x86)', 'ProgramData', 'Users', 'PerfLogs', '$Recycle.Bin', 'Recovery', 'System Volume Information', 'Teamviewer')
+    $rootCandidateNamePattern = '(?i)backup|old|previous|prev|data|files|documents|docs|photos|pictures|work|client|archive|accounts|MYOB|Xero|Desktop|Previous PC backup'
+    foreach ($driveRoot in @('C:\', 'D:\')) {
+        if (Test-Path -LiteralPath $driveRoot) {
+            Get-ChildItem -LiteralPath $driveRoot -Directory -ErrorAction SilentlyContinue | Where-Object {
+                $_.Name -notin $knownRootFolderExclusions -and $_.Name -match $rootCandidateNamePattern
+            } | ForEach-Object {
+                $matched = Test-PathCoveredByBackupSet -FilePath $_.FullName -IncludePaths $includePaths -ExcludePaths $excludePaths
+                $rootDriveCandidateFolders += [pscustomobject]@{
+                    Drive = $driveRoot
+                    Path = $_.FullName
+                    BackupSetMatched = $matched
+                    Recommendation = 'Root-level candidate folders found; consider adding to iDrive backup set - when in doubt, include due to iDrive generous storage quotas'
+                }
+            }
+        }
+    }
+
     $coveredCount = 0
     $uncovered = @()
     $onedriveHosted = @()
@@ -591,6 +657,27 @@ function Get-OutlookPstBackupCoverage {
         }
     }
 
+    $coverageNotes = @()
+    if ($missingStandardFolders.Count -gt 0) {
+        $coverageNotes += 'Standard user folders missing from iDrive backup set'
+        if ($status -eq 'PASS') { $status = 'WARNING - Standard user folders missing from iDrive backup set' }
+        if ($recommendedAction -eq 'No action required') { $recommendedAction = 'Add missing standard user folders to the iDrive backup set' }
+    }
+    if ($missingRoamCache.Count -gt 0) {
+        $coverageNotes += 'Outlook RoamCache missing from iDrive backup set'
+        if ($status -eq 'PASS') { $status = 'WARNING - Outlook RoamCache missing from iDrive backup set' }
+        if ($recommendedAction -eq 'No action required') { $recommendedAction = 'Add Outlook RoamCache to iDrive backup set so Stream_Autocomplete contact history is protected' }
+    }
+    $unmatchedRootCandidates = @($rootDriveCandidateFolders | Where-Object { -not $_.BackupSetMatched })
+    if ($unmatchedRootCandidates.Count -gt 0) {
+        $coverageNotes += 'Root-level candidate folders found; consider adding to iDrive backup set'
+        if ($status -eq 'PASS') { $status = 'WARNING - Root-level candidate folders found; consider adding to iDrive backup set' }
+        if ($recommendedAction -eq 'No action required') { $recommendedAction = 'Review root C: or D: folders and, when in doubt, include due to iDrive generous storage quotas' }
+    }
+    if ($coverageNotes.Count -gt 0) {
+        $coverage = (($coverage, $coverageNotes) | Where-Object { $_ }) -join '; '
+    }
+
     return @{
         Status              = $status
         OutlookPstFiles     = @($pstFiles)
@@ -603,6 +690,11 @@ function Get-OutlookPstBackupCoverage {
         IncludePathsFound   = @($includePaths | Select-Object -Unique | Select-Object -First 25)
         ExcludePathsFound   = @($excludePaths | Select-Object -Unique | Select-Object -First 25)
         RecommendedAction   = $recommendedAction
+        StandardUserFoldersCoverage = @($standardFolderCoverage)
+        MissingStandardUserFolders = @($missingStandardFolders)
+        OutlookRoamCacheCoverage = @($roamCacheCoverage)
+        MissingOutlookRoamCache = @($missingRoamCache)
+        RootDriveCandidateFolders = @($rootDriveCandidateFolders)
     }
 }
 
@@ -4209,6 +4301,28 @@ if (-not $Results.iDriveBackup.Installed) {
             }
             $html += "</table>"
         }
+        if ($pstCoverage.MissingStandardUserFolders -and $pstCoverage.MissingStandardUserFolders.Count -gt 0) {
+            $html += "<h4>Missing standard user folders</h4><ul>"
+            foreach ($folder in $pstCoverage.MissingStandardUserFolders) {
+                $html += "<li>$($folder.User) $($folder.Folder): <code>$($folder.Path)</code></li>"
+            }
+            $html += "</ul>"
+        }
+        if ($pstCoverage.MissingOutlookRoamCache -and $pstCoverage.MissingOutlookRoamCache.Count -gt 0) {
+            $html += "<h4>Outlook RoamCache / Stream_Autocomplete coverage</h4><ul>"
+            foreach ($cache in $pstCoverage.MissingOutlookRoamCache) {
+                $html += "<li>$($cache.User): <code>$($cache.Path)</code> ($($cache.StreamAutocompleteFiles) Stream_Autocomplete files)</li>"
+            }
+            $html += "</ul>"
+        }
+        if ($pstCoverage.RootDriveCandidateFolders -and $pstCoverage.RootDriveCandidateFolders.Count -gt 0) {
+            $html += "<h4>Root drive candidate folders</h4><p class='warning-text'>Root-level candidate folders found; consider adding to iDrive backup set - when in doubt, include due to iDrive generous storage quotas.</p><ul>"
+            foreach ($rootFolder in $pstCoverage.RootDriveCandidateFolders) {
+                $matched = if ($rootFolder.BackupSetMatched) { "included" } else { "not found / unverified" }
+                $html += "<li><code>$($rootFolder.Path)</code> - $matched</li>"
+            }
+            $html += "</ul>"
+        }
     }
 }
 
@@ -5038,7 +5152,7 @@ ${overallColor}OVERALL STATUS: $overallStatus ($warningCount warning(s), $errorC
                 $emailBody += "Account".PadRight(30) + "$($Results.iDriveBackup.Account)`n"
                 $emailBody += "Service".PadRight(30) + "$svcStatus`n"
             }
-            if ($Results.iDriveBackup.OutlookPstCoverage -and $Results.iDriveBackup.OutlookPstCoverage.PstCount -gt 0) {
+            if ($Results.iDriveBackup.OutlookPstCoverage -and ($Results.iDriveBackup.OutlookPstCoverage.PstCount -gt 0 -or $Results.iDriveBackup.OutlookPstCoverage.MissingStandardUserFolders.Count -gt 0 -or $Results.iDriveBackup.OutlookPstCoverage.MissingOutlookRoamCache.Count -gt 0 -or $Results.iDriveBackup.OutlookPstCoverage.RootDriveCandidateFolders.Count -gt 0)) {
                 $pstCoverage = $Results.iDriveBackup.OutlookPstCoverage
                 $pstStatus = if ($pstCoverage.Status -match "^PASS$") { "[G]$($pstCoverage.Status)[/G]" } else { "[W]$($pstCoverage.Status)[/W]" }
                 $emailBody += "`n[H]OUTLOOK PST BACKUP COVERAGE[/H] $pstStatus`n"
@@ -5049,6 +5163,15 @@ ${overallColor}OVERALL STATUS: $overallStatus ($warningCount warning(s), $errorC
                 foreach ($pst in $pstCoverage.OutlookPstFiles) {
                     $matched = if ($pst.BackupSetMatched) { "Yes" } else { "No / unverified" }
                     $emailBody += "  $($pst.Location): $($pst.Path) ($($pst.SizeGB) GB, backed up: $matched)`n"
+                }
+                if ($pstCoverage.MissingStandardUserFolders.Count -gt 0) {
+                    $emailBody += "Missing Standard Folders".PadRight(30) + "[W]$($pstCoverage.MissingStandardUserFolders.Count)[/W]`n"
+                }
+                if ($pstCoverage.MissingOutlookRoamCache.Count -gt 0) {
+                    $emailBody += "Missing Outlook RoamCache".PadRight(30) + "[W]$($pstCoverage.MissingOutlookRoamCache.Count)[/W]`n"
+                }
+                if ($pstCoverage.RootDriveCandidateFolders.Count -gt 0) {
+                    $emailBody += "Root Folder Candidates".PadRight(30) + "[W]$($pstCoverage.RootDriveCandidateFolders.Count) - review/add when in doubt[/W]`n"
                 }
             }
             $emailBody += "`n"
