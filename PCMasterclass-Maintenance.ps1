@@ -71,7 +71,7 @@ param(
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-$ScriptVersion = "2.9.5"
+$ScriptVersion = "2.9.6"
 
 # GitHub raw URL for the latest version of this script
 # To use: create a private GitHub repo, push the script, and set this URL
@@ -436,6 +436,7 @@ $Results = [ordered]@{
     AdwCleaner       = @{}
     RestorePoints    = @{}
     TelemetryServices = @{}
+    Warnings          = @()
     Errors           = @()
     EmailResult      = @{}
     WebhookResult    = @{}
@@ -450,6 +451,159 @@ function Write-Log {
     $entry = "[$Level] $(Get-Date -Format 'HH:mm:ss') - $Message"
     Write-Host $entry
     Add-Content -Path $LogFile -Value $entry
+}
+
+function Normalize-BackupPath {
+    param([string]$Path)
+    if (-not $Path) { return "" }
+    $p = [Environment]::ExpandEnvironmentVariables($Path).Trim().Trim('"')
+    $p = $p -replace '/', '\'
+    $p = $p.TrimEnd('\')
+    return $p.ToLowerInvariant()
+}
+
+function Test-PathCoveredByBackupSet {
+    param(
+        [string]$FilePath,
+        [string[]]$IncludePaths,
+        [string[]]$ExcludePaths
+    )
+
+    $normalFile = Normalize-BackupPath $FilePath
+    if (-not $normalFile) { return $false }
+
+    foreach ($exclude in @($ExcludePaths)) {
+        $normalExclude = Normalize-BackupPath $exclude
+        if ($normalExclude -and ($normalFile -eq $normalExclude -or $normalFile.StartsWith($normalExclude + '\'))) {
+            return $false
+        }
+    }
+
+    foreach ($include in @($IncludePaths)) {
+        $normalInclude = Normalize-BackupPath $include
+        if ($normalInclude -and ($normalFile -eq $normalInclude -or $normalFile.StartsWith($normalInclude + '\'))) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Get-OutlookPstBackupCoverage {
+    param([string]$IDriveDataRoot)
+
+    # Explicit PST discovery locations:
+    #   Documents\*.pst
+    #   OneDrive\Documents\*.pst
+    #   AppData\Local\Microsoft\Outlook\*.pst
+    $pstFiles = @()
+    $userRoots = @(Get-ChildItem -LiteralPath "C:\Users" -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notin @('All Users', 'Default', 'Default User', 'Public') })
+
+    foreach ($userRoot in $userRoots) {
+        $candidatePatterns = @(
+            @{ Path = Join-Path $userRoot.FullName 'Documents'; Source = 'Documents' },
+            @{ Path = Join-Path $userRoot.FullName 'OneDrive\Documents'; Source = 'OneDrive Documents' },
+            @{ Path = Join-Path $userRoot.FullName 'AppData\Local\Microsoft\Outlook'; Source = 'AppData Local Outlook' }
+        )
+
+        foreach ($candidate in $candidatePatterns) {
+            if (Test-Path -LiteralPath $candidate.Path) {
+                Get-ChildItem -LiteralPath $candidate.Path -Filter '*.pst' -File -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+                    $isOneDrive = $_.FullName -match '\\OneDrive\\Documents\\'
+                    $pstFiles += [pscustomobject]@{
+                        User             = $userRoot.Name
+                        Path             = $_.FullName
+                        Location         = $candidate.Source
+                        SizeGB           = [math]::Round($_.Length / 1GB, 2)
+                        LastWriteTime    = $_.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')
+                        IsOneDriveHosted = $isOneDrive
+                        BackupSetMatched = $false
+                    }
+                }
+            }
+        }
+    }
+
+    $includePaths = @()
+    $excludePaths = @()
+    $backupSetVerified = $false
+    $configFilesChecked = 0
+
+    if ($IDriveDataRoot -and (Test-Path -LiteralPath $IDriveDataRoot)) {
+        $configFiles = Get-ChildItem -LiteralPath $IDriveDataRoot -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -match '^\.(txt|xml|json|ini|cfg|conf|lst)$' -or $_.Name -match 'backup|bkpset|include|exclude|filelist' } |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 250
+
+        foreach ($cfg in $configFiles) {
+            $configFilesChecked++
+            try {
+                $content = Get-Content -LiteralPath $cfg.FullName -Raw -ErrorAction Stop
+                if ($content -match 'C:\\Users\\|%USERPROFILE%|Documents|Outlook|\.pst|AppData') {
+                    $backupSetVerified = $true
+                    $pathMatches = [regex]::Matches($content, '([A-Za-z]:\\[^<>:"|?*\r\n]+|%USERPROFILE%\\[^<>:"|?*\r\n]+)')
+                    foreach ($m in $pathMatches) {
+                        $pathText = $m.Value.Trim().Trim('"').Trim()
+                        if (-not $pathText) { continue }
+                        if ($pathText -match '(?i)exclude|skip') {
+                            $excludePaths += $pathText
+                        } else {
+                            $includePaths += $pathText
+                        }
+                    }
+                    if ($content -match '(?i)AppData\\') { $excludePaths += 'C:\Users\*\AppData' }
+                }
+            } catch {}
+        }
+    }
+
+    $coveredCount = 0
+    $uncovered = @()
+    $onedriveHosted = @()
+    foreach ($pst in $pstFiles) {
+        $matched = Test-PathCoveredByBackupSet -FilePath $pst.Path -IncludePaths $includePaths -ExcludePaths $excludePaths
+        $pst.BackupSetMatched = $matched
+        if ($matched) { $coveredCount++ } else { $uncovered += $pst }
+        if ($pst.IsOneDriveHosted) { $onedriveHosted += $pst }
+    }
+
+    $status = 'PASS'
+    $coverage = 'No Outlook PST files found'
+    $recommendedAction = 'No action required'
+
+    if ($pstFiles.Count -gt 0) {
+        if ($onedriveHosted.Count -gt 0) {
+            $status = 'WARNING - OneDrive-hosted PST files are unreliable'
+            $coverage = 'OneDrive-hosted PST files are unreliable even if the folder appears protected'
+            $recommendedAction = 'Move PST out of OneDrive and ensure iDrive backs it up'
+        } elseif (-not $backupSetVerified) {
+            $status = 'CHECK REQUIRED'
+            $coverage = 'Unable to verify iDrive backup-set coverage for Outlook PST files'
+            $recommendedAction = 'Confirm iDrive includes the PST file location(s), especially AppData Local Outlook and Documents'
+        } elseif ($uncovered.Count -gt 0) {
+            $status = 'WARNING - PST files found but no matching iDrive backup-set path found'
+            $coverage = 'PST files found but no matching iDrive backup-set path found'
+            $recommendedAction = 'Add the PST folder(s) to the iDrive backup set or move PST files to an included local Documents folder'
+        } else {
+            $status = 'PASS'
+            $coverage = 'PST files found and backup set appears to include their folder'
+            $recommendedAction = 'No action required'
+        }
+    }
+
+    return @{
+        Status              = $status
+        OutlookPstFiles     = @($pstFiles)
+        PstCount            = @($pstFiles).Count
+        OneDrivePstCount    = @($onedriveHosted).Count
+        BackupSetCoverage   = $coverage
+        BackupSetMatched    = $coveredCount
+        BackupSetVerified   = $backupSetVerified
+        ConfigFilesChecked  = $configFilesChecked
+        IncludePathsFound   = @($includePaths | Select-Object -Unique | Select-Object -First 25)
+        ExcludePathsFound   = @($excludePaths | Select-Object -Unique | Select-Object -First 25)
+        RecommendedAction   = $recommendedAction
+    }
 }
 
 Write-Log "============================================"
@@ -1002,6 +1156,15 @@ try {
     $backupComputerName = "N/A"
     $backupAccount = "N/A"
     $filesInSync = "N/A"
+    $outlookPstCoverage = @{
+        Status = "NOT CHECKED"
+        OutlookPstFiles = @()
+        PstCount = 0
+        BackupSetCoverage = "iDrive not installed; Outlook PST backup-set coverage not checked"
+        BackupSetMatched = 0
+        BackupSetVerified = $false
+        RecommendedAction = "Install/configure backup if Outlook PST files are used"
+    }
 
     # Check if iDrive service is running
     $idriveService = Get-Service -Name "IDrive*" -ErrorAction SilentlyContinue
@@ -1168,6 +1331,28 @@ try {
             }
         }
 
+        # Audit whether Outlook PST files are present and covered by the iDrive backup set.
+        # This is intentionally separate from latest-backup log success: a successful iDrive run can still miss PSTs
+        # if AppData is excluded or if Documents was redirected into OneDrive during Microsoft account setup.
+        try {
+            $outlookPstCoverage = Get-OutlookPstBackupCoverage -IDriveDataRoot $idriveDataRoot
+            if ($outlookPstCoverage.Status -notmatch "^PASS$|No Outlook PST") {
+                $Results.Warnings += "iDrive Outlook PST coverage: $($outlookPstCoverage.BackupSetCoverage)"
+            }
+        } catch {
+            Write-Log "Outlook PST backup coverage audit failed: $_" "WARN"
+            $outlookPstCoverage = @{
+                Status = "CHECK REQUIRED"
+                OutlookPstFiles = @()
+                PstCount = 0
+                BackupSetCoverage = "Unable to verify iDrive backup-set coverage for Outlook PST files"
+                BackupSetMatched = 0
+                BackupSetVerified = $false
+                RecommendedAction = "Manually confirm iDrive includes any Outlook PST locations"
+                Error = $_.ToString()
+            }
+        }
+
         $Results.iDriveBackup = @{
             Status           = $idriveStatus
             Installed        = $true
@@ -1180,6 +1365,7 @@ try {
             Duration         = $backupDuration
             ComputerName     = $backupComputerName
             Account          = $backupAccount
+            OutlookPstCoverage = $outlookPstCoverage
         }
 
         Write-Log "iDrive: $idriveStatus | Last backup: $lastBackupDate | Result: $lastBackupInfo | Files: $backupFilesCount"
@@ -1188,6 +1374,7 @@ try {
         $Results.iDriveBackup = @{
             Status    = "NOT INSTALLED"
             Installed = $false
+            OutlookPstCoverage = $outlookPstCoverage
         }
         Write-Log "iDrive client not found on this system"
     }
@@ -4000,6 +4187,29 @@ if (-not $Results.iDriveBackup.Installed) {
         <tr><td><strong>Account</strong></td><td>$($Results.iDriveBackup.Account)</td></tr>
     </table>
 "@
+
+    if ($Results.iDriveBackup.OutlookPstCoverage) {
+        $pstCoverage = $Results.iDriveBackup.OutlookPstCoverage
+        $pstClass = if ($pstCoverage.Status -match "^PASS$") { "success-text" } elseif ($pstCoverage.Status -match "WARNING|CHECK") { "warning-text" } else { "detail" }
+        $html += "<h3>Outlook PST Backup Coverage</h3>"
+        $html += @"
+    <table>
+        <tr><td><strong>Status</strong></td><td><span class='$pstClass'>$($pstCoverage.Status)</span></td></tr>
+        <tr><td><strong>PST Files Found</strong></td><td>$($pstCoverage.PstCount)</td></tr>
+        <tr><td><strong>Backup Set Coverage</strong></td><td>$($pstCoverage.BackupSetCoverage)</td></tr>
+        <tr><td><strong>BackupSetMatched</strong></td><td>$($pstCoverage.BackupSetMatched)</td></tr>
+        <tr><td><strong>Recommended Action</strong></td><td>$($pstCoverage.RecommendedAction)</td></tr>
+    </table>
+"@
+        if ($pstCoverage.OutlookPstFiles -and $pstCoverage.OutlookPstFiles.Count -gt 0) {
+            $html += "<table><tr><th>User</th><th>Location</th><th>Size</th><th>Backed up?</th><th>Path</th></tr>"
+            foreach ($pst in $pstCoverage.OutlookPstFiles) {
+                $matched = if ($pst.BackupSetMatched) { "Yes" } else { "No / unverified" }
+                $html += "<tr><td>$($pst.User)</td><td>$($pst.Location)</td><td>$($pst.SizeGB) GB</td><td>$matched</td><td><code>$($pst.Path)</code></td></tr>"
+            }
+            $html += "</table>"
+        }
+    }
 }
 
 $html += @"
@@ -4827,6 +5037,19 @@ ${overallColor}OVERALL STATUS: $overallStatus ($warningCount warning(s), $errorC
                 $emailBody += "Computer Name".PadRight(30) + "$($Results.iDriveBackup.ComputerName)`n"
                 $emailBody += "Account".PadRight(30) + "$($Results.iDriveBackup.Account)`n"
                 $emailBody += "Service".PadRight(30) + "$svcStatus`n"
+            }
+            if ($Results.iDriveBackup.OutlookPstCoverage -and $Results.iDriveBackup.OutlookPstCoverage.PstCount -gt 0) {
+                $pstCoverage = $Results.iDriveBackup.OutlookPstCoverage
+                $pstStatus = if ($pstCoverage.Status -match "^PASS$") { "[G]$($pstCoverage.Status)[/G]" } else { "[W]$($pstCoverage.Status)[/W]" }
+                $emailBody += "`n[H]OUTLOOK PST BACKUP COVERAGE[/H] $pstStatus`n"
+                $emailBody += "PST Files Found".PadRight(30) + "$($pstCoverage.PstCount)`n"
+                $emailBody += "Backup Set Coverage".PadRight(30) + "$($pstCoverage.BackupSetCoverage)`n"
+                $emailBody += "BackupSetMatched".PadRight(30) + "$($pstCoverage.BackupSetMatched)`n"
+                $emailBody += "Recommended Action".PadRight(30) + "$($pstCoverage.RecommendedAction)`n"
+                foreach ($pst in $pstCoverage.OutlookPstFiles) {
+                    $matched = if ($pst.BackupSetMatched) { "Yes" } else { "No / unverified" }
+                    $emailBody += "  $($pst.Location): $($pst.Path) ($($pst.SizeGB) GB, backed up: $matched)`n"
+                }
             }
             $emailBody += "`n"
         }
