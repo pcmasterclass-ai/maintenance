@@ -25,6 +25,18 @@ class WindowsAntivirusReportingTests(unittest.TestCase):
         self.assertIn('WARNING - No active antivirus detected', MAINTENANCE)
         self.assertIn('Multiple active antivirus products detected', MAINTENANCE)
 
+    def test_unwanted_security_scanware_is_detected_and_reported(self):
+        self.assertIn('UnwantedSecuritySoftware', MAINTENANCE)
+        self.assertIn('McAfee Security Scan Plus', MAINTENANCE)
+        self.assertIn('Norton Security Scan', MAINTENANCE)
+        self.assertIn('Security scanware / unwanted AV-adjacent software', MAINTENANCE)
+        self.assertIn('Remove useless security scanware such as McAfee Security Scan Plus', MAINTENANCE)
+
+    def test_unwanted_security_scanware_is_in_email_and_html_sections(self):
+        self.assertIn('UNWANTED SECURITY SOFTWARE', MAINTENANCE)
+        self.assertIn('Unwanted security software detected', MAINTENANCE)
+        self.assertIn('if ($Results.AntivirusInventory.UnwantedSecuritySoftware', MAINTENANCE)
+
     def test_email_subject_preserves_existing_surname_firstname_comma(self):
         self.assertIn('preserve the comma rather than adding a second one', MAINTENANCE)
         self.assertIn("$ClientName -match '^\\s*([^,]+),\\s*(.+?)\\s*$'", MAINTENANCE)

@@ -1380,6 +1380,48 @@ function Convert-AVProductState {
     return @{ RawState = $hexState; RealTimeProtection = $rtState; SignatureStatus = $sigState }
 }
 
+$UnwantedSecuritySoftwarePatterns = @(
+    @{ Pattern = "McAfee Security Scan Plus"; Reason = "Security scanware / unwanted AV-adjacent software commonly bundled with Adobe updates" },
+    @{ Pattern = "Norton Security Scan"; Reason = "Security scanware / unwanted AV-adjacent software" },
+    @{ Pattern = "Norton Security Scan Plus"; Reason = "Security scanware / unwanted AV-adjacent software" },
+    @{ Pattern = "Kaspersky Security Scan"; Reason = "Security scanware / unwanted AV-adjacent software" },
+    @{ Pattern = "Avast Secure Browser"; Reason = "Bundled security-adjacent browser; review/remove if not intentionally used" },
+    @{ Pattern = "AVG Secure Browser"; Reason = "Bundled security-adjacent browser; review/remove if not intentionally used" }
+)
+
+function Get-UnwantedSecuritySoftware {
+    $uninstallRoots = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKU:\*\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    )
+
+    $matches = @()
+    foreach ($root in $uninstallRoots) {
+        try {
+            $apps = @(Get-ItemProperty -Path $root -ErrorAction SilentlyContinue)
+            foreach ($app in $apps) {
+                $displayName = [string]$app.DisplayName
+                if ([string]::IsNullOrWhiteSpace($displayName)) { continue }
+                foreach ($rule in $UnwantedSecuritySoftwarePatterns) {
+                    if ($displayName -like "*$($rule.Pattern)*") {
+                        $matches += [ordered]@{
+                            Name = $displayName
+                            Version = [string]$app.DisplayVersion
+                            Publisher = [string]$app.Publisher
+                            Reason = $rule.Reason
+                            RegistryKey = [string]$app.PSPath
+                        }
+                        break
+                    }
+                }
+            }
+        } catch {}
+    }
+
+    return @($matches | Sort-Object Name, Version -Unique)
+}
+
 try {
     $avProducts = @()
     try {
@@ -1435,6 +1477,7 @@ try {
     $thirdPartyActive = @($activeProducts | Where-Object { $_.VendorType -eq "Third-party antivirus" })
     $defenderActive = @($activeProducts | Where-Object { $_.VendorType -eq "Microsoft Defender" })
     $mbEndpointActive = @($activeProducts | Where-Object { $_.VendorType -eq "PCMC Malwarebytes Endpoint" })
+    $unwantedSecuritySoftware = @(Get-UnwantedSecuritySoftware)
 
     $protectionSummary = "Unknown"
     $inventoryStatus = "INFO"
@@ -1474,11 +1517,19 @@ try {
         $recommendedAction = $Results.Malwarebytes.RecommendedAction
     }
 
+    if ($unwantedSecuritySoftware.Count -gt 0) {
+        if ($inventoryStatus -eq "PASS" -or $inventoryStatus -eq "INFO") { $inventoryStatus = "WARNING" }
+        $unwantedNames = ($unwantedSecuritySoftware | ForEach-Object { $_.Name }) -join ", "
+        $recommendedAction = "$recommendedAction; Remove useless security scanware such as McAfee Security Scan Plus when found"
+        Write-Log "Unwanted security software detected: $unwantedNames" "WARN"
+    }
+
     $Results.AntivirusInventory = @{
         Status = $inventoryStatus
         ProtectionSummary = $protectionSummary
         SecurityCenter2Products = $productRows
         ActiveProducts = $activeNames
+        UnwantedSecuritySoftware = $unwantedSecuritySoftware
         RecommendedAction = $recommendedAction
         MalwarebytesProduct = $Results.Malwarebytes.ProductType
         MalwarebytesRecommendedAction = $Results.Malwarebytes.RecommendedAction
@@ -4008,6 +4059,16 @@ if ($Results.AntivirusInventory.SecurityCenter2Products -and $Results.AntivirusI
     $html += "<p class='warning-text'>No antivirus products were reported by Windows Security Center.</p>"
 }
 
+if ($Results.AntivirusInventory.UnwantedSecuritySoftware -and $Results.AntivirusInventory.UnwantedSecuritySoftware.Count -gt 0) {
+    $html += "<h3>Unwanted security software detected</h3>"
+    $html += "<p class='warning-text'>These products are usually security scanware or bundled AV-adjacent software rather than useful managed protection.</p>"
+    $html += "<table><tr><th>Product</th><th>Version</th><th>Publisher</th><th>Reason</th></tr>"
+    foreach ($app in $Results.AntivirusInventory.UnwantedSecuritySoftware) {
+        $html += "<tr><td>$($app.Name)</td><td>$($app.Version)</td><td>$($app.Publisher)</td><td>$($app.Reason)</td></tr>"
+    }
+    $html += "</table>"
+}
+
 $html += @"
 </div></details>
 </div>
@@ -4804,6 +4865,12 @@ ${overallColor}OVERALL STATUS: $overallStatus ($warningCount warning(s), $errorC
             if ($Results.AntivirusInventory.SecurityCenter2Products) {
                 foreach ($av in $Results.AntivirusInventory.SecurityCenter2Products) {
                     $emailBody += "  $($av.Name)".PadRight(30) + "$($av.RealTimeProtection) / $($av.SignatureStatus)`n"
+                }
+            }
+            if ($Results.AntivirusInventory.UnwantedSecuritySoftware -and $Results.AntivirusInventory.UnwantedSecuritySoftware.Count -gt 0) {
+                $emailBody += "`n[H]UNWANTED SECURITY SOFTWARE[/H]`n"
+                foreach ($app in $Results.AntivirusInventory.UnwantedSecuritySoftware) {
+                    $emailBody += "[W]$($app.Name)[/W]".PadRight(30) + "$($app.Reason)`n"
                 }
             }
             $emailBody += "`n"
