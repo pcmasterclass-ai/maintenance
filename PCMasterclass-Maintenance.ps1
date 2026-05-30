@@ -71,7 +71,7 @@ param(
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-$ScriptVersion = "2.9.4"
+$ScriptVersion = "2.9.5"
 
 # GitHub raw URL for the latest version of this script
 # To use: create a private GitHub repo, push the script, and set this URL
@@ -420,6 +420,7 @@ $Results = [ordered]@{
     WindowsUpdates   = @{}
     iDriveBackup     = @{}
     Malwarebytes     = @{}
+    AntivirusInventory = @{}
     Defender         = @{}
     EventLogErrors   = @{}
     PendingReboot    = @{}
@@ -1239,10 +1240,14 @@ try {
     if ($mbServices) { $mbInstalled = $true }
 
     if ($mbInstalled) {
-        # Determine product type (Premium/Free/Endpoint)
+        # Determine product type (Endpoint/Premium/Free/Other) and the business follow-up.
+        # This deliberately distinguishes PCMC-managed Endpoint Protection from older
+        # consumer Malwarebytes products so renewal/upgrade opportunities are visible.
         $mbEndpointSvc = Get-Service -Name "MBEndpointAgent" -ErrorAction SilentlyContinue
+        $mbRecommendedAction = "Review Malwarebytes status"
         if ($mbEndpointSvc) {
             $mbProductType = "Endpoint Protection"
+            $mbRecommendedAction = "OK - PCMC-managed Malwarebytes Endpoint Protection detected"
         } else {
             # Check registry for license type
             $mbRegPaths = @(
@@ -1254,13 +1259,19 @@ try {
                     $mbReg = Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue
                     if ($mbReg) {
                         if ($mbReg.premium -eq 1 -or $mbReg.IsPremium -eq 1) {
-                            $mbProductType = "Premium"
+                            $mbProductType = "Premium - upgrade opportunity"
+                            $mbRecommendedAction = "Offer upgrade to PCMC-managed Malwarebytes Endpoint Protection before next subscription renewal"
                         } else {
-                            $mbProductType = "Free"
+                            $mbProductType = "Free - upgrade recommended"
+                            $mbRecommendedAction = "Upgrade recommended: free Malwarebytes is not managed endpoint protection"
                         }
                         break
                     }
                 }
+            }
+            if ($mbProductType -eq "N/A") {
+                $mbProductType = "Consumer/Other - review before renewal"
+                $mbRecommendedAction = "Review license type and offer PCMC-managed Malwarebytes Endpoint Protection if appropriate"
             }
         }
 
@@ -1319,6 +1330,7 @@ try {
             RealTimeProtection  = $mbRealTimeProtection
             LastScan            = $mbLastScan
             DefinitionsAge      = $mbDefinitionsAge
+            RecommendedAction   = $mbRecommendedAction
         }
 
         Write-Log "Malwarebytes: $mbProductType v$mbVersion | Service: $(if($mbServiceRunning){'Running'}else{'Stopped'}) | RT: $mbRealTimeProtection"
@@ -1326,6 +1338,8 @@ try {
         $Results.Malwarebytes = @{
             Installed = $false
             Status    = "NOT INSTALLED"
+            ProductType = "Not installed"
+            RecommendedAction = "Opportunity: offer PCMC-managed Malwarebytes Endpoint Protection"
         }
         Write-Log "Malwarebytes not found on this system"
     }
@@ -1334,6 +1348,147 @@ try {
     Write-Log "Malwarebytes check failed: $_" "ERROR"
     $Results.Malwarebytes = @{ Status = "ERROR"; Error = $_.ToString() }
     $Results.Errors += "Malwarebytes: $_"
+}
+
+
+# ============================================================================
+# MODULE 5B: ANTIVIRUS INVENTORY / ENDPOINT PROTECTION SUMMARY
+# ============================================================================
+Write-Log "Checking antivirus inventory / endpoint protection summary..."
+
+function Convert-AVProductState {
+    param([int]$ProductState)
+
+    $hexState = "0x{0:X6}" -f $ProductState
+    $rtNibble = (($ProductState -shr 12) -band 0xF)
+    $sigNibble = (($ProductState -shr 4) -band 0xF)
+
+    # Windows SecurityCenter2 productState is not perfectly documented across vendors,
+    # so keep the raw hex state and use conservative labels.
+    $rtState = switch ($rtNibble) {
+        1 { "Enabled" }
+        6 { "Enabled" }
+        0 { "Disabled" }
+        default { "Unknown" }
+    }
+    $sigState = switch ($sigNibble) {
+        0 { "Up to date" }
+        1 { "Out of date" }
+        default { "Unknown" }
+    }
+
+    return @{ RawState = $hexState; RealTimeProtection = $rtState; SignatureStatus = $sigState }
+}
+
+try {
+    $avProducts = @()
+    try {
+        $avProducts = @(Get-CimInstance -Namespace "root\SecurityCenter2" -ClassName "AntiVirusProduct" -ErrorAction Stop)
+    } catch {
+        Write-Log "SecurityCenter2 antivirus inventory unavailable: $_" "WARN"
+    }
+
+    $productRows = @()
+    foreach ($av in $avProducts) {
+        $decoded = Convert-AVProductState -ProductState ([int]$av.productState)
+        $name = [string]$av.displayName
+        $vendorType = if ($name -match "Malwarebytes") {
+            if ($Results.Malwarebytes.ProductType -eq "Endpoint Protection") { "PCMC Malwarebytes Endpoint" } else { "Malwarebytes consumer/other" }
+        } elseif ($name -match "Windows Defender|Microsoft Defender") {
+            "Microsoft Defender"
+        } else {
+            "Third-party antivirus"
+        }
+        $productRows += [ordered]@{
+            Name = $name
+            VendorType = $vendorType
+            RealTimeProtection = $decoded.RealTimeProtection
+            SignatureStatus = $decoded.SignatureStatus
+            ProductState = $decoded.RawState
+            Path = $av.pathToSignedProductExe
+        }
+    }
+
+    # Cross-check Microsoft Defender directly. Some third-party SecurityCenter2
+    # productState values are vendor-specific; Defender's own cmdlet is more reliable.
+    try {
+        $mpInventoryStatus = Get-MpComputerStatus -ErrorAction Stop
+        if ($mpInventoryStatus -and $mpInventoryStatus.RealTimeProtectionEnabled) {
+            foreach ($row in @($productRows | Where-Object { $_.VendorType -eq "Microsoft Defender" })) {
+                $row.RealTimeProtection = "Enabled"
+            }
+            if (($productRows | Where-Object { $_.VendorType -eq "Microsoft Defender" }).Count -eq 0) {
+                $productRows += [ordered]@{
+                    Name = "Microsoft Defender Antivirus"
+                    VendorType = "Microsoft Defender"
+                    RealTimeProtection = "Enabled"
+                    SignatureStatus = "See Defender section"
+                    ProductState = "Get-MpComputerStatus"
+                    Path = ""
+                }
+            }
+        }
+    } catch {}
+
+    $activeProducts = @($productRows | Where-Object { $_.RealTimeProtection -eq "Enabled" })
+    $activeNames = @($activeProducts | ForEach-Object { $_.Name })
+    $thirdPartyActive = @($activeProducts | Where-Object { $_.VendorType -eq "Third-party antivirus" })
+    $defenderActive = @($activeProducts | Where-Object { $_.VendorType -eq "Microsoft Defender" })
+    $mbEndpointActive = @($activeProducts | Where-Object { $_.VendorType -eq "PCMC Malwarebytes Endpoint" })
+
+    $protectionSummary = "Unknown"
+    $inventoryStatus = "INFO"
+    $recommendedAction = "Review antivirus inventory"
+
+    if ($mbEndpointActive.Count -gt 0 -or ($Results.Malwarebytes.ProductType -eq "Endpoint Protection" -and $Results.Malwarebytes.ServiceRunning)) {
+        $protectionSummary = "Protected by PCMC-managed Malwarebytes Endpoint Protection"
+        $inventoryStatus = "PASS"
+        $recommendedAction = "No Malwarebytes upgrade needed"
+    } elseif ($activeProducts.Count -eq 0 -and $productRows.Count -eq 0) {
+        $protectionSummary = "WARNING - No active antivirus detected"
+        $inventoryStatus = "WARNING"
+        $recommendedAction = "Urgent review: no antivirus product registered with Windows Security Center"
+    } elseif ($activeProducts.Count -eq 0) {
+        $protectionSummary = "WARNING - No active antivirus detected"
+        $inventoryStatus = "WARNING"
+        $recommendedAction = "Urgent review: antivirus products are present but none appear active"
+    } elseif ($activeProducts.Count -gt 1) {
+        $protectionSummary = "Multiple active antivirus products detected: $($activeNames -join ', ')"
+        $inventoryStatus = "WARNING"
+        $recommendedAction = "Review for conflicting antivirus products"
+    } elseif ($thirdPartyActive.Count -gt 0) {
+        $protectionSummary = "Protected by third-party antivirus: $($thirdPartyActive[0].Name)"
+        $inventoryStatus = "INFO"
+        $recommendedAction = "Review whether to replace with PCMC-managed Malwarebytes Endpoint Protection"
+    } elseif ($defenderActive.Count -gt 0) {
+        $protectionSummary = "Protected by Microsoft Defender only"
+        $inventoryStatus = "INFO"
+        $recommendedAction = "Consider offering PCMC-managed Malwarebytes Endpoint Protection"
+    } else {
+        $protectionSummary = "Antivirus protection present but state could not be confidently classified"
+        $inventoryStatus = "INFO"
+        $recommendedAction = "Manual review recommended"
+    }
+
+    if ($Results.Malwarebytes.Installed -and $Results.Malwarebytes.ProductType -match "Premium|Free|Consumer/Other") {
+        $recommendedAction = $Results.Malwarebytes.RecommendedAction
+    }
+
+    $Results.AntivirusInventory = @{
+        Status = $inventoryStatus
+        ProtectionSummary = $protectionSummary
+        SecurityCenter2Products = $productRows
+        ActiveProducts = $activeNames
+        RecommendedAction = $recommendedAction
+        MalwarebytesProduct = $Results.Malwarebytes.ProductType
+        MalwarebytesRecommendedAction = $Results.Malwarebytes.RecommendedAction
+    }
+
+    Write-Log "Antivirus Inventory: $protectionSummary | Action: $recommendedAction"
+} catch {
+    Write-Log "Antivirus inventory check failed: $_" "ERROR"
+    $Results.AntivirusInventory = @{ Status = "ERROR"; Error = $_.ToString(); SecurityCenter2Products = @(); RecommendedAction = "Manual review required" }
+    $Results.Errors += "Antivirus Inventory: $_"
 }
 
 
@@ -3470,7 +3625,7 @@ $overallStatus = "PASS"
 $warningCount = 0
 $errorCount = 0
 
-$checkModules = @($Results.SFC, $Results.DiskHealth, $Results.WindowsUpdates, $Results.iDriveBackup, $Results.Malwarebytes, $Results.Defender, $Results.EventLogErrors, $Results.PendingReboot, $Results.Firewall, $Results.UserAccounts, $Results.DISM, $Results.TempFiles, $Results.StartupPrograms, $Results.ScheduledTasks, $Results.BrowserExtensions, $Results.ServiceStatus, $Results.NetworkConfig, $Results.AdwCleaner, $Results.RestorePoints, $Results.TelemetryServices)
+$checkModules = @($Results.SFC, $Results.DiskHealth, $Results.WindowsUpdates, $Results.iDriveBackup, $Results.Malwarebytes, $Results.AntivirusInventory, $Results.Defender, $Results.EventLogErrors, $Results.PendingReboot, $Results.Firewall, $Results.UserAccounts, $Results.DISM, $Results.TempFiles, $Results.StartupPrograms, $Results.ScheduledTasks, $Results.BrowserExtensions, $Results.ServiceStatus, $Results.NetworkConfig, $Results.AdwCleaner, $Results.RestorePoints, $Results.TelemetryServices)
 foreach ($module in $checkModules) {
     if ($module.Status -match "ERROR|FAIL") { $errorCount++; $overallStatus = "FAIL" }
     elseif ($module.Status -match "WARNING") { $warningCount++ }
@@ -3568,6 +3723,7 @@ $summaryItems = @(
     @("updates",      "Windows Updates",             $Results.WindowsUpdates.Status),
     @("idrive",       "iDrive Backup",               $Results.iDriveBackup.Status),
     @("malwarebytes", "Malwarebytes",                $Results.Malwarebytes.Status),
+    @("avinventory",  "Antivirus Inventory",          $Results.AntivirusInventory.Status),
     @("defender",     "Windows Defender",             $Results.Defender.Status),
     @("eventlog",     "Event Log Errors",             $Results.EventLogErrors.Status),
     @("reboot",       "Pending Reboot",               $Results.PendingReboot.Status),
@@ -3811,6 +3967,7 @@ $html += "<div class='section-body'>"
 
 if (-not $Results.Malwarebytes.Installed) {
     $html += "<p class='detail'>Malwarebytes not found on this system.</p>"
+    $html += "<p class='warning-text'>$($Results.Malwarebytes.RecommendedAction)</p>"
 } else {
     $mbSvcRunning = if ($Results.Malwarebytes.ServiceRunning) { "Running" } else { "<span class='warning-text'>Not Running</span>" }
     $mbRtColor = if ($Results.Malwarebytes.RealTimeProtection -eq "Enabled") { "color:#28a745" } elseif ($Results.Malwarebytes.RealTimeProtection -eq "Disabled") { "color:#dc3545" } else { "" }
@@ -3819,8 +3976,36 @@ if (-not $Results.Malwarebytes.Installed) {
         <tr><td><strong>Product</strong></td><td>$($Results.Malwarebytes.ProductType)</td></tr>
         <tr><td><strong>Service Status</strong></td><td>$mbSvcRunning</td></tr>
         <tr><td><strong>Real-Time Protection</strong></td><td><span style='$mbRtColor;font-weight:bold;'>$($Results.Malwarebytes.RealTimeProtection)</span></td></tr>
+        <tr><td><strong>Recommended Action</strong></td><td>$($Results.Malwarebytes.RecommendedAction)</td></tr>
     </table>
 "@
+}
+
+$html += @"
+</div></details>
+</div>
+
+<!-- ANTIVIRUS INVENTORY -->
+<div class="section" id="avinventory">
+"@
+
+$avInventoryOpen = if ($Results.AntivirusInventory.Status -match "PASS|CLEAN|UP TO DATE|INFO") { "" } else { " open" }
+$avInventoryHeadClass = Get-HeadingClass $Results.AntivirusInventory.Status
+
+$html += "<details$avInventoryOpen><summary class='$avInventoryHeadClass'><span class='icon'>&#x1F6E1;</span> Antivirus Inventory / Endpoint Protection $(Get-StatusBadge $Results.AntivirusInventory.Status)</summary>"
+$html += "<div class='section-body'>"
+$html += "<p><strong>$($Results.AntivirusInventory.ProtectionSummary)</strong></p>"
+$html += "<p class='detail'><strong>Recommended action:</strong> $($Results.AntivirusInventory.RecommendedAction)</p>"
+
+if ($Results.AntivirusInventory.SecurityCenter2Products -and $Results.AntivirusInventory.SecurityCenter2Products.Count -gt 0) {
+    $html += "<table><tr><th>Product</th><th>Type</th><th>Real-Time Protection</th><th>Signatures</th><th>State</th></tr>"
+    foreach ($av in $Results.AntivirusInventory.SecurityCenter2Products) {
+        $rtClass = if ($av.RealTimeProtection -eq "Enabled") { "" } elseif ($av.RealTimeProtection -eq "Disabled") { "class='warning-text'" } else { "class='detail'" }
+        $html += "<tr><td>$($av.Name)</td><td>$($av.VendorType)</td><td $rtClass>$($av.RealTimeProtection)</td><td>$($av.SignatureStatus)</td><td class='detail'>$($av.ProductState)</td></tr>"
+    }
+    $html += "</table>"
+} else {
+    $html += "<p class='warning-text'>No antivirus products were reported by Windows Security Center.</p>"
 }
 
 $html += @"
@@ -4595,6 +4780,26 @@ ${overallColor}OVERALL STATUS: $overallStatus ($warningCount warning(s), $errorC
                 $emailBody += "Product".PadRight(30) + "$($Results.Malwarebytes.ProductType)`n"
                 $emailBody += "Service".PadRight(30) + "$mbSvcText`n"
                 $emailBody += "Real-Time Protection".PadRight(30) + "$mbRtText`n"
+            }
+            $emailBody += "`n"
+        }
+
+        # Add Antivirus Inventory / Endpoint Protection details
+        if ($Results.AntivirusInventory.Status) {
+            if ($Results.AntivirusInventory.Status -match "PASS|INFO") {
+                $emailBody += "`n[H]ANTIVIRUS INVENTORY / ENDPOINT PROTECTION[/H] $($Results.AntivirusInventory.ProtectionSummary) (see HTML report for full details)`n"
+                if ($Results.AntivirusInventory.RecommendedAction) {
+                    $emailBody += "Recommended Action".PadRight(30) + "$($Results.AntivirusInventory.RecommendedAction)`n"
+                }
+            } else {
+                $emailBody += "`n[H]ANTIVIRUS INVENTORY / ENDPOINT PROTECTION[/H]`n"
+                $emailBody += "Summary".PadRight(30) + "[W]$($Results.AntivirusInventory.ProtectionSummary)[/W]`n"
+                $emailBody += "Recommended Action".PadRight(30) + "[W]$($Results.AntivirusInventory.RecommendedAction)[/W]`n"
+            }
+            if ($Results.AntivirusInventory.SecurityCenter2Products) {
+                foreach ($av in $Results.AntivirusInventory.SecurityCenter2Products) {
+                    $emailBody += "  $($av.Name)".PadRight(30) + "$($av.RealTimeProtection) / $($av.SignatureStatus)`n"
+                }
             }
             $emailBody += "`n"
         }
