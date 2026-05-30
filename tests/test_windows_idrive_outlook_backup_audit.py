@@ -23,9 +23,14 @@ class WindowsIDriveOutlookBackupAuditTests(unittest.TestCase):
         self.assertIn('Move PST out of OneDrive and ensure iDrive backs it up', MAINTENANCE)
 
     def test_outlook_backup_audit_is_in_html_and_email_output(self):
-        self.assertIn('Outlook PST Backup Coverage', MAINTENANCE)
-        self.assertIn('OUTLOOK PST BACKUP COVERAGE', MAINTENANCE)
+        self.assertIn('iDrive Backup Set Coverage', MAINTENANCE)
+        self.assertIn('iDRIVE BACKUP SET COVERAGE', MAINTENANCE)
         self.assertIn('BackupSetMatched', MAINTENANCE)
+
+    def test_backup_set_coverage_notes_are_flattened_before_joining(self):
+        self.assertIn('$allCoverageNotes = @($coverage)', MAINTENANCE)
+        self.assertIn('$allCoverageNotes += $coverageNotes', MAINTENANCE)
+        self.assertNotIn('($coverage, $coverageNotes)', MAINTENANCE)
 
     def test_standard_user_backup_folders_are_checked(self):
         self.assertIn('StandardUserFoldersCoverage', MAINTENANCE)

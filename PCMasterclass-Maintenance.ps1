@@ -782,7 +782,9 @@ function Get-OutlookPstBackupCoverage {
         $coverageNotes += 'Cloud-sync placeholders detected; iDrive may only see stubs for online-only files'
     }
     if ($coverageNotes.Count -gt 0) {
-        $coverage = (($coverage, $coverageNotes) | Where-Object { $_ }) -join '; '
+        $allCoverageNotes = @($coverage)
+        $allCoverageNotes += $coverageNotes
+        $coverage = ($allCoverageNotes | Where-Object { $_ }) -join '; '
     }
 
     return @{
