@@ -4602,10 +4602,15 @@ if ($EmailTo) {
         }
 
         $scriptDuration = [math]::Round(((Get-Date) - $scriptStartTime).TotalMinutes, 1)
-        # Format client name as "Surname, Firstname" for the email subject line
+        # Format client name for the email subject line.
+        # If Tactical already supplied "Surname, Firstname", preserve the comma rather than adding a second one.
         if ($ClientName) {
-            $nameParts = $ClientName -split '\s+', 2
-            $clientDisplay = if ($nameParts.Count -ge 2) { "$($nameParts[0].ToUpper()), $($nameParts[1])" } else { $ClientName }
+            if ($ClientName -match '^\s*([^,]+),\s*(.+?)\s*$') {
+                $clientDisplay = "$($Matches[1].Trim().ToUpper()), $($Matches[2].Trim())"
+            } else {
+                $nameParts = $ClientName -split '\s+', 2
+                $clientDisplay = if ($nameParts.Count -ge 2) { "$($nameParts[0].ToUpper()), $($nameParts[1])" } else { $ClientName }
+            }
         } else {
             $clientDisplay = $ComputerName
         }

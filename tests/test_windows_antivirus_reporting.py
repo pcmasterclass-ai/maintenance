@@ -25,6 +25,11 @@ class WindowsAntivirusReportingTests(unittest.TestCase):
         self.assertIn('WARNING - No active antivirus detected', MAINTENANCE)
         self.assertIn('Multiple active antivirus products detected', MAINTENANCE)
 
+    def test_email_subject_preserves_existing_surname_firstname_comma(self):
+        self.assertIn('preserve the comma rather than adding a second one', MAINTENANCE)
+        self.assertIn("$ClientName -match '^\\s*([^,]+),\\s*(.+?)\\s*$'", MAINTENANCE)
+        self.assertIn('$($Matches[1].Trim().ToUpper()), $($Matches[2].Trim())', MAINTENANCE)
+
 
 if __name__ == "__main__":
     unittest.main()
