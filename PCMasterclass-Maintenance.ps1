@@ -71,7 +71,7 @@ param(
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-$ScriptVersion = "2.9.7"
+$ScriptVersion = "2.9.8"
 
 # GitHub raw URL for the latest version of this script
 # To use: create a private GitHub repo, push the script, and set this URL
@@ -497,6 +497,96 @@ function Test-PathCoveredByBackupSet {
     return $false
 }
 
+function Get-CloudSyncFolderInventory {
+    param(
+        [object[]]$UserRoots,
+        [string[]]$IncludePaths,
+        [string[]]$ExcludePaths,
+        [int]$SampleLimit = 750
+    )
+
+    $cloudFolders = @()
+    $cloudFolderNamePattern = '(?i)^(OneDrive($|\s|-)|Dropbox$|Google Drive$|My Drive$|Shared drives$|Box$|iCloudDrive$|iCloud Drive$|iCloud Photos$)'
+
+    foreach ($userRoot in @($UserRoots)) {
+        if (-not $userRoot -or -not (Test-Path -LiteralPath $userRoot.FullName)) { continue }
+
+        Get-ChildItem -LiteralPath $userRoot.FullName -Directory -ErrorAction SilentlyContinue | Where-Object {
+            $_.Name -match $cloudFolderNamePattern
+        } | ForEach-Object {
+            $folder = $_
+            $provider = switch -Regex ($folder.Name) {
+                '(?i)^OneDrive' { 'OneDrive'; break }
+                '(?i)^Dropbox$' { 'Dropbox'; break }
+                '(?i)^(Google Drive|My Drive|Shared drives)$' { 'Google Drive'; break }
+                '(?i)^Box$' { 'Box'; break }
+                '(?i)^iCloud' { 'iCloud Drive'; break }
+                default { 'Cloud sync' }
+            }
+
+            $sampleFiles = @()
+            try {
+                $sampleFiles = @(Get-ChildItem -LiteralPath $folder.FullName -File -Recurse -Force -ErrorAction SilentlyContinue | Select-Object -First $SampleLimit)
+            } catch {
+                $sampleFiles = @()
+            }
+
+            $localFiles = @()
+            $placeholderFiles = @()
+            foreach ($file in $sampleFiles) {
+                $attrText = $file.Attributes.ToString()
+                $isPlaceholder = ($attrText -match 'Offline') -or (($attrText -match 'ReparsePoint') -and $file.Length -eq 0)
+                if ($isPlaceholder) {
+                    $placeholderFiles += $file
+                } else {
+                    $localFiles += $file
+                }
+            }
+
+            $localSizeBytes = 0
+            foreach ($file in $localFiles) { $localSizeBytes += [int64]$file.Length }
+            $matched = Test-PathCoveredByBackupSet -FilePath $folder.FullName -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths
+            $localState = if ($sampleFiles.Count -eq 0) {
+                'No files found in sample / empty folder'
+            } elseif ($localFiles.Count -gt 0 -and $placeholderFiles.Count -gt 0) {
+                'Mixed local and online-only placeholders'
+            } elseif ($localFiles.Count -gt 0) {
+                'Local file contents present'
+            } elseif ($placeholderFiles.Count -gt 0) {
+                'Appears online-only / placeholder-based'
+            } else {
+                'Unable to determine'
+            }
+
+            $recommendation = if ($localFiles.Count -gt 0 -and -not $matched) {
+                'Add this locally stored cloud-sync folder to the iDrive backup set, unless a separate cloud backup/retention policy is confirmed'
+            } elseif ($placeholderFiles.Count -gt 0 -and -not $matched) {
+                'Online-only placeholders detected; iDrive may not back up actual contents unless files are hydrated locally. Confirm separate cloud backup/retention or mirror/include required data'
+            } elseif ($matched) {
+                'Cloud-sync folder appears included in iDrive backup set; confirm cloud-only placeholders are not being mistaken for backed-up content'
+            } else {
+                'Review cloud-sync folder backup requirements'
+            }
+
+            $cloudFolders += [pscustomobject]@{
+                User = $userRoot.Name
+                Provider = $provider
+                Name = $folder.Name
+                Path = $folder.FullName
+                BackupSetMatched = $matched
+                LocalState = $localState
+                SampleFilesChecked = $sampleFiles.Count
+                LocalFilesInSample = $localFiles.Count
+                PlaceholderFilesInSample = $placeholderFiles.Count
+                LocalSizeSampleGB = [math]::Round($localSizeBytes / 1GB, 2)
+                Recommendation = $recommendation
+            }
+        }
+    }
+
+    return @($cloudFolders)
+}
+
 function Get-OutlookPstBackupCoverage {
     param([string]$IDriveDataRoot)
 
@@ -511,6 +601,8 @@ function Get-OutlookPstBackupCoverage {
     $roamCacheCoverage = @()
     $missingRoamCache = @()
     $rootDriveCandidateFolders = @()
+    $cloudSyncFolders = @()
+    $missingCloudSyncFolders = @()
     $userRoots = @(Get-ChildItem -LiteralPath "C:\Users" -Directory -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -notin @('All Users', 'Default', 'Default User', 'Public') })
 
@@ -553,9 +645,9 @@ function Get-OutlookPstBackupCoverage {
             $configFilesChecked++
             try {
                 $content = Get-Content -LiteralPath $cfg.FullName -Raw -ErrorAction Stop
-                if ($content -match 'C:\\Users\\|%USERPROFILE%|Documents|Outlook|\.pst|AppData') {
+                if ($content -match 'C:\\Users\\|%USERPROFILE%|Documents|Outlook|\.pst|AppData|OneDrive|Dropbox|Google Drive|My Drive|Box|iCloud') {
                     $backupSetVerified = $true
-                    $pathMatches = [regex]::Matches($content, '([A-Za-z]:\\[^<>:"|?*\r\n]+|%USERPROFILE%\\[^<>:"|?*\r\n]+)')
+                    $pathMatches = [regex]::Matches($content, '([A-Za-z]:\\[^<>:"|?\r\n]+|%USERPROFILE%\\[^<>:"|?\r\n]+)')
                     foreach ($m in $pathMatches) {
                         $pathText = $m.Value.Trim().Trim('"').Trim()
                         if (-not $pathText) { continue }
@@ -623,6 +715,9 @@ function Get-OutlookPstBackupCoverage {
         }
     }
 
+    $cloudSyncFolders = Get-CloudSyncFolderInventory -UserRoots $userRoots -IncludePaths $includePaths -ExcludePaths $excludePaths
+    $missingCloudSyncFolders = @($cloudSyncFolders | Where-Object { -not $_.BackupSetMatched -and $_.LocalFilesInSample -gt 0 })
+
     $coveredCount = 0
     $uncovered = @()
     $onedriveHosted = @()
@@ -674,6 +769,18 @@ function Get-OutlookPstBackupCoverage {
         if ($status -eq 'PASS') { $status = 'WARNING - Root-level candidate folders found; consider adding to iDrive backup set' }
         if ($recommendedAction -eq 'No action required') { $recommendedAction = 'Review root C: or D: folders and, when in doubt, include due to iDrive generous storage quotas' }
     }
+    if ($missingCloudSyncFolders.Count -gt 0) {
+        $coverageNotes += 'Cloud-sync folders with local files missing from iDrive backup set'
+        if ($status -eq 'PASS') { $status = 'WARNING - Cloud-sync folders with local files missing from iDrive backup set' }
+        if ($recommendedAction -eq 'No action required') { $recommendedAction = 'Add locally stored OneDrive/Google Drive/Dropbox/Box/iCloud folders to iDrive backup set, unless separate cloud backup/retention is confirmed' }
+    } elseif ($cloudSyncFolders.Count -gt 0 -and -not $backupSetVerified) {
+        $coverageNotes += 'Cloud-sync folders found; iDrive backup-set coverage could not be verified'
+        if ($status -eq 'PASS') { $status = 'CHECK REQUIRED - Cloud-sync folder backup coverage unverified' }
+        if ($recommendedAction -eq 'No action required') { $recommendedAction = 'Confirm whether cloud-sync folders are included in iDrive or separately backed up' }
+    }
+    if (($cloudSyncFolders | Where-Object { $_.PlaceholderFilesInSample -gt 0 }).Count -gt 0) {
+        $coverageNotes += 'Cloud-sync placeholders detected; iDrive may only see stubs for online-only files'
+    }
     if ($coverageNotes.Count -gt 0) {
         $coverage = (($coverage, $coverageNotes) | Where-Object { $_ }) -join '; '
     }
@@ -695,6 +802,8 @@ function Get-OutlookPstBackupCoverage {
         OutlookRoamCacheCoverage = @($roamCacheCoverage)
         MissingOutlookRoamCache = @($missingRoamCache)
         RootDriveCandidateFolders = @($rootDriveCandidateFolders)
+        CloudSyncFolders = @($cloudSyncFolders)
+        MissingCloudSyncFolders = @($missingCloudSyncFolders)
     }
 }
 
@@ -1256,6 +1365,8 @@ try {
         BackupSetMatched = 0
         BackupSetVerified = $false
         RecommendedAction = "Install/configure backup if Outlook PST files are used"
+        CloudSyncFolders = @()
+        MissingCloudSyncFolders = @()
     }
 
     # Check if iDrive service is running
@@ -1429,7 +1540,7 @@ try {
         try {
             $outlookPstCoverage = Get-OutlookPstBackupCoverage -IDriveDataRoot $idriveDataRoot
             if ($outlookPstCoverage.Status -notmatch "^PASS$|No Outlook PST") {
-                $Results.Warnings += "iDrive Outlook PST coverage: $($outlookPstCoverage.BackupSetCoverage)"
+                $Results.Warnings += "iDrive backup coverage: $($outlookPstCoverage.BackupSetCoverage)"
             }
         } catch {
             Write-Log "Outlook PST backup coverage audit failed: $_" "WARN"
@@ -1441,6 +1552,8 @@ try {
                 BackupSetMatched = 0
                 BackupSetVerified = $false
                 RecommendedAction = "Manually confirm iDrive includes any Outlook PST locations"
+                CloudSyncFolders = @()
+                MissingCloudSyncFolders = @()
                 Error = $_.ToString()
             }
         }
@@ -4283,7 +4396,7 @@ if (-not $Results.iDriveBackup.Installed) {
     if ($Results.iDriveBackup.OutlookPstCoverage) {
         $pstCoverage = $Results.iDriveBackup.OutlookPstCoverage
         $pstClass = if ($pstCoverage.Status -match "^PASS$") { "success-text" } elseif ($pstCoverage.Status -match "WARNING|CHECK") { "warning-text" } else { "detail" }
-        $html += "<h3>Outlook PST Backup Coverage</h3>"
+        $html += "<h3>iDrive Backup Set Coverage</h3>"
         $html += @"
     <table>
         <tr><td><strong>Status</strong></td><td><span class='$pstClass'>$($pstCoverage.Status)</span></td></tr>
@@ -4314,6 +4427,16 @@ if (-not $Results.iDriveBackup.Installed) {
                 $html += "<li>$($cache.User): <code>$($cache.Path)</code> ($($cache.StreamAutocompleteFiles) Stream_Autocomplete files)</li>"
             }
             $html += "</ul>"
+        }
+        if ($pstCoverage.CloudSyncFolders -and $pstCoverage.CloudSyncFolders.Count -gt 0) {
+            $html += "<h4>Cloud sync folder backup coverage</h4><p class='warning-text'>Cloud services are sync, not guaranteed backup. Include locally stored OneDrive/Google Drive/Dropbox/Box/iCloud data in iDrive unless a separate cloud backup/retention policy is confirmed. Online-only placeholders may not contain actual file content for iDrive to back up.</p>"
+            $html += "<table><tr><th>User</th><th>Provider</th><th>Local state</th><th>Sample</th><th>Backed up?</th><th>Path</th><th>Recommendation</th></tr>"
+            foreach ($cloud in $pstCoverage.CloudSyncFolders) {
+                $matched = if ($cloud.BackupSetMatched) { "Yes" } else { "No / unverified" }
+                $sample = "$($cloud.LocalFilesInSample) local, $($cloud.PlaceholderFilesInSample) placeholder(s), $($cloud.LocalSizeSampleGB) GB sampled"
+                $html += "<tr><td>$($cloud.User)</td><td>$($cloud.Provider)</td><td>$($cloud.LocalState)</td><td>$sample</td><td>$matched</td><td><code>$($cloud.Path)</code></td><td>$($cloud.Recommendation)</td></tr>"
+            }
+            $html += "</table>"
         }
         if ($pstCoverage.RootDriveCandidateFolders -and $pstCoverage.RootDriveCandidateFolders.Count -gt 0) {
             $html += "<h4>Root drive candidate folders</h4><p class='warning-text'>Root-level candidate folders found; consider adding to iDrive backup set - when in doubt, include due to iDrive generous storage quotas.</p><ul>"
@@ -5152,10 +5275,10 @@ ${overallColor}OVERALL STATUS: $overallStatus ($warningCount warning(s), $errorC
                 $emailBody += "Account".PadRight(30) + "$($Results.iDriveBackup.Account)`n"
                 $emailBody += "Service".PadRight(30) + "$svcStatus`n"
             }
-            if ($Results.iDriveBackup.OutlookPstCoverage -and ($Results.iDriveBackup.OutlookPstCoverage.PstCount -gt 0 -or $Results.iDriveBackup.OutlookPstCoverage.MissingStandardUserFolders.Count -gt 0 -or $Results.iDriveBackup.OutlookPstCoverage.MissingOutlookRoamCache.Count -gt 0 -or $Results.iDriveBackup.OutlookPstCoverage.RootDriveCandidateFolders.Count -gt 0)) {
+            if ($Results.iDriveBackup.OutlookPstCoverage -and ($Results.iDriveBackup.OutlookPstCoverage.PstCount -gt 0 -or $Results.iDriveBackup.OutlookPstCoverage.MissingStandardUserFolders.Count -gt 0 -or $Results.iDriveBackup.OutlookPstCoverage.MissingOutlookRoamCache.Count -gt 0 -or $Results.iDriveBackup.OutlookPstCoverage.RootDriveCandidateFolders.Count -gt 0 -or $Results.iDriveBackup.OutlookPstCoverage.CloudSyncFolders.Count -gt 0)) {
                 $pstCoverage = $Results.iDriveBackup.OutlookPstCoverage
                 $pstStatus = if ($pstCoverage.Status -match "^PASS$") { "[G]$($pstCoverage.Status)[/G]" } else { "[W]$($pstCoverage.Status)[/W]" }
-                $emailBody += "`n[H]OUTLOOK PST BACKUP COVERAGE[/H] $pstStatus`n"
+                $emailBody += "`n[H]iDRIVE BACKUP SET COVERAGE[/H] $pstStatus`n"
                 $emailBody += "PST Files Found".PadRight(30) + "$($pstCoverage.PstCount)`n"
                 $emailBody += "Backup Set Coverage".PadRight(30) + "$($pstCoverage.BackupSetCoverage)`n"
                 $emailBody += "BackupSetMatched".PadRight(30) + "$($pstCoverage.BackupSetMatched)`n"
@@ -5172,6 +5295,16 @@ ${overallColor}OVERALL STATUS: $overallStatus ($warningCount warning(s), $errorC
                 }
                 if ($pstCoverage.RootDriveCandidateFolders.Count -gt 0) {
                     $emailBody += "Root Folder Candidates".PadRight(30) + "[W]$($pstCoverage.RootDriveCandidateFolders.Count) - review/add when in doubt[/W]`n"
+                }
+                if ($pstCoverage.CloudSyncFolders.Count -gt 0) {
+                    $missingCloudCount = @($pstCoverage.CloudSyncFolders | Where-Object { -not $_.BackupSetMatched -and $_.LocalFilesInSample -gt 0 }).Count
+                    $cloudSummary = "$($pstCoverage.CloudSyncFolders.Count) found"
+                    if ($missingCloudCount -gt 0) { $cloudSummary += "; $missingCloudCount with local files not in backup set" }
+                    $emailBody += "Cloud Sync Folders".PadRight(30) + "[W]$cloudSummary[/W]`n"
+                    foreach ($cloud in $pstCoverage.CloudSyncFolders) {
+                        $matched = if ($cloud.BackupSetMatched) { "included" } else { "not found / unverified" }
+                        $emailBody += "  $($cloud.Provider): $($cloud.Path) ($($cloud.LocalState), backed up: $matched)`n"
+                    }
                 }
             }
             $emailBody += "`n"
