@@ -71,7 +71,7 @@ param(
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-$ScriptVersion = "2.9.4"
+$ScriptVersion = "2.9.8"
 
 # GitHub raw URL for the latest version of this script
 # To use: create a private GitHub repo, push the script, and set this URL
@@ -420,6 +420,7 @@ $Results = [ordered]@{
     WindowsUpdates   = @{}
     iDriveBackup     = @{}
     Malwarebytes     = @{}
+    AntivirusInventory = @{}
     Defender         = @{}
     EventLogErrors   = @{}
     PendingReboot    = @{}
@@ -435,6 +436,7 @@ $Results = [ordered]@{
     AdwCleaner       = @{}
     RestorePoints    = @{}
     TelemetryServices = @{}
+    Warnings          = @()
     Errors           = @()
     EmailResult      = @{}
     WebhookResult    = @{}
@@ -449,6 +451,362 @@ function Write-Log {
     $entry = "[$Level] $(Get-Date -Format 'HH:mm:ss') - $Message"
     Write-Host $entry
     Add-Content -Path $LogFile -Value $entry
+}
+
+function Normalize-BackupPath {
+    param([string]$Path)
+    if (-not $Path) { return "" }
+    $p = [Environment]::ExpandEnvironmentVariables($Path).Trim().Trim('"')
+    $p = $p -replace '/', '\'
+    $p = $p.TrimEnd('\')
+    return $p.ToLowerInvariant()
+}
+
+function Test-PathCoveredByBackupSet {
+    param(
+        [string]$FilePath,
+        [string[]]$IncludePaths,
+        [string[]]$ExcludePaths
+    )
+
+    $normalFile = Normalize-BackupPath $FilePath
+    if (-not $normalFile) { return $false }
+
+    foreach ($exclude in @($ExcludePaths)) {
+        $normalExclude = Normalize-BackupPath $exclude
+        if ($normalExclude) {
+            if ($normalExclude.Contains('*')) {
+                if ($normalFile -like ($normalExclude + '*')) { return $false }
+            } elseif ($normalFile -eq $normalExclude -or $normalFile.StartsWith($normalExclude + '\')) {
+                return $false
+            }
+        }
+    }
+
+    foreach ($include in @($IncludePaths)) {
+        $normalInclude = Normalize-BackupPath $include
+        if ($normalInclude) {
+            if ($normalInclude.Contains('*')) {
+                if ($normalFile -like ($normalInclude + '*')) { return $true }
+            } elseif ($normalFile -eq $normalInclude -or $normalFile.StartsWith($normalInclude + '\')) {
+                return $true
+            }
+        }
+    }
+
+    return $false
+}
+
+function Get-CloudSyncFolderInventory {
+    param(
+        [object[]]$UserRoots,
+        [string[]]$IncludePaths,
+        [string[]]$ExcludePaths,
+        [int]$SampleLimit = 750
+    )
+
+    $cloudFolders = @()
+    $cloudFolderNamePattern = '(?i)^(OneDrive($|\s|-)|Dropbox$|Google Drive$|My Drive$|Shared drives$|Box$|iCloudDrive$|iCloud Drive$|iCloud Photos$)'
+
+    foreach ($userRoot in @($UserRoots)) {
+        if (-not $userRoot -or -not (Test-Path -LiteralPath $userRoot.FullName)) { continue }
+
+        Get-ChildItem -LiteralPath $userRoot.FullName -Directory -ErrorAction SilentlyContinue | Where-Object {
+            $_.Name -match $cloudFolderNamePattern
+        } | ForEach-Object {
+            $folder = $_
+            $provider = switch -Regex ($folder.Name) {
+                '(?i)^OneDrive' { 'OneDrive'; break }
+                '(?i)^Dropbox$' { 'Dropbox'; break }
+                '(?i)^(Google Drive|My Drive|Shared drives)$' { 'Google Drive'; break }
+                '(?i)^Box$' { 'Box'; break }
+                '(?i)^iCloud' { 'iCloud Drive'; break }
+                default { 'Cloud sync' }
+            }
+
+            $sampleFiles = @()
+            try {
+                $sampleFiles = @(Get-ChildItem -LiteralPath $folder.FullName -File -Recurse -Force -ErrorAction SilentlyContinue | Select-Object -First $SampleLimit)
+            } catch {
+                $sampleFiles = @()
+            }
+
+            $localFiles = @()
+            $placeholderFiles = @()
+            foreach ($file in $sampleFiles) {
+                $attrText = $file.Attributes.ToString()
+                $isPlaceholder = ($attrText -match 'Offline') -or (($attrText -match 'ReparsePoint') -and $file.Length -eq 0)
+                if ($isPlaceholder) {
+                    $placeholderFiles += $file
+                } else {
+                    $localFiles += $file
+                }
+            }
+
+            $localSizeBytes = 0
+            foreach ($file in $localFiles) { $localSizeBytes += [int64]$file.Length }
+            $matched = Test-PathCoveredByBackupSet -FilePath $folder.FullName -IncludePaths $IncludePaths -ExcludePaths $ExcludePaths
+            $localState = if ($sampleFiles.Count -eq 0) {
+                'No files found in sample / empty folder'
+            } elseif ($localFiles.Count -gt 0 -and $placeholderFiles.Count -gt 0) {
+                'Mixed local and online-only placeholders'
+            } elseif ($localFiles.Count -gt 0) {
+                'Local file contents present'
+            } elseif ($placeholderFiles.Count -gt 0) {
+                'Appears online-only / placeholder-based'
+            } else {
+                'Unable to determine'
+            }
+
+            $recommendation = if ($localFiles.Count -gt 0 -and -not $matched) {
+                'Add this locally stored cloud-sync folder to the iDrive backup set, unless a separate cloud backup/retention policy is confirmed'
+            } elseif ($placeholderFiles.Count -gt 0 -and -not $matched) {
+                'Online-only placeholders detected; iDrive may not back up actual contents unless files are hydrated locally. Confirm separate cloud backup/retention or mirror/include required data'
+            } elseif ($matched) {
+                'Cloud-sync folder appears included in iDrive backup set; confirm cloud-only placeholders are not being mistaken for backed-up content'
+            } else {
+                'Review cloud-sync folder backup requirements'
+            }
+
+            $cloudFolders += [pscustomobject]@{
+                User = $userRoot.Name
+                Provider = $provider
+                Name = $folder.Name
+                Path = $folder.FullName
+                BackupSetMatched = $matched
+                LocalState = $localState
+                SampleFilesChecked = $sampleFiles.Count
+                LocalFilesInSample = $localFiles.Count
+                PlaceholderFilesInSample = $placeholderFiles.Count
+                LocalSizeSampleGB = [math]::Round($localSizeBytes / 1GB, 2)
+                Recommendation = $recommendation
+            }
+        }
+    }
+
+    return @($cloudFolders)
+}
+
+function Get-OutlookPstBackupCoverage {
+    param([string]$IDriveDataRoot)
+
+    # Explicit PST discovery locations:
+    #   Documents\*.pst
+    #   OneDrive\Documents\*.pst
+    #   AppData\Local\Microsoft\Outlook\*.pst
+    $pstFiles = @()
+    $standardUserFolders = @('Desktop', 'Documents', 'Downloads', 'Pictures', 'Music', 'Videos')
+    $standardFolderCoverage = @()
+    $missingStandardFolders = @()
+    $roamCacheCoverage = @()
+    $missingRoamCache = @()
+    $rootDriveCandidateFolders = @()
+    $cloudSyncFolders = @()
+    $missingCloudSyncFolders = @()
+    $userRoots = @(Get-ChildItem -LiteralPath "C:\Users" -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notin @('All Users', 'Default', 'Default User', 'Public') })
+
+    foreach ($userRoot in $userRoots) {
+        $candidatePatterns = @(
+            @{ Path = Join-Path $userRoot.FullName 'Documents'; Source = 'Documents' },
+            @{ Path = Join-Path $userRoot.FullName 'OneDrive\Documents'; Source = 'OneDrive Documents' },
+            @{ Path = Join-Path $userRoot.FullName 'AppData\Local\Microsoft\Outlook'; Source = 'AppData Local Outlook' }
+        )
+
+        foreach ($candidate in $candidatePatterns) {
+            if (Test-Path -LiteralPath $candidate.Path) {
+                Get-ChildItem -LiteralPath $candidate.Path -Filter '*.pst' -File -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+                    $isOneDrive = $_.FullName -match '\\OneDrive\\Documents\\'
+                    $pstFiles += [pscustomobject]@{
+                        User             = $userRoot.Name
+                        Path             = $_.FullName
+                        Location         = $candidate.Source
+                        SizeGB           = [math]::Round($_.Length / 1GB, 2)
+                        LastWriteTime    = $_.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')
+                        IsOneDriveHosted = $isOneDrive
+                        BackupSetMatched = $false
+                    }
+                }
+            }
+        }
+    }
+
+    $includePaths = @()
+    $excludePaths = @()
+    $backupSetVerified = $false
+    $configFilesChecked = 0
+
+    if ($IDriveDataRoot -and (Test-Path -LiteralPath $IDriveDataRoot)) {
+        $configFiles = Get-ChildItem -LiteralPath $IDriveDataRoot -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -match '^\.(txt|xml|json|ini|cfg|conf|lst)$' -or $_.Name -match 'backup|bkpset|include|exclude|filelist' } |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 250
+
+        foreach ($cfg in $configFiles) {
+            $configFilesChecked++
+            try {
+                $content = Get-Content -LiteralPath $cfg.FullName -Raw -ErrorAction Stop
+                if ($content -match 'C:\\Users\\|%USERPROFILE%|Documents|Outlook|\.pst|AppData|OneDrive|Dropbox|Google Drive|My Drive|Box|iCloud') {
+                    $backupSetVerified = $true
+                    $pathMatches = [regex]::Matches($content, '([A-Za-z]:\\[^<>:"|?\r\n]+|%USERPROFILE%\\[^<>:"|?\r\n]+)')
+                    foreach ($m in $pathMatches) {
+                        $pathText = $m.Value.Trim().Trim('"').Trim()
+                        if (-not $pathText) { continue }
+                        if ($pathText -match '(?i)exclude|skip') {
+                            $excludePaths += $pathText
+                        } else {
+                            $includePaths += $pathText
+                        }
+                    }
+                    if ($content -match '(?i)AppData\\') { $excludePaths += 'C:\Users\*\AppData' }
+                }
+            } catch {}
+        }
+    }
+
+    foreach ($userRoot in $userRoots) {
+        foreach ($folderName in $standardUserFolders) {
+            $folderPath = Join-Path $userRoot.FullName $folderName
+            if (Test-Path -LiteralPath $folderPath) {
+                $matched = Test-PathCoveredByBackupSet -FilePath $folderPath -IncludePaths $includePaths -ExcludePaths $excludePaths
+                $entry = [pscustomobject]@{
+                    User = $userRoot.Name
+                    Folder = $folderName
+                    Path = $folderPath
+                    BackupSetMatched = $matched
+                }
+                $standardFolderCoverage += $entry
+                if (-not $matched) { $missingStandardFolders += $entry }
+            }
+        }
+
+        # For all Outlook users, check RoamCache because Stream_Autocomplete files may be the only contact history.
+        $outlookRoot = Join-Path $userRoot.FullName 'AppData\Local\Microsoft\Outlook'
+        $roamCachePath = Join-Path $outlookRoot 'RoamCache'
+        $hasOutlookData = (Test-Path -LiteralPath $outlookRoot) -or (($pstFiles | Where-Object { $_.User -eq $userRoot.Name }).Count -gt 0)
+        if ($hasOutlookData -and (Test-Path -LiteralPath $roamCachePath)) {
+            $autocompleteFiles = @(Get-ChildItem -LiteralPath $roamCachePath -Filter 'Stream_Autocomplete*' -File -ErrorAction SilentlyContinue)
+            $matched = Test-PathCoveredByBackupSet -FilePath $roamCachePath -IncludePaths $includePaths -ExcludePaths $excludePaths
+            $entry = [pscustomobject]@{
+                User = $userRoot.Name
+                Path = $roamCachePath
+                StreamAutocompleteFiles = $autocompleteFiles.Count
+                BackupSetMatched = $matched
+            }
+            $roamCacheCoverage += $entry
+            if (-not $matched) { $missingRoamCache += $entry }
+        }
+    }
+
+    $knownRootFolderExclusions = @('Windows', 'Program Files', 'Program Files (x86)', 'ProgramData', 'Users', 'PerfLogs', '$Recycle.Bin', 'Recovery', 'System Volume Information', 'Teamviewer')
+    $rootCandidateNamePattern = '(?i)backup|old|previous|prev|data|files|documents|docs|photos|pictures|work|client|archive|accounts|MYOB|Xero|Desktop|Previous PC backup'
+    foreach ($driveRoot in @('C:\', 'D:\')) {
+        if (Test-Path -LiteralPath $driveRoot) {
+            Get-ChildItem -LiteralPath $driveRoot -Directory -ErrorAction SilentlyContinue | Where-Object {
+                $_.Name -notin $knownRootFolderExclusions -and $_.Name -match $rootCandidateNamePattern
+            } | ForEach-Object {
+                $matched = Test-PathCoveredByBackupSet -FilePath $_.FullName -IncludePaths $includePaths -ExcludePaths $excludePaths
+                $rootDriveCandidateFolders += [pscustomobject]@{
+                    Drive = $driveRoot
+                    Path = $_.FullName
+                    BackupSetMatched = $matched
+                    Recommendation = 'Root-level candidate folders found; consider adding to iDrive backup set - when in doubt, include due to iDrive generous storage quotas'
+                }
+            }
+        }
+    }
+
+    $cloudSyncFolders = Get-CloudSyncFolderInventory -UserRoots $userRoots -IncludePaths $includePaths -ExcludePaths $excludePaths
+    $missingCloudSyncFolders = @($cloudSyncFolders | Where-Object { -not $_.BackupSetMatched -and $_.LocalFilesInSample -gt 0 })
+
+    $coveredCount = 0
+    $uncovered = @()
+    $onedriveHosted = @()
+    foreach ($pst in $pstFiles) {
+        $matched = Test-PathCoveredByBackupSet -FilePath $pst.Path -IncludePaths $includePaths -ExcludePaths $excludePaths
+        $pst.BackupSetMatched = $matched
+        if ($matched) { $coveredCount++ } else { $uncovered += $pst }
+        if ($pst.IsOneDriveHosted) { $onedriveHosted += $pst }
+    }
+
+    $status = 'PASS'
+    $coverage = 'No Outlook PST files found'
+    $recommendedAction = 'No action required'
+
+    if ($pstFiles.Count -gt 0) {
+        if ($onedriveHosted.Count -gt 0) {
+            $status = 'WARNING - OneDrive-hosted PST files are unreliable'
+            $coverage = 'OneDrive-hosted PST files are unreliable even if the folder appears protected'
+            $recommendedAction = 'Move PST out of OneDrive and ensure iDrive backs it up'
+        } elseif (-not $backupSetVerified) {
+            $status = 'CHECK REQUIRED'
+            $coverage = 'Unable to verify iDrive backup-set coverage for Outlook PST files'
+            $recommendedAction = 'Confirm iDrive includes the PST file location(s), especially AppData Local Outlook and Documents'
+        } elseif ($uncovered.Count -gt 0) {
+            $status = 'WARNING - PST files found but no matching iDrive backup-set path found'
+            $coverage = 'PST files found but no matching iDrive backup-set path found'
+            $recommendedAction = 'Add the PST folder(s) to the iDrive backup set or move PST files to an included local Documents folder'
+        } else {
+            $status = 'PASS'
+            $coverage = 'PST files found and backup set appears to include their folder'
+            $recommendedAction = 'No action required'
+        }
+    }
+
+    $coverageNotes = @()
+    if ($missingStandardFolders.Count -gt 0) {
+        $coverageNotes += 'Standard user folders missing from iDrive backup set'
+        if ($status -eq 'PASS') { $status = 'WARNING - Standard user folders missing from iDrive backup set' }
+        if ($recommendedAction -eq 'No action required') { $recommendedAction = 'Add missing standard user folders to the iDrive backup set' }
+    }
+    if ($missingRoamCache.Count -gt 0) {
+        $coverageNotes += 'Outlook RoamCache missing from iDrive backup set'
+        if ($status -eq 'PASS') { $status = 'WARNING - Outlook RoamCache missing from iDrive backup set' }
+        if ($recommendedAction -eq 'No action required') { $recommendedAction = 'Add Outlook RoamCache to iDrive backup set so Stream_Autocomplete contact history is protected' }
+    }
+    $unmatchedRootCandidates = @($rootDriveCandidateFolders | Where-Object { -not $_.BackupSetMatched })
+    if ($unmatchedRootCandidates.Count -gt 0) {
+        $coverageNotes += 'Root-level candidate folders found; consider adding to iDrive backup set'
+        if ($status -eq 'PASS') { $status = 'WARNING - Root-level candidate folders found; consider adding to iDrive backup set' }
+        if ($recommendedAction -eq 'No action required') { $recommendedAction = 'Review root C: or D: folders and, when in doubt, include due to iDrive generous storage quotas' }
+    }
+    if ($missingCloudSyncFolders.Count -gt 0) {
+        $coverageNotes += 'Cloud-sync folders with local files missing from iDrive backup set'
+        if ($status -eq 'PASS') { $status = 'WARNING - Cloud-sync folders with local files missing from iDrive backup set' }
+        if ($recommendedAction -eq 'No action required') { $recommendedAction = 'Add locally stored OneDrive/Google Drive/Dropbox/Box/iCloud folders to iDrive backup set, unless separate cloud backup/retention is confirmed' }
+    } elseif ($cloudSyncFolders.Count -gt 0 -and -not $backupSetVerified) {
+        $coverageNotes += 'Cloud-sync folders found; iDrive backup-set coverage could not be verified'
+        if ($status -eq 'PASS') { $status = 'CHECK REQUIRED - Cloud-sync folder backup coverage unverified' }
+        if ($recommendedAction -eq 'No action required') { $recommendedAction = 'Confirm whether cloud-sync folders are included in iDrive or separately backed up' }
+    }
+    if (($cloudSyncFolders | Where-Object { $_.PlaceholderFilesInSample -gt 0 }).Count -gt 0) {
+        $coverageNotes += 'Cloud-sync placeholders detected; iDrive may only see stubs for online-only files'
+    }
+    if ($coverageNotes.Count -gt 0) {
+        $allCoverageNotes = @($coverage)
+        $allCoverageNotes += $coverageNotes
+        $coverage = ($allCoverageNotes | Where-Object { $_ }) -join '; '
+    }
+
+    return @{
+        Status              = $status
+        OutlookPstFiles     = @($pstFiles)
+        PstCount            = @($pstFiles).Count
+        OneDrivePstCount    = @($onedriveHosted).Count
+        BackupSetCoverage   = $coverage
+        BackupSetMatched    = $coveredCount
+        BackupSetVerified   = $backupSetVerified
+        ConfigFilesChecked  = $configFilesChecked
+        IncludePathsFound   = @($includePaths | Select-Object -Unique | Select-Object -First 25)
+        ExcludePathsFound   = @($excludePaths | Select-Object -Unique | Select-Object -First 25)
+        RecommendedAction   = $recommendedAction
+        StandardUserFoldersCoverage = @($standardFolderCoverage)
+        MissingStandardUserFolders = @($missingStandardFolders)
+        OutlookRoamCacheCoverage = @($roamCacheCoverage)
+        MissingOutlookRoamCache = @($missingRoamCache)
+        RootDriveCandidateFolders = @($rootDriveCandidateFolders)
+        CloudSyncFolders = @($cloudSyncFolders)
+        MissingCloudSyncFolders = @($missingCloudSyncFolders)
+    }
 }
 
 Write-Log "============================================"
@@ -1001,6 +1359,17 @@ try {
     $backupComputerName = "N/A"
     $backupAccount = "N/A"
     $filesInSync = "N/A"
+    $outlookPstCoverage = @{
+        Status = "NOT CHECKED"
+        OutlookPstFiles = @()
+        PstCount = 0
+        BackupSetCoverage = "iDrive not installed; Outlook PST backup-set coverage not checked"
+        BackupSetMatched = 0
+        BackupSetVerified = $false
+        RecommendedAction = "Install/configure backup if Outlook PST files are used"
+        CloudSyncFolders = @()
+        MissingCloudSyncFolders = @()
+    }
 
     # Check if iDrive service is running
     $idriveService = Get-Service -Name "IDrive*" -ErrorAction SilentlyContinue
@@ -1167,6 +1536,30 @@ try {
             }
         }
 
+        # Audit whether Outlook PST files are present and covered by the iDrive backup set.
+        # This is intentionally separate from latest-backup log success: a successful iDrive run can still miss PSTs
+        # if AppData is excluded or if Documents was redirected into OneDrive during Microsoft account setup.
+        try {
+            $outlookPstCoverage = Get-OutlookPstBackupCoverage -IDriveDataRoot $idriveDataRoot
+            if ($outlookPstCoverage.Status -notmatch "^PASS$|No Outlook PST") {
+                $Results.Warnings += "iDrive backup coverage: $($outlookPstCoverage.BackupSetCoverage)"
+            }
+        } catch {
+            Write-Log "Outlook PST backup coverage audit failed: $_" "WARN"
+            $outlookPstCoverage = @{
+                Status = "CHECK REQUIRED"
+                OutlookPstFiles = @()
+                PstCount = 0
+                BackupSetCoverage = "Unable to verify iDrive backup-set coverage for Outlook PST files"
+                BackupSetMatched = 0
+                BackupSetVerified = $false
+                RecommendedAction = "Manually confirm iDrive includes any Outlook PST locations"
+                CloudSyncFolders = @()
+                MissingCloudSyncFolders = @()
+                Error = $_.ToString()
+            }
+        }
+
         $Results.iDriveBackup = @{
             Status           = $idriveStatus
             Installed        = $true
@@ -1179,6 +1572,7 @@ try {
             Duration         = $backupDuration
             ComputerName     = $backupComputerName
             Account          = $backupAccount
+            OutlookPstCoverage = $outlookPstCoverage
         }
 
         Write-Log "iDrive: $idriveStatus | Last backup: $lastBackupDate | Result: $lastBackupInfo | Files: $backupFilesCount"
@@ -1187,6 +1581,7 @@ try {
         $Results.iDriveBackup = @{
             Status    = "NOT INSTALLED"
             Installed = $false
+            OutlookPstCoverage = $outlookPstCoverage
         }
         Write-Log "iDrive client not found on this system"
     }
@@ -1239,10 +1634,14 @@ try {
     if ($mbServices) { $mbInstalled = $true }
 
     if ($mbInstalled) {
-        # Determine product type (Premium/Free/Endpoint)
+        # Determine product type (Endpoint/Premium/Free/Other) and the business follow-up.
+        # This deliberately distinguishes PCMC-managed Endpoint Protection from older
+        # consumer Malwarebytes products so renewal/upgrade opportunities are visible.
         $mbEndpointSvc = Get-Service -Name "MBEndpointAgent" -ErrorAction SilentlyContinue
+        $mbRecommendedAction = "Review Malwarebytes status"
         if ($mbEndpointSvc) {
             $mbProductType = "Endpoint Protection"
+            $mbRecommendedAction = "OK - PCMC-managed Malwarebytes Endpoint Protection detected"
         } else {
             # Check registry for license type
             $mbRegPaths = @(
@@ -1254,13 +1653,19 @@ try {
                     $mbReg = Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue
                     if ($mbReg) {
                         if ($mbReg.premium -eq 1 -or $mbReg.IsPremium -eq 1) {
-                            $mbProductType = "Premium"
+                            $mbProductType = "Premium - upgrade opportunity"
+                            $mbRecommendedAction = "Offer upgrade to PCMC-managed Malwarebytes Endpoint Protection before next subscription renewal"
                         } else {
-                            $mbProductType = "Free"
+                            $mbProductType = "Free - upgrade recommended"
+                            $mbRecommendedAction = "Upgrade recommended: free Malwarebytes is not managed endpoint protection"
                         }
                         break
                     }
                 }
+            }
+            if ($mbProductType -eq "N/A") {
+                $mbProductType = "Consumer/Other - review before renewal"
+                $mbRecommendedAction = "Review license type and offer PCMC-managed Malwarebytes Endpoint Protection if appropriate"
             }
         }
 
@@ -1319,6 +1724,7 @@ try {
             RealTimeProtection  = $mbRealTimeProtection
             LastScan            = $mbLastScan
             DefinitionsAge      = $mbDefinitionsAge
+            RecommendedAction   = $mbRecommendedAction
         }
 
         Write-Log "Malwarebytes: $mbProductType v$mbVersion | Service: $(if($mbServiceRunning){'Running'}else{'Stopped'}) | RT: $mbRealTimeProtection"
@@ -1326,6 +1732,8 @@ try {
         $Results.Malwarebytes = @{
             Installed = $false
             Status    = "NOT INSTALLED"
+            ProductType = "Not installed"
+            RecommendedAction = "Opportunity: offer PCMC-managed Malwarebytes Endpoint Protection"
         }
         Write-Log "Malwarebytes not found on this system"
     }
@@ -1334,6 +1742,198 @@ try {
     Write-Log "Malwarebytes check failed: $_" "ERROR"
     $Results.Malwarebytes = @{ Status = "ERROR"; Error = $_.ToString() }
     $Results.Errors += "Malwarebytes: $_"
+}
+
+
+# ============================================================================
+# MODULE 5B: ANTIVIRUS INVENTORY / ENDPOINT PROTECTION SUMMARY
+# ============================================================================
+Write-Log "Checking antivirus inventory / endpoint protection summary..."
+
+function Convert-AVProductState {
+    param([int]$ProductState)
+
+    $hexState = "0x{0:X6}" -f $ProductState
+    $rtNibble = (($ProductState -shr 12) -band 0xF)
+    $sigNibble = (($ProductState -shr 4) -band 0xF)
+
+    # Windows SecurityCenter2 productState is not perfectly documented across vendors,
+    # so keep the raw hex state and use conservative labels.
+    $rtState = switch ($rtNibble) {
+        1 { "Enabled" }
+        6 { "Enabled" }
+        0 { "Disabled" }
+        default { "Unknown" }
+    }
+    $sigState = switch ($sigNibble) {
+        0 { "Up to date" }
+        1 { "Out of date" }
+        default { "Unknown" }
+    }
+
+    return @{ RawState = $hexState; RealTimeProtection = $rtState; SignatureStatus = $sigState }
+}
+
+$UnwantedSecuritySoftwarePatterns = @(
+    @{ Pattern = "McAfee Security Scan Plus"; Reason = "Security scanware / unwanted AV-adjacent software commonly bundled with Adobe updates" },
+    @{ Pattern = "Norton Security Scan"; Reason = "Security scanware / unwanted AV-adjacent software" },
+    @{ Pattern = "Norton Security Scan Plus"; Reason = "Security scanware / unwanted AV-adjacent software" },
+    @{ Pattern = "Kaspersky Security Scan"; Reason = "Security scanware / unwanted AV-adjacent software" },
+    @{ Pattern = "Avast Secure Browser"; Reason = "Bundled security-adjacent browser; review/remove if not intentionally used" },
+    @{ Pattern = "AVG Secure Browser"; Reason = "Bundled security-adjacent browser; review/remove if not intentionally used" }
+)
+
+function Get-UnwantedSecuritySoftware {
+    $uninstallRoots = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKU:\*\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    )
+
+    $matches = @()
+    foreach ($root in $uninstallRoots) {
+        try {
+            $apps = @(Get-ItemProperty -Path $root -ErrorAction SilentlyContinue)
+            foreach ($app in $apps) {
+                $displayName = [string]$app.DisplayName
+                if ([string]::IsNullOrWhiteSpace($displayName)) { continue }
+                foreach ($rule in $UnwantedSecuritySoftwarePatterns) {
+                    if ($displayName -like "*$($rule.Pattern)*") {
+                        $matches += [ordered]@{
+                            Name = $displayName
+                            Version = [string]$app.DisplayVersion
+                            Publisher = [string]$app.Publisher
+                            Reason = $rule.Reason
+                            RegistryKey = [string]$app.PSPath
+                        }
+                        break
+                    }
+                }
+            }
+        } catch {}
+    }
+
+    return @($matches | Sort-Object Name, Version -Unique)
+}
+
+try {
+    $avProducts = @()
+    try {
+        $avProducts = @(Get-CimInstance -Namespace "root\SecurityCenter2" -ClassName "AntiVirusProduct" -ErrorAction Stop)
+    } catch {
+        Write-Log "SecurityCenter2 antivirus inventory unavailable: $_" "WARN"
+    }
+
+    $productRows = @()
+    foreach ($av in $avProducts) {
+        $decoded = Convert-AVProductState -ProductState ([int]$av.productState)
+        $name = [string]$av.displayName
+        $vendorType = if ($name -match "Malwarebytes") {
+            if ($Results.Malwarebytes.ProductType -eq "Endpoint Protection") { "PCMC Malwarebytes Endpoint" } else { "Malwarebytes consumer/other" }
+        } elseif ($name -match "Windows Defender|Microsoft Defender") {
+            "Microsoft Defender"
+        } else {
+            "Third-party antivirus"
+        }
+        $productRows += [ordered]@{
+            Name = $name
+            VendorType = $vendorType
+            RealTimeProtection = $decoded.RealTimeProtection
+            SignatureStatus = $decoded.SignatureStatus
+            ProductState = $decoded.RawState
+            Path = $av.pathToSignedProductExe
+        }
+    }
+
+    # Cross-check Microsoft Defender directly. Some third-party SecurityCenter2
+    # productState values are vendor-specific; Defender's own cmdlet is more reliable.
+    try {
+        $mpInventoryStatus = Get-MpComputerStatus -ErrorAction Stop
+        if ($mpInventoryStatus -and $mpInventoryStatus.RealTimeProtectionEnabled) {
+            foreach ($row in @($productRows | Where-Object { $_.VendorType -eq "Microsoft Defender" })) {
+                $row.RealTimeProtection = "Enabled"
+            }
+            if (($productRows | Where-Object { $_.VendorType -eq "Microsoft Defender" }).Count -eq 0) {
+                $productRows += [ordered]@{
+                    Name = "Microsoft Defender Antivirus"
+                    VendorType = "Microsoft Defender"
+                    RealTimeProtection = "Enabled"
+                    SignatureStatus = "See Defender section"
+                    ProductState = "Get-MpComputerStatus"
+                    Path = ""
+                }
+            }
+        }
+    } catch {}
+
+    $activeProducts = @($productRows | Where-Object { $_.RealTimeProtection -eq "Enabled" })
+    $activeNames = @($activeProducts | ForEach-Object { $_.Name })
+    $thirdPartyActive = @($activeProducts | Where-Object { $_.VendorType -eq "Third-party antivirus" })
+    $defenderActive = @($activeProducts | Where-Object { $_.VendorType -eq "Microsoft Defender" })
+    $mbEndpointActive = @($activeProducts | Where-Object { $_.VendorType -eq "PCMC Malwarebytes Endpoint" })
+    $unwantedSecuritySoftware = @(Get-UnwantedSecuritySoftware)
+
+    $protectionSummary = "Unknown"
+    $inventoryStatus = "INFO"
+    $recommendedAction = "Review antivirus inventory"
+
+    if ($mbEndpointActive.Count -gt 0 -or ($Results.Malwarebytes.ProductType -eq "Endpoint Protection" -and $Results.Malwarebytes.ServiceRunning)) {
+        $protectionSummary = "Protected by PCMC-managed Malwarebytes Endpoint Protection"
+        $inventoryStatus = "PASS"
+        $recommendedAction = "No Malwarebytes upgrade needed"
+    } elseif ($activeProducts.Count -eq 0 -and $productRows.Count -eq 0) {
+        $protectionSummary = "WARNING - No active antivirus detected"
+        $inventoryStatus = "WARNING"
+        $recommendedAction = "Urgent review: no antivirus product registered with Windows Security Center"
+    } elseif ($activeProducts.Count -eq 0) {
+        $protectionSummary = "WARNING - No active antivirus detected"
+        $inventoryStatus = "WARNING"
+        $recommendedAction = "Urgent review: antivirus products are present but none appear active"
+    } elseif ($activeProducts.Count -gt 1) {
+        $protectionSummary = "Multiple active antivirus products detected: $($activeNames -join ', ')"
+        $inventoryStatus = "WARNING"
+        $recommendedAction = "Review for conflicting antivirus products"
+    } elseif ($thirdPartyActive.Count -gt 0) {
+        $protectionSummary = "Protected by third-party antivirus: $($thirdPartyActive[0].Name)"
+        $inventoryStatus = "INFO"
+        $recommendedAction = "Review whether to replace with PCMC-managed Malwarebytes Endpoint Protection"
+    } elseif ($defenderActive.Count -gt 0) {
+        $protectionSummary = "Protected by Microsoft Defender only"
+        $inventoryStatus = "INFO"
+        $recommendedAction = "Consider offering PCMC-managed Malwarebytes Endpoint Protection"
+    } else {
+        $protectionSummary = "Antivirus protection present but state could not be confidently classified"
+        $inventoryStatus = "INFO"
+        $recommendedAction = "Manual review recommended"
+    }
+
+    if ($Results.Malwarebytes.Installed -and $Results.Malwarebytes.ProductType -match "Premium|Free|Consumer/Other") {
+        $recommendedAction = $Results.Malwarebytes.RecommendedAction
+    }
+
+    if ($unwantedSecuritySoftware.Count -gt 0) {
+        if ($inventoryStatus -eq "PASS" -or $inventoryStatus -eq "INFO") { $inventoryStatus = "WARNING" }
+        $unwantedNames = ($unwantedSecuritySoftware | ForEach-Object { $_.Name }) -join ", "
+        $recommendedAction = "$recommendedAction; Remove useless security scanware such as McAfee Security Scan Plus when found"
+        Write-Log "Unwanted security software detected: $unwantedNames" "WARN"
+    }
+
+    $Results.AntivirusInventory = @{
+        Status = $inventoryStatus
+        ProtectionSummary = $protectionSummary
+        SecurityCenter2Products = $productRows
+        ActiveProducts = $activeNames
+        UnwantedSecuritySoftware = $unwantedSecuritySoftware
+        RecommendedAction = $recommendedAction
+        MalwarebytesProduct = $Results.Malwarebytes.ProductType
+        MalwarebytesRecommendedAction = $Results.Malwarebytes.RecommendedAction
+    }
+
+    Write-Log "Antivirus Inventory: $protectionSummary | Action: $recommendedAction"
+} catch {
+    Write-Log "Antivirus inventory check failed: $_" "ERROR"
+    $Results.AntivirusInventory = @{ Status = "ERROR"; Error = $_.ToString(); SecurityCenter2Products = @(); RecommendedAction = "Manual review required" }
+    $Results.Errors += "Antivirus Inventory: $_"
 }
 
 
@@ -3470,7 +4070,7 @@ $overallStatus = "PASS"
 $warningCount = 0
 $errorCount = 0
 
-$checkModules = @($Results.SFC, $Results.DiskHealth, $Results.WindowsUpdates, $Results.iDriveBackup, $Results.Malwarebytes, $Results.Defender, $Results.EventLogErrors, $Results.PendingReboot, $Results.Firewall, $Results.UserAccounts, $Results.DISM, $Results.TempFiles, $Results.StartupPrograms, $Results.ScheduledTasks, $Results.BrowserExtensions, $Results.ServiceStatus, $Results.NetworkConfig, $Results.AdwCleaner, $Results.RestorePoints, $Results.TelemetryServices)
+$checkModules = @($Results.SFC, $Results.DiskHealth, $Results.WindowsUpdates, $Results.iDriveBackup, $Results.Malwarebytes, $Results.AntivirusInventory, $Results.Defender, $Results.EventLogErrors, $Results.PendingReboot, $Results.Firewall, $Results.UserAccounts, $Results.DISM, $Results.TempFiles, $Results.StartupPrograms, $Results.ScheduledTasks, $Results.BrowserExtensions, $Results.ServiceStatus, $Results.NetworkConfig, $Results.AdwCleaner, $Results.RestorePoints, $Results.TelemetryServices)
 foreach ($module in $checkModules) {
     if ($module.Status -match "ERROR|FAIL") { $errorCount++; $overallStatus = "FAIL" }
     elseif ($module.Status -match "WARNING") { $warningCount++ }
@@ -3568,6 +4168,7 @@ $summaryItems = @(
     @("updates",      "Windows Updates",             $Results.WindowsUpdates.Status),
     @("idrive",       "iDrive Backup",               $Results.iDriveBackup.Status),
     @("malwarebytes", "Malwarebytes",                $Results.Malwarebytes.Status),
+    @("avinventory",  "Antivirus Inventory",          $Results.AntivirusInventory.Status),
     @("defender",     "Windows Defender",             $Results.Defender.Status),
     @("eventlog",     "Event Log Errors",             $Results.EventLogErrors.Status),
     @("reboot",       "Pending Reboot",               $Results.PendingReboot.Status),
@@ -3793,6 +4394,61 @@ if (-not $Results.iDriveBackup.Installed) {
         <tr><td><strong>Account</strong></td><td>$($Results.iDriveBackup.Account)</td></tr>
     </table>
 "@
+
+    if ($Results.iDriveBackup.OutlookPstCoverage) {
+        $pstCoverage = $Results.iDriveBackup.OutlookPstCoverage
+        $pstClass = if ($pstCoverage.Status -match "^PASS$") { "success-text" } elseif ($pstCoverage.Status -match "WARNING|CHECK") { "warning-text" } else { "detail" }
+        $html += "<h3>iDrive Backup Set Coverage</h3>"
+        $html += @"
+    <table>
+        <tr><td><strong>Status</strong></td><td><span class='$pstClass'>$($pstCoverage.Status)</span></td></tr>
+        <tr><td><strong>PST Files Found</strong></td><td>$($pstCoverage.PstCount)</td></tr>
+        <tr><td><strong>Backup Set Coverage</strong></td><td>$($pstCoverage.BackupSetCoverage)</td></tr>
+        <tr><td><strong>BackupSetMatched</strong></td><td>$($pstCoverage.BackupSetMatched)</td></tr>
+        <tr><td><strong>Recommended Action</strong></td><td>$($pstCoverage.RecommendedAction)</td></tr>
+    </table>
+"@
+        if ($pstCoverage.OutlookPstFiles -and $pstCoverage.OutlookPstFiles.Count -gt 0) {
+            $html += "<table><tr><th>User</th><th>Location</th><th>Size</th><th>Backed up?</th><th>Path</th></tr>"
+            foreach ($pst in $pstCoverage.OutlookPstFiles) {
+                $matched = if ($pst.BackupSetMatched) { "Yes" } else { "No / unverified" }
+                $html += "<tr><td>$($pst.User)</td><td>$($pst.Location)</td><td>$($pst.SizeGB) GB</td><td>$matched</td><td><code>$($pst.Path)</code></td></tr>"
+            }
+            $html += "</table>"
+        }
+        if ($pstCoverage.MissingStandardUserFolders -and $pstCoverage.MissingStandardUserFolders.Count -gt 0) {
+            $html += "<h4>Missing standard user folders</h4><ul>"
+            foreach ($folder in $pstCoverage.MissingStandardUserFolders) {
+                $html += "<li>$($folder.User) $($folder.Folder): <code>$($folder.Path)</code></li>"
+            }
+            $html += "</ul>"
+        }
+        if ($pstCoverage.MissingOutlookRoamCache -and $pstCoverage.MissingOutlookRoamCache.Count -gt 0) {
+            $html += "<h4>Outlook RoamCache / Stream_Autocomplete coverage</h4><ul>"
+            foreach ($cache in $pstCoverage.MissingOutlookRoamCache) {
+                $html += "<li>$($cache.User): <code>$($cache.Path)</code> ($($cache.StreamAutocompleteFiles) Stream_Autocomplete files)</li>"
+            }
+            $html += "</ul>"
+        }
+        if ($pstCoverage.CloudSyncFolders -and $pstCoverage.CloudSyncFolders.Count -gt 0) {
+            $html += "<h4>Cloud sync folder backup coverage</h4><p class='warning-text'>Cloud services are sync, not guaranteed backup. Include locally stored OneDrive/Google Drive/Dropbox/Box/iCloud data in iDrive unless a separate cloud backup/retention policy is confirmed. Online-only placeholders may not contain actual file content for iDrive to back up.</p>"
+            $html += "<table><tr><th>User</th><th>Provider</th><th>Local state</th><th>Sample</th><th>Backed up?</th><th>Path</th><th>Recommendation</th></tr>"
+            foreach ($cloud in $pstCoverage.CloudSyncFolders) {
+                $matched = if ($cloud.BackupSetMatched) { "Yes" } else { "No / unverified" }
+                $sample = "$($cloud.LocalFilesInSample) local, $($cloud.PlaceholderFilesInSample) placeholder(s), $($cloud.LocalSizeSampleGB) GB sampled"
+                $html += "<tr><td>$($cloud.User)</td><td>$($cloud.Provider)</td><td>$($cloud.LocalState)</td><td>$sample</td><td>$matched</td><td><code>$($cloud.Path)</code></td><td>$($cloud.Recommendation)</td></tr>"
+            }
+            $html += "</table>"
+        }
+        if ($pstCoverage.RootDriveCandidateFolders -and $pstCoverage.RootDriveCandidateFolders.Count -gt 0) {
+            $html += "<h4>Root drive candidate folders</h4><p class='warning-text'>Root-level candidate folders found; consider adding to iDrive backup set - when in doubt, include due to iDrive generous storage quotas.</p><ul>"
+            foreach ($rootFolder in $pstCoverage.RootDriveCandidateFolders) {
+                $matched = if ($rootFolder.BackupSetMatched) { "included" } else { "not found / unverified" }
+                $html += "<li><code>$($rootFolder.Path)</code> - $matched</li>"
+            }
+            $html += "</ul>"
+        }
+    }
 }
 
 $html += @"
@@ -3811,6 +4467,7 @@ $html += "<div class='section-body'>"
 
 if (-not $Results.Malwarebytes.Installed) {
     $html += "<p class='detail'>Malwarebytes not found on this system.</p>"
+    $html += "<p class='warning-text'>$($Results.Malwarebytes.RecommendedAction)</p>"
 } else {
     $mbSvcRunning = if ($Results.Malwarebytes.ServiceRunning) { "Running" } else { "<span class='warning-text'>Not Running</span>" }
     $mbRtColor = if ($Results.Malwarebytes.RealTimeProtection -eq "Enabled") { "color:#28a745" } elseif ($Results.Malwarebytes.RealTimeProtection -eq "Disabled") { "color:#dc3545" } else { "" }
@@ -3819,8 +4476,46 @@ if (-not $Results.Malwarebytes.Installed) {
         <tr><td><strong>Product</strong></td><td>$($Results.Malwarebytes.ProductType)</td></tr>
         <tr><td><strong>Service Status</strong></td><td>$mbSvcRunning</td></tr>
         <tr><td><strong>Real-Time Protection</strong></td><td><span style='$mbRtColor;font-weight:bold;'>$($Results.Malwarebytes.RealTimeProtection)</span></td></tr>
+        <tr><td><strong>Recommended Action</strong></td><td>$($Results.Malwarebytes.RecommendedAction)</td></tr>
     </table>
 "@
+}
+
+$html += @"
+</div></details>
+</div>
+
+<!-- ANTIVIRUS INVENTORY -->
+<div class="section" id="avinventory">
+"@
+
+$avInventoryOpen = if ($Results.AntivirusInventory.Status -match "PASS|CLEAN|UP TO DATE|INFO") { "" } else { " open" }
+$avInventoryHeadClass = Get-HeadingClass $Results.AntivirusInventory.Status
+
+$html += "<details$avInventoryOpen><summary class='$avInventoryHeadClass'><span class='icon'>&#x1F6E1;</span> Antivirus Inventory / Endpoint Protection $(Get-StatusBadge $Results.AntivirusInventory.Status)</summary>"
+$html += "<div class='section-body'>"
+$html += "<p><strong>$($Results.AntivirusInventory.ProtectionSummary)</strong></p>"
+$html += "<p class='detail'><strong>Recommended action:</strong> $($Results.AntivirusInventory.RecommendedAction)</p>"
+
+if ($Results.AntivirusInventory.SecurityCenter2Products -and $Results.AntivirusInventory.SecurityCenter2Products.Count -gt 0) {
+    $html += "<table><tr><th>Product</th><th>Type</th><th>Real-Time Protection</th><th>Signatures</th><th>State</th></tr>"
+    foreach ($av in $Results.AntivirusInventory.SecurityCenter2Products) {
+        $rtClass = if ($av.RealTimeProtection -eq "Enabled") { "" } elseif ($av.RealTimeProtection -eq "Disabled") { "class='warning-text'" } else { "class='detail'" }
+        $html += "<tr><td>$($av.Name)</td><td>$($av.VendorType)</td><td $rtClass>$($av.RealTimeProtection)</td><td>$($av.SignatureStatus)</td><td class='detail'>$($av.ProductState)</td></tr>"
+    }
+    $html += "</table>"
+} else {
+    $html += "<p class='warning-text'>No antivirus products were reported by Windows Security Center.</p>"
+}
+
+if ($Results.AntivirusInventory.UnwantedSecuritySoftware -and $Results.AntivirusInventory.UnwantedSecuritySoftware.Count -gt 0) {
+    $html += "<h3>Unwanted security software detected</h3>"
+    $html += "<p class='warning-text'>These products are usually security scanware or bundled AV-adjacent software rather than useful managed protection.</p>"
+    $html += "<table><tr><th>Product</th><th>Version</th><th>Publisher</th><th>Reason</th></tr>"
+    foreach ($app in $Results.AntivirusInventory.UnwantedSecuritySoftware) {
+        $html += "<tr><td>$($app.Name)</td><td>$($app.Version)</td><td>$($app.Publisher)</td><td>$($app.Reason)</td></tr>"
+    }
+    $html += "</table>"
 }
 
 $html += @"
@@ -4417,10 +5112,15 @@ if ($EmailTo) {
         }
 
         $scriptDuration = [math]::Round(((Get-Date) - $scriptStartTime).TotalMinutes, 1)
-        # Format client name as "Surname, Firstname" for the email subject line
+        # Format client name for the email subject line.
+        # If Tactical already supplied "Surname, Firstname", preserve the comma rather than adding a second one.
         if ($ClientName) {
-            $nameParts = $ClientName -split '\s+', 2
-            $clientDisplay = if ($nameParts.Count -ge 2) { "$($nameParts[0].ToUpper()), $($nameParts[1])" } else { $ClientName }
+            if ($ClientName -match '^\s*([^,]+),\s*(.+?)\s*$') {
+                $clientDisplay = "$($Matches[1].Trim().ToUpper()), $($Matches[2].Trim())"
+            } else {
+                $nameParts = $ClientName -split '\s+', 2
+                $clientDisplay = if ($nameParts.Count -ge 2) { "$($nameParts[0].ToUpper()), $($nameParts[1])" } else { $ClientName }
+            }
         } else {
             $clientDisplay = $ComputerName
         }
@@ -4577,6 +5277,38 @@ ${overallColor}OVERALL STATUS: $overallStatus ($warningCount warning(s), $errorC
                 $emailBody += "Account".PadRight(30) + "$($Results.iDriveBackup.Account)`n"
                 $emailBody += "Service".PadRight(30) + "$svcStatus`n"
             }
+            if ($Results.iDriveBackup.OutlookPstCoverage -and ($Results.iDriveBackup.OutlookPstCoverage.PstCount -gt 0 -or $Results.iDriveBackup.OutlookPstCoverage.MissingStandardUserFolders.Count -gt 0 -or $Results.iDriveBackup.OutlookPstCoverage.MissingOutlookRoamCache.Count -gt 0 -or $Results.iDriveBackup.OutlookPstCoverage.RootDriveCandidateFolders.Count -gt 0 -or $Results.iDriveBackup.OutlookPstCoverage.CloudSyncFolders.Count -gt 0)) {
+                $pstCoverage = $Results.iDriveBackup.OutlookPstCoverage
+                $pstStatus = if ($pstCoverage.Status -match "^PASS$") { "[G]$($pstCoverage.Status)[/G]" } else { "[W]$($pstCoverage.Status)[/W]" }
+                $emailBody += "`n[H]iDRIVE BACKUP SET COVERAGE[/H] $pstStatus`n"
+                $emailBody += "PST Files Found".PadRight(30) + "$($pstCoverage.PstCount)`n"
+                $emailBody += "Backup Set Coverage".PadRight(30) + "$($pstCoverage.BackupSetCoverage)`n"
+                $emailBody += "BackupSetMatched".PadRight(30) + "$($pstCoverage.BackupSetMatched)`n"
+                $emailBody += "Recommended Action".PadRight(30) + "$($pstCoverage.RecommendedAction)`n"
+                foreach ($pst in $pstCoverage.OutlookPstFiles) {
+                    $matched = if ($pst.BackupSetMatched) { "Yes" } else { "No / unverified" }
+                    $emailBody += "  $($pst.Location): $($pst.Path) ($($pst.SizeGB) GB, backed up: $matched)`n"
+                }
+                if ($pstCoverage.MissingStandardUserFolders.Count -gt 0) {
+                    $emailBody += "Missing Standard Folders".PadRight(30) + "[W]$($pstCoverage.MissingStandardUserFolders.Count)[/W]`n"
+                }
+                if ($pstCoverage.MissingOutlookRoamCache.Count -gt 0) {
+                    $emailBody += "Missing Outlook RoamCache".PadRight(30) + "[W]$($pstCoverage.MissingOutlookRoamCache.Count)[/W]`n"
+                }
+                if ($pstCoverage.RootDriveCandidateFolders.Count -gt 0) {
+                    $emailBody += "Root Folder Candidates".PadRight(30) + "[W]$($pstCoverage.RootDriveCandidateFolders.Count) - review/add when in doubt[/W]`n"
+                }
+                if ($pstCoverage.CloudSyncFolders.Count -gt 0) {
+                    $missingCloudCount = @($pstCoverage.CloudSyncFolders | Where-Object { -not $_.BackupSetMatched -and $_.LocalFilesInSample -gt 0 }).Count
+                    $cloudSummary = "$($pstCoverage.CloudSyncFolders.Count) found"
+                    if ($missingCloudCount -gt 0) { $cloudSummary += "; $missingCloudCount with local files not in backup set" }
+                    $emailBody += "Cloud Sync Folders".PadRight(30) + "[W]$cloudSummary[/W]`n"
+                    foreach ($cloud in $pstCoverage.CloudSyncFolders) {
+                        $matched = if ($cloud.BackupSetMatched) { "included" } else { "not found / unverified" }
+                        $emailBody += "  $($cloud.Provider): $($cloud.Path) ($($cloud.LocalState), backed up: $matched)`n"
+                    }
+                }
+            }
             $emailBody += "`n"
         }
 
@@ -4595,6 +5327,32 @@ ${overallColor}OVERALL STATUS: $overallStatus ($warningCount warning(s), $errorC
                 $emailBody += "Product".PadRight(30) + "$($Results.Malwarebytes.ProductType)`n"
                 $emailBody += "Service".PadRight(30) + "$mbSvcText`n"
                 $emailBody += "Real-Time Protection".PadRight(30) + "$mbRtText`n"
+            }
+            $emailBody += "`n"
+        }
+
+        # Add Antivirus Inventory / Endpoint Protection details
+        if ($Results.AntivirusInventory.Status) {
+            if ($Results.AntivirusInventory.Status -match "PASS|INFO") {
+                $emailBody += "`n[H]ANTIVIRUS INVENTORY / ENDPOINT PROTECTION[/H] $($Results.AntivirusInventory.ProtectionSummary) (see HTML report for full details)`n"
+                if ($Results.AntivirusInventory.RecommendedAction) {
+                    $emailBody += "Recommended Action".PadRight(30) + "$($Results.AntivirusInventory.RecommendedAction)`n"
+                }
+            } else {
+                $emailBody += "`n[H]ANTIVIRUS INVENTORY / ENDPOINT PROTECTION[/H]`n"
+                $emailBody += "Summary".PadRight(30) + "[W]$($Results.AntivirusInventory.ProtectionSummary)[/W]`n"
+                $emailBody += "Recommended Action".PadRight(30) + "[W]$($Results.AntivirusInventory.RecommendedAction)[/W]`n"
+            }
+            if ($Results.AntivirusInventory.SecurityCenter2Products) {
+                foreach ($av in $Results.AntivirusInventory.SecurityCenter2Products) {
+                    $emailBody += "  $($av.Name)".PadRight(30) + "$($av.RealTimeProtection) / $($av.SignatureStatus)`n"
+                }
+            }
+            if ($Results.AntivirusInventory.UnwantedSecuritySoftware -and $Results.AntivirusInventory.UnwantedSecuritySoftware.Count -gt 0) {
+                $emailBody += "`n[H]UNWANTED SECURITY SOFTWARE[/H]`n"
+                foreach ($app in $Results.AntivirusInventory.UnwantedSecuritySoftware) {
+                    $emailBody += "[W]$($app.Name)[/W]".PadRight(30) + "$($app.Reason)`n"
+                }
             }
             $emailBody += "`n"
         }
