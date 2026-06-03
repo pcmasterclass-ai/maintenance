@@ -4417,14 +4417,20 @@ if ($EmailTo) {
         }
 
         $scriptDuration = [math]::Round(((Get-Date) - $scriptStartTime).TotalMinutes, 1)
-        # Format client name as "Surname, Firstname" for the email subject line
+        # Format client name for the email subject line.
+        # Preferred input for individual clients is "Surname, Firstname".
+        # Company names may be passed as-is. If no client name is supplied, fall back to the computer name.
         if ($ClientName) {
-            $nameParts = $ClientName -split '\s+', 2
-            $clientDisplay = if ($nameParts.Count -ge 2) { "$($nameParts[0].ToUpper()), $($nameParts[1])" } else { $ClientName }
+            $cleanClientName = $ClientName.Trim().Trim('"')
+            if ($cleanClientName -match '^\s*([^,]+),\s*(.+?)\s*$') {
+                $clientDisplay = "$($Matches[1].Trim().ToUpper()), $($Matches[2].Trim())"
+            } else {
+                $clientDisplay = $cleanClientName
+            }
         } else {
             $clientDisplay = $ComputerName
         }
-        $emailSubject = "$clientDisplay - $overallStatus - Maintenance Report - $ComputerName - $(Get-Date -Format 'dd MMM yyyy') - ${scriptDuration}m - v$ScriptVersion"
+        $emailSubject = "$clientDisplay - Maintenance Report - $ComputerName - $(Get-Date -Format 'dd MMM yyyy') - ${scriptDuration}m - v$ScriptVersion"
 
         $emailBody = "[T]PC MASTERCLASS - SCHEDULED MAINTENANCE REPORT[/T]`n"
         $emailBody += "Computer".PadRight(30) + "$ComputerName ($($Results.SystemInfo.Manufacturer) $($Results.SystemInfo.Model))`n"

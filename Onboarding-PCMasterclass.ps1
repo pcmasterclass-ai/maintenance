@@ -12,8 +12,8 @@
 
 .NOTES
     Author:  Paul - PC Masterclass
-    Version: 1.4.1
-    Date:    2026-05-17
+    Version: 1.4.2
+    Date:    2026-06-03
 
     USAGE (paste into an elevated PowerShell prompt):
       powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\Downloads\Onboarding-PCMasterclass.ps1"
@@ -36,7 +36,7 @@
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-$DeployVersion = "1.4.1"
+$DeployVersion = "1.4.2"
 $BaseDir = "C:\Teamviewer"
 $ScriptName = "PCMasterclass-Maintenance.ps1"
 $GitHubRepo = "pcmasterclass-ai/maintenance"
@@ -686,12 +686,21 @@ function Set-MaintenanceSchedule {
     $emailInput = Read-Host "  Email reports to (press Enter for $DefaultEmailTo)"
     $emailTo = if ($emailInput) { $emailInput } else { $DefaultEmailTo }
 
+    # Ask for client name so report subjects do not fall back to the computer name.
+    # Preferred format is "Surname, Firstname" for individuals; company names may be entered as-is.
+    Write-Host ""
+    $clientInput = Read-Host "  Client name for report subjects, e.g. Caganoff, Sol (press Enter to use computer name $env:COMPUTERNAME)"
+    $clientName = if ($clientInput) { $clientInput.Trim() } else { "" }
+
     Write-Step "Creating scheduled task..."
 
     try {
         # Build the command that the scheduled task will run
         # -WindowStyle Hidden prevents a PowerShell window flashing on screen
         $scriptArgs = "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ScriptPath`" -EmailTo `"$emailTo`""
+        if ($clientName) {
+            $scriptArgs += " -ClientName `"$clientName`""
+        }
 
         # Create the scheduled task action
         $action = New-ScheduledTaskAction `
@@ -771,6 +780,11 @@ function Set-MaintenanceSchedule {
         Write-OK "Schedule: $freqLabel at $runTime"
         Write-OK "First scheduled run: $($startDateTime.ToString('dd MMM yyyy')) at $runTime"
         Write-OK "Reports will be emailed to: $emailTo"
+        if ($clientName) {
+            Write-OK "Report subject client name: $clientName"
+        } else {
+            Write-Warn "No client name supplied - report subjects will use computer name $env:COMPUTERNAME"
+        }
         Write-OK "Task runs as SYSTEM with elevated privileges"
 
         # Trigger an immediate first run if start date is today
